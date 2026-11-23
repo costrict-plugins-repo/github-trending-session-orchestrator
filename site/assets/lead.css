@@ -1,0 +1,97 @@
+/* /lead only: small additions on top of site.css. Same tokens, no new fonts,
+   no new colours. Everything else on the page reuses site.css classes. */
+.hero-art svg { width: 100%; height: 100%; }
+.lead-diagram .d-line { fill: none; stroke: var(--line); stroke-width: 1.5; }
+.lead-diagram .d-flow { fill: none; stroke: var(--fg-2); stroke-width: 1.25; }
+.lead-diagram .d-head { fill: var(--fg-2); }
+.lead-diagram .d-lead { fill: #202326; stroke: var(--accent); stroke-width: 1.5; }
+.lead-diagram .d-box { fill: var(--bg); stroke: var(--line); stroke-width: 1.25; }
+.lead-diagram .d-you { fill: var(--bg); stroke: var(--fg); stroke-width: 1.5; }
+.lead-diagram .d-title { fill: var(--fg); font: 500 20px var(--font-display); letter-spacing: -.02em; }
+.lead-diagram .d-name { fill: var(--fg); font: 500 15px var(--font-display); letter-spacing: -.01em; }
+.lead-diagram .d-chip { fill: var(--accent); font: 400 11px var(--font-mono); letter-spacing: .04em; }
+.lead-diagram .d-meta { fill: var(--fg-2); font: 400 10px var(--font-mono); }
+.lead-diagram .d-note { fill: var(--fg-2); font: 400 11px var(--font-body); }
+.lead-pair { grid-template-columns: repeat(2,minmax(0,1fr)); }
+.lead-pair .card h3 { margin-bottom: 10px; }
+.lead-pair .card p { font-size: .9rem; color: var(--fg-2); }
+.lead-who { margin-top: 12px; }
+.lead-who caption { text-align: left; padding-bottom: 10px; color: var(--fg); font: 500 1.05rem var(--font-display); letter-spacing: -.02em; }
+.story-sec .go-steps { margin-top: 0; }
+.lead-soon { display: inline-block; margin-left: 10px; padding: 2px 7px; border: 1px solid #5d673c; border-radius: 4px; color: var(--accent); font: 400 .68rem var(--font-body); vertical-align: middle; }
+@media (max-width: 600px) {
+  .lead-pair { grid-template-columns: 1fr; }
+}
+.lead-diagram-fig { max-width: 760px; margin: 40px auto 0; padding: 20px; border: 1px solid var(--line); border-radius: 12px; background: #17191b; }
+.lead-diagram-fig .lead-diagram { display: block; width: 100%; height: auto; }
+
+/* Hero rule-of-thumb box */
+.lead-rule { max-width: 48ch; margin: 0 0 24px; padding: 14px 16px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); color: var(--fg-2); font-size: .9375rem; }
+.lead-rule b { color: var(--fg); }
+
+/* "How it works" cards: one sentence each */
+.lead-cards { grid-template-columns: repeat(4,minmax(0,1fr)); margin: 0; padding: 0; list-style: none; }
+.lead-cards .card p { margin: 0; font-size: .9rem; color: var(--fg-2); }
+@media (max-width: 959px) { .lead-cards { grid-template-columns: repeat(2,minmax(0,1fr)); } }
+@media (max-width: 600px) { .lead-cards { grid-template-columns: 1fr; } }
+
+/* Owner Inbox recreation: real text, terminal look */
+.inbox-grid { display: grid; grid-template-columns: minmax(0,1.6fr) minmax(0,1fr); gap: 32px; align-items: start; }
+.inbox-fig { margin: 0; min-width: 0; }
+.inbox-fig figcaption { margin-top: 8px; color: var(--fg-2); font-size: .75rem; }
+.inbox-pane { padding: 16px 18px; border: 1px solid #3a3836; border-radius: 10px; background: #232323; color: #cbc4ba; font: 400 .78rem/1.55 var(--font-mono); overflow-wrap: anywhere; cursor: default; }
+.inbox-pane p { margin: 0; }
+.ib-top, .ib-bar { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 0 12px; }
+.ib-need { color: #e8c35a; font-weight: 600; }
+.ib-dim, .ib-sub { color: #a8a197; }
+.ib-sub { margin-bottom: 10px; }
+.ib-tabs { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
+.ib-tab { padding: 1px 8px; border: 1px solid #4a4744; border-radius: 4px; color: #a8a197; }
+.ib-tab.is-on { border-color: #cbc4ba; color: #f1ebe2; }
+.ib-bar b { color: #f1ebe2; }
+.ib-h { margin-top: 10px; color: #f1ebe2; font-weight: 700; }
+.ib-q { display: grid; grid-template-columns: 4ch minmax(0,1fr) auto; gap: 0 10px; }
+.ib-q.is-sel { color: #f1ebe2; font-weight: 700; }
+.ib-q.is-task { color: #a8a197; }
+.ib-m { white-space: nowrap; }
+.ib-age { color: #a8a197; font-weight: 400; text-align: right; white-space: nowrap; }
+.ib-frame { margin: 4px 0 0; padding: 8px 12px; border: 1px solid #8f897f; border-radius: 8px; display: grid; gap: 6px; }
+.ib-opt { color: #f1ebe2; font-weight: 700; }
+.ib-key { color: #a8a197; font-weight: 400; }
+.ib-star { color: #e8c35a; white-space: nowrap; }
+.ib-input { margin: 6px 0 10px; padding: 3px 12px; border-left: 2px solid #8f897f; color: #a8a197; }
+.ib-foot { margin-top: 14px; padding-top: 8px; border-top: 1px solid #3a3836; color: #a8a197; }
+.inbox-keys { margin: 0; display: grid; gap: 14px; }
+.inbox-keys div { padding-top: 12px; border-top: 1px solid var(--line); }
+.inbox-keys dt { color: var(--fg); font-weight: 600; }
+.inbox-keys dd { margin: 2px 0 0; color: var(--fg-2); font-size: .9rem; }
+.lead-codex { margin: 32px 0 0; max-width: 72ch; }
+.lead-codex h3 { margin-top: 0; }
+.lead-codex p { color: var(--fg-2); font-size: .9375rem; }
+.lead-codex b { color: var(--fg); }
+@media (max-width: 959px) { .inbox-grid { grid-template-columns: 1fr; } }
+@media (max-width: 480px) {
+  .inbox-pane { padding: 12px; font-size: .72rem; }
+  .ib-q { grid-template-columns: 4ch minmax(0,1fr); }
+  .ib-age { grid-column: 2; text-align: left; }
+  .ib-frame { padding: 8px 10px; }
+}
+
+/* Cold entry context and local section links. */
+.lead-context { max-width: 48ch; margin: 0 0 20px; color: var(--fg-2); }
+.lead-sections { display: flex; flex-wrap: wrap; gap: 0 20px; margin-top: 12px; font-size: .85rem; }
+/* 23 px tall as bare text links: below the 24 px floor of WCAG 2.5.8 (ux-grill 2026-11-18, #1756). */
+.lead-sections a { display: inline-flex; align-items: center; min-height: 44px; }
+
+/* Keep labels at their drawn size; contain scrolling inside the figure. */
+.lead-diagram-scroll { max-width: 100%; overflow-x: auto; }
+.lead-diagram-fig .lead-diagram { min-width: 600px; }
+.lead-scroll-hint { display: none; }
+@media (max-width: 700px) { .lead-scroll-hint { display: inline; } }
+
+/* Same command row pattern as the home install section. */
+.install-sec .cmd-row { display: flex; align-items: stretch; margin: 0 0 6px; background: var(--code-bg); border-radius: 8px; overflow: hidden; }
+.install-sec .cmd-row code { flex: 1; min-width: 0; padding: 10px 12px; font-size: .8rem; line-height: 1.45; color: var(--fg); overflow-wrap: anywhere; white-space: pre-wrap; }
+.install-sec .cmd-row .copy { position: static; transform: none; flex: 0 0 auto; min-width: 66px; min-height: 44px; padding: 0 14px; border: 0; border-left: 1px solid var(--line); border-radius: 0; background: transparent; color: var(--fg-2); font: 500 .8rem/1 var(--font-body); }
+.install-sec .cmd-row .copy:hover { color: var(--fg); }
+.install-sec .small { max-width: 80ch; }

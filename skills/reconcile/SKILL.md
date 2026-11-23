@@ -1,0 +1,476 @@
+---
+name: reconcile
+user-invocable: true
+argument-hint: "[--dry-run]"
+tags: [learning, rules, intelligence, meta]
+model: sonnet
+model-preference: sonnet
+model-preference-codex: gpt-6.2-sol
+model-preference-cursor: claude-sonnet-4-6
+args-schema:
+  - flag: --dry-run
+    description: "Print proposals without writing anything or rendering the approval AUQ"
+description: >
+  Use this skill when the user wants to reconcile learnings into rules, run /reconcile, propose
+  rules from learnings, turn learnings into .claude/rules/ entries, or review what rules would be
+  generated from current session learnings. On-demand version of session-end Phase 3.6.8.
+---
+
+> **Platform Note:** State files use the platform's native directory: `.claude/` (Claude Code), `.codex/` (Codex CLI), or `.cursor/` (Cursor IDE). Shared metrics live in `.orchestrator/metrics/`. See `skills/_shared/platform-tools.md`.
+
+# Reconcile Skill
+
+## Invocation
+
+The user invoked `/reconcile` with arguments: **$ARGUMENTS** — parsed in Phase 1.3 below.
+
+- `/reconcile` — full approval flow: engine → AUQ → write approved rules.
+- `/reconcile --dry-run` — print proposals and rejections without writing anything or rendering the AUQ prompt.
+
+**Engine seams used:** `runReconcile` (engine.mjs) · `writeApprovedRules` (writer.mjs) · `reconcile` config block · `.claude/rules/` write target.
+
+On-demand version of the session-end Phase 3.6.8 reconciliation flow. Turns eligible learnings
+from `.orchestrator/metrics/learnings.jsonl` into proposed `.claude/rules/<slug>.md` entries,
+presenting each batch of 4 to the coordinator via AUQ multiSelect for operator approval before
+any file is written. Advisory-only — rules are NEVER auto-applied.
+
+## Posture Contract (load-bearing — read before executing)
+
+- **Advisory-only.** No rule is ever written without explicit operator approval via AUQ.
+  The AUQ multiSelect is the mandatory gate; there is no bypass.
+- **Never-always-on invariant.** The reconcile engine's emitter (`emitter.mjs`) throws
+  on any eligible learning that would produce an `alwaysApply: true` rule — the engine
+  structurally cannot emit always-on rules. This invariant is enforced upstream, not by
+  this skill.
+- **Engine never writes `.claude/rules/`.** `runReconcile` computes proposals and records
+  them in the idempotency sidecar only. The only module that writes `.claude/rules/` is
+  `writer.mjs`, and only AFTER the operator approves proposals via AUQ.
+- **The candidate store belongs to `mergeCandidates` — nothing else writes it.**
+  `.orchestrator/runtime/reconcile-candidates.jsonl` is a mutable work-queue whose only
+  sanctioned writer is `mergeCandidates` (`scripts/lib/reconcile/idempotency.mjs`); it is
+  not a scratch pad, and no report, analysis run, or agent may append to it by hand. A
+  hand-written record there corrupts downstream readers — the session-start reconcile nudge
+  banner derives "last run" from `created_at`, so a foreign-shaped record makes a non-empty
+  store report *no reconcile run on record*. Candidate analyses and dry-run reports write
+  their findings to `docs/reconcile/<date>-<topic>.md`, never into the store. (Since
+  2026-07-31 a read-side shape guard drops records lacking `learning_key`/`created_at` and
+  `mergeCandidates` reports the count as `skipped` — that guard is a backstop, not a licence.)
+- **Verdicts outlive the checkout in an append-only ledger** (#1710).
+  `.orchestrator/metrics/reconcile-verdicts.jsonl` resolves against the MAIN checkout
+  (`resolveEventsLedgerRoot`) and sits beside `learnings.jsonl`, so it shares that file's
+  tracking (vault: tracked, needs `merge=union`; this repo: host-local). Verdict lines come
+  from `mergeCandidates`, once per terminal DECISION (`rejected`, `expired-swept`), and from
+  `markCandidateProcessed` when a decision is stamped over a kept `written` /
+  `already-on-disk` record (the merge keeps that record, so it cannot mirror the decision); the
+  branch-scoped `written` / `already-on-disk` / outcome-less records stay out, because the
+  tracked rule file's provenance marker already witnesses them across trees. After a non-dry
+  merge the engine appends one run line with the learnings count it loaded; run recency comes
+  from run lines only. A learning is terminal when the sidecar OR the ledger OR a
+  `.claude/rules/` provenance marker says so. Code never rewrites the ledger; the only
+  sanctioned hand edit is a deliberate re-open of a declined learning, and it must cover
+  EVERY checkout: remove the learning's verdict lines from the ledger in the main checkout
+  AND its record from the sidecar of the main checkout and of every linked worktree —
+  otherwise the next merge in a worktree whose sidecar still holds the terminal `rejected`
+  record appends it to the ledger again (backfill). Ceiling: a `/reconcile` in a linked
+  worktree of the vault appends to the main checkout's tracked ledger — an uncommitted
+  change there, committed by the vault's replica sync.
+- **Same pipeline as session-end Phase 3.6.8.** This skill uses the identical engine and
+  writer seams as the automatic session-end reconciliation phase — operator experience is
+  consistent, and any fixes to the engine benefit both paths.
+- **`reconcile.enabled` gates the AUTOMATIC session-end phase only.** `/reconcile` is an
+  on-demand command and runs regardless of `reconcile.enabled`. It still honours
+  `rule-expiry-days` and `confidence-floor` from the `reconcile` config block.
+
+---
+
+## Phase 0: Bootstrap Gate
+
+Read `skills/_shared/bootstrap-gate.md` and execute the gate check. If the gate is CLOSED,
+invoke `skills/bootstrap/SKILL.md` and wait for completion before proceeding. If the gate
+is OPEN, continue to Phase 1.
+
+<HARD-GATE>
+Do NOT proceed past Phase 0 if GATE_CLOSED. There is no bypass. Refer to
+`skills/_shared/bootstrap-gate.md` for the full HARD-GATE constraints.
+</HARD-GATE>
+
+---
+
+## Phase 1: Config & Argument Loading
+
+### 1.1 Read Session Config
+
+Read and parse Session Config per `skills/_shared/config-reading.md`. Store result as `$CONFIG`.
+
+### 1.2 Extract Reconcile Config
+
+Extract the `reconcile` block from `$CONFIG`:
+
+```bash
+# rule-expiry-days defaults to EMPTY (not a number) so the engine falls back to
+# its per-type TTL (deriveExpiresAt, default 60d). A numeric override forces flat
+# N-day expiry — matching the `null` default of the reconcile: config resolver.
+RULE_EXPIRY_DAYS=$(echo "$CONFIG" | jq -r '.reconcile["rule-expiry-days"] // empty')
+CONFIDENCE_FLOOR=$(echo "$CONFIG" | jq -r '.reconcile["confidence-floor"] // 0.5')
+RECONCILE_MODE=$(echo "$CONFIG"   | jq -r '.reconcile.mode // "warn"')
+MIN_RULE_DAYS=$(echo "$CONFIG"    | jq -r '.reconcile["min-rule-days"] // 7')
+MIN_INSIGHT_CHARS=$(echo "$CONFIG" | jq -r '.reconcile["min-insight-chars"] // 24')
+MAX_PROPOSALS_PER_RUN=$(echo "$CONFIG" | jq -r '.reconcile["max-proposals-per-run"] // 10')
+```
+
+When `RULE_EXPIRY_DAYS` is empty, pass `ruleExpiryDays: undefined` to `runReconcile` so the engine uses its per-type TTL. Defaults when the `reconcile` block is absent or a field is missing:
+- `rule-expiry-days` uses the per-type TTL when empty (`deriveExpiresAt`, default 60d), matching the `null` resolver default. A positive integer N uses the learning's `created_at` plus N days as the eligibility cutoff and as the basis for the generated rule's `expires-at`, subject to the `min-rule-days` floor on the emitted date.
+- `confidence-floor`: 0.5
+- `mode`: warn (enum `off` | `warn`)
+- `min-rule-days`: 7 — floor window (days) applied to a proposed rule's `expires-at` so a
+  near-dead or already-elapsed natural expiry never produces a born-dead rule (issue #741.1).
+- `min-insight-chars`: 24 — opt-in minimum insight length gating the eligibility
+  placeholder-insight check (issue #741.2).
+- `max-proposals-per-run`: 10 — volume brake (issue #900 D); the engine sorts eligible
+  learnings by confidence DESC and proposes at most this many per run.
+
+Note: `reconcile.enabled` is intentionally NOT checked — this on-demand command always runs.
+
+### 1.3 Parse Arguments
+
+Check `$ARGUMENTS` for `--dry-run`:
+
+```bash
+DRY_RUN=false
+if echo "$ARGUMENTS" | grep -q -- '--dry-run'; then
+  DRY_RUN=true
+fi
+```
+
+---
+
+## Phase 2: Run the Reconciliation Engine
+
+### 2.1 Resolve Plugin Root
+
+Resolve `$PLUGIN_ROOT` per `skills/_shared/config-reading.md` (the standard resolution chain:
+`$CLAUDE_PLUGIN_ROOT` → `$CODEX_PLUGIN_ROOT` → `$CURSOR_RULES_DIR` → common install locations).
+
+### 2.2 Resolve the Effective Write-Targets
+
+`reconcile.targets` says WHERE approved rules land. Resolve it BEFORE surfacing
+the approval AUQ — the operator must never be asked to approve a write to a
+destination that cannot exist:
+
+```javascript
+import { resolveEffectiveTargets } from '$PLUGIN_ROOT/scripts/lib/reconcile/engine.mjs';
+
+const { targets, baselineRoot, dropped, reason } = resolveEffectiveTargets({
+  targets: CONFIG.reconcile?.targets,        // ['repo-local'] | ['baseline'] | both
+  baselineRoot: CONFIG['plan-baseline-path'], // already 3-tier-resolved by config.mjs
+});
+```
+
+| Target | Writes to | Root |
+|---|---|---|
+| `repo-local` (default) | `<repoRoot>/.claude/rules/<slug>.md` | `repoRoot` |
+| `baseline` (#1099) | `<baselineRoot>/proposals/<slug>.md` | `plan-baseline-path`, resolved `SO_BASELINE_PATH` env > `owner.yaml` `paths.baseline-path` > committed |
+
+`baseline` is DROPPED (with one stderr WARN, and `dropped: ['baseline']` in the
+return) when the root is unresolvable on all three tiers, is still the committed
+`OVERRIDE-IN-…` placeholder, or is not absolute. A dropped target means: do not
+surface its proposals in the AUQ at all. If `targets` comes back EMPTY, stop
+here and report the `reason` — there is nowhere to write.
+
+Writing to `baseline` is still advisory and AUQ-gated exactly like `repo-local`:
+files land under `proposals/` in the baseline checkout, nothing is committed
+there, and no branch is touched. The operator reviews and commits in that repo
+himself.
+
+### 2.3 Invoke `runReconcile`
+
+```javascript
+import { runReconcileFromSkill } from '$PLUGIN_ROOT/scripts/lib/reconcile/engine.mjs';
+
+const { proposals, rejected, summary, error } = await runReconcileFromSkill({
+  repoRoot,             // absolute path from git rev-parse --show-toplevel
+  ruleExpiryDays: RULE_EXPIRY_DAYS,   // empty → undefined → engine per-type TTL
+  minRuleDays: MIN_RULE_DAYS,         // default 7 — floors a near-dead expires-at
+  minInsightChars: MIN_INSIGHT_CHARS, // default 24 — opt-in placeholder-insight length gate
+  maxProposalsPerRun: MAX_PROPOSALS_PER_RUN, // default 10 — volume brake (issue #900 D)
+  now: new Date(),
+  dryRun: DRY_RUN,     // true → engine touches no disk (no idempotency sidecar write)
+  // trigger is pinned to 'skill' IN CODE by runReconcileFromSkill (#1201 Part A) —
+  // this prose block no longer sets it.
+  targets,             // from resolveEffectiveTargets above; recorded when non-empty, omitted otherwise
+});
+
+// The engine does NOT apply a confidence floor — it proposes every eligible
+// learning and carries each one's `confidence` through. `confidence-floor` is a
+// DELIVERY gate: filter proposals here before the sidecar + AUQ (mirrors
+// session-end Phase 3.6.8). Use `surfaced` everywhere "proposals" appears below.
+const surfaced = proposals.filter((p) => typeof p.confidence === 'number' && p.confidence >= CONFIDENCE_FLOOR);
+```
+
+`runReconcile` NEVER throws — a top-level error populates `result.error` instead.
+
+If `error` is present, surface it to the user and abort:
+> "Reconcile engine error: `<error>`. Check `.orchestrator/metrics/learnings.jsonl` and retry."
+
+### 2.3 Handle Empty / Zero-Proposal Cases
+
+If `summary.totalLearnings === 0`:
+> "No learnings found in `.orchestrator/metrics/learnings.jsonl`. Run `/evolve analyze` first to extract session patterns."
+Exit cleanly.
+
+If `summary.eligible === 0` (learnings exist but none are eligible — already proposed,
+or wrong learning type — eligibility is type/`file_paths`-based, NOT confidence-based):
+> "No eligible learnings for rule proposals (total: `summary.totalLearnings`, already proposed or ineligible type: all). Run more sessions to accumulate evidence."
+Exit cleanly. Optionally list the rejection reasons from `rejected[]` (field `reason`) as an
+informational table.
+
+If `summary.eligible > 0` but `surfaced.length === 0` (proposals exist but ALL fall below
+`confidence-floor`):
+> "No proposals above the confidence floor (`CONFIDENCE_FLOOR`). Lower `reconcile.confidence-floor` or run more sessions so the underlying learnings accrue confidence."
+Exit cleanly.
+
+If `summary.proposed === 0` but `summary.eligible > 0` (emit/render failures consumed all
+candidates — unusual):
+> "Engine produced 0 proposals from N eligible learnings. See rejection log."
+List `rejected[].reason` and exit.
+
+---
+
+## Phase 3: Dry-Run Branch
+
+**Only when `DRY_RUN=true`.**
+
+Print the proposals in a readable table. Do NOT write the sidecar, do NOT render an AUQ, and
+do NOT write candidates into `.orchestrator/runtime/reconcile-candidates.jsonl` — that store
+is `mergeCandidates`' alone (see Posture Contract). A dry-run write-up belongs in
+`docs/reconcile/`.
+
+```
+## Reconcile — Dry Run  (N proposals, M rejected)
+
+| # | Slug | Confidence | Learning Key | Rule Path |
+|---|------|-----------|-------------|-----------|
+| 1 | <slug> | 0.72 | <learningKey> | .claude/rules/<slug>.md |
+| 2 | ...   | ...  | ...          | ...                     |
+
+Rejected (not eligible for proposal):
+| Learning Key | Reason |
+|-------------|--------|
+| <key> | <reason> |
+
+Re-run without --dry-run to enter the approval flow.
+```
+
+Exit after printing. Do not proceed to Phase 4.
+
+---
+
+## Phase 4: Write Pending Sidecar (Normal Mode Only)
+
+Create the runtime proposal sidecar `.orchestrator/metrics/reconcile-pending.md` as a human-readable <!-- path-check: example -->
+record before presenting the AUQ. This sidecar is informational only — it lets the operator
+see the full proposal set in an editor alongside the AUQ prompt.
+
+```markdown
+# Reconcile Pending — <ISO date>
+
+Generated by `/reconcile` on <timestamp>. N proposals, M rejected.
+
+## Proposals
+
+| # | Slug | Confidence | Learning Key | Rendered Rule Path |
+|---|------|-----------|-------------|-------------------|
+| 1 | <slug> | 0.72 | <key> | .claude/rules/<slug>.md |
+...
+
+## Rejected
+
+| Learning Key | Type | Reason |
+|-------------|------|--------|
+| <key> | <type> | <reason> |
+...
+```
+
+Write via standard file write (not atomic, not lock-protected — this is a disposable sidecar,
+not a critical artifact).
+
+---
+
+## Phase 5: AUQ Approval Flow (Normal Mode Only)
+
+Present proposals to the operator in batches of 4. Mirror the session-end Phase 3.6.3 / 3.6.8
+multiSelect pattern exactly.
+
+For each batch (proposals sliced into groups of 4):
+
+```
+AskUserQuestion({
+  questions: [{
+    question: "Batch K of N — which rule proposals should be written into .claude/rules/?",
+    header: "Regeln",
+    options: [
+      {
+        label: "<slug>.md (confidence: 0.72)",
+        description: "From learning <learningKey>. Becomes a file under .claude/rules/ — where this repo keeps its rules. Text: <first 100 chars of rendered content>"
+      },
+      ...up to 4 options per batch...
+      {
+        label: "Skip all in this batch",
+        description: "Decline all proposals in this batch — they are archived to the rejected log."
+      }
+    ],
+    multiSelect: true
+  }]
+})
+```
+
+Collect responses across all batches:
+- Selected options (excluding "Skip all") → `approved[]`
+- Unselected options + "Skip all" batches → `rejected_by_operator[]`
+
+> **Codex CLI fallback:** AskUserQuestion is unavailable in subagents and on Codex CLI
+> (AUQ-004). In those contexts, present proposals as a numbered Markdown list and ask
+> the operator to reply with the numbers they wish to approve.
+
+---
+
+## Phase 6: Write Approved Rules
+
+### 6.1 Invoke `writeApprovedRules`
+
+```javascript
+import { writeApprovedRules } from '$PLUGIN_ROOT/scripts/lib/reconcile/writer.mjs';
+
+const { written, archived, errors } = await writeApprovedRules({
+  approved: approved,             // proposals the operator approved
+  rejected: rejected_by_operator, // proposals the operator declined
+  repoRoot,
+  baselineRoot,                   // from Phase 2.2; omit/undefined ⇒ baseline is a no-op
+  targets,                        // from Phase 2.2; omitted ⇒ ['repo-local']
+  sessionId: currentSessionId,    // informational; from STATE.md or 'manual'
+});
+```
+
+`writeApprovedRules` NEVER throws — per-item failures are collected in `errors[]`.
+
+`written` is a FILE count, not a proposal count: one proposal approved with both
+targets in effect writes two files and counts 2, while stamping the idempotency
+sidecar exactly once. A baseline root that does not exist on disk (the
+fresh-clone / CI case) skips that target with an `errors[]` entry — it is NEVER
+created, because a typo'd path that silently mints a directory tree looks
+exactly like a successful write.
+
+**Budget refusal (#1316).** Before writing, `writeApprovedRules` projects the
+instruction budget (`computeInstructionBudget`) on a temporary copy of
+`.claude/rules/` plus the pending writes. If an axis would end over its ceiling
+AND the batch grows it, it writes NOTHING, stamps no candidate (approved or
+rejected) and returns `{ written: 0, archived: 0, errors: [<one line>], ok: false,
+reason: 'instruction-budget-exceeded', axis, current, projected, ceiling, calibrated, hint }`.
+Read `ok`/`reason` alongside `written, archived, errors`; on a refusal, tell the
+operator, then branch on `calibrated` (#1995):
+- `calibrated: true` — the repo set this ceiling itself: absorb the approved
+  learnings into an existing thematic rule file per `docs/rule-authoring.md`
+  § Consolidated rules, then re-run `/reconcile`.
+- `calibrated: false` — the ceiling is the plugin's own default, not this
+  repo's: show the operator the calibrate command named in `hint`. He commits
+  the printed block into the file it names, then re-runs `/reconcile`.
+
+### 6.2 Handle Errors
+
+If `errors.length > 0`, surface each error to the operator:
+> "Warning: `N` rule(s) failed to write: `<error list>`. Successfully written: `written`. Archived: `archived`."
+
+Log each error but do NOT abort — partial success is acceptable.
+
+### 6.3 Report
+
+```
+## Reconcile Complete
+
+- Written:  <written> rule file(s) to .claude/rules/
+- Archived: <archived> declined proposal(s) to .orchestrator/reconcile.rejected.log
+- Errors:   <errors.length> (see warnings above, if any)
+
+New rules take effect immediately — they are loaded by the wave-executor's rule-loader
+on the next wave dispatch.
+```
+
+If `written === 0` and `approved.length === 0`:
+> "No proposals approved. No rules written."
+
+---
+
+## Consolidating and Dropping Generated Rules (merge contract)
+
+`.claude/rules/` grows one file per approved learning, so it accumulates. This
+repo consolidated 43 generated files (112,443 B, 46.2 % frontmatter+provenance
+overhead) into 8 thematic files plus 10 drops on 2026-09-06. Both operations
+are safe ONLY under the contract below — the full authoring spec is
+[`docs/rule-authoring.md`](../../docs/rule-authoring.md) § "Consolidated rules:
+N provenance pairs in ONE file". The three facts that decide whether a
+consolidation survives the next `/reconcile`:
+
+- **A target file may carry N provenance bullet PAIRS.** Frontmatter
+  `learning-key:` is a scalar, so at most one marker fits there; the other N−1
+  live in the body as `` - learning-key: `…` `` + `` - learning-id: `…` ``
+  bullets, which `engine.mjs` reads via `BODY_LEARNING_KEY_RE` /
+  `BODY_LEARNING_ID_RE`. One pair per absorbed learning — a missing pair
+  regenerates that learning as a standalone file on the next run.
+- **A merged file's `expires-at` is the EARLIEST of its parts**, never the
+  latest: it must not outlive its shortest-lived content.
+- **An EXPIRED file no longer dedupes** (#1387): the provenance reader skips it
+  whole, so its learnings become re-proposable — fail-open on an unparseable
+  date. Two known limits, measured 2026-09-18: this covers only the on-disk
+  source, not the sidecar or the verdict ledger (79 of this repo's 92
+  provenance keys are ALSO sidecar-terminal, so just 13 return; the ledger
+  carries decisions only, never a rule's own `written` verdict), and a file the
+  sweep cannot split or cannot read
+  (`no-1to1-mapping`, `no-provenance-block`, `unreadable`, and since GH#70
+  `no-counter-sentence` — the fail-closed branch that touches such a file not
+  at all, deletion included; none in the live tree today, `skipped: []` over 7
+  files) that expires legitimately
+  re-proposes on every run with no mechanical exit. Detail:
+  `docs/rule-authoring.md` § Consolidated rules.
+- **A dropped learning must be STAMPED before deletion, or it regenerates.**
+  `rm .claude/rules/<slug>.md` alone leaves `isProcessed()` false and no
+  on-disk marker, so the engine re-proposes it. Stamp it terminal first with
+  `markCandidateProcessed({ learningKey, outcome: 'rejected', fallbackSlug,
+  repoRoot })` from `scripts/lib/reconcile/idempotency.mjs` — the ONLY
+  sanctioned writer of `.orchestrator/runtime/reconcile-candidates.jsonl`
+  (never append to that file by hand; the read-side shape guard drops foreign
+  records and `mergeCandidates` rewrites the store in full). A `rejected` stamp
+  also reaches the verdict ledger, so the drop holds in fresh worktrees (and on
+  other hosts only where `.orchestrator/metrics/` is tracked).
+
+**Verify a consolidation with a dry run**, not by eye: `alreadyMaterialized`
+must equal absorbed + dropped. If it equals only the absorbed count, the drops
+were not stamped and the next run will resurrect them. Do the whole operation
+while `reconcile.enabled: false` in Session Config, so nothing regenerates
+underneath you mid-edit.
+
+## Critical Rules
+
+- **NEVER** call `writeApprovedRules` before the operator has confirmed via AUQ — this is the
+  only write-protection gate for `.claude/rules/`.
+- **NEVER** pass `dryRun: false` to `runReconcile` and then skip the AUQ — the idempotency
+  sidecar is written during the engine run; writing rules without AUQ confirmation would create
+  an inconsistency between the sidecar and the actual rule files.
+- **ALWAYS** surface `errors[]` from `writeApprovedRules` — per-item isolation must not
+  silently swallow failures.
+- **ALWAYS** present proposals in batches of ≤4 via AUQ multiSelect — mirrors session-end
+  3.6.3 / 3.6.8 and keeps the operator prompt readable.
+- **ALWAYS** honour `confidence-floor`, `rule-expiry-days`, `min-rule-days`,
+  `min-insight-chars`, and `max-proposals-per-run` from Session Config `reconcile` block —
+  the engine reads these, but the skill must pass them explicitly.
+
+## Anti-Patterns
+
+- **DO NOT** write any file to `.claude/rules/` without AUQ operator confirmation.
+- **DO NOT** check `reconcile.enabled` — that flag gates the automatic session-end phase, not
+  this on-demand command.
+- **DO NOT** emit or approve a rule with `alwaysApply: true` — the engine structurally prevents
+  it, but the reviewer should reject any proposal that would produce an always-on rule.
+- **DO NOT** skip the dry-run branch when `--dry-run` is passed — the entire AUQ + write flow
+  must be bypassed.
+- **DO NOT** treat `runReconcile` failures as fatal — check the `error` field and surface it,
+  then exit cleanly.

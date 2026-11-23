@@ -1,0 +1,699 @@
+/**
+ * session-registry.mjs — Per-session heartbeat files + peer detection.
+ *
+ * Part of Sub-Epic F (#159) of Epic #157. Backs hooks/on-session-start.mjs
+ * peer-detection (F2, #168) and hooks/on-stop.mjs clean deregister + zombie
+ * sweep (F3, #169).
+ *
+ * Registry location: `<private-config-dir>/sessions/active/<sessionId>.json`
+ * Sweep log: `<private-config-dir>/sessions/sweep.log` (JSONL)
+ *
+ * `<private-config-dir>` is `resolvePrivateConfigDir()` — `SO_CONFIG_HOME` >
+ * `XDG_CONFIG_HOME` > `~/.config/session-orchestrator`. `SO_SESSION_REGISTRY_DIR`
+ * overrides the whole `sessions/` directory (not `active/`) and outranks all
+ * three — used by tests for isolation.
+ *
+ * Heartbeat schema (per issue #167):
+ *   {
+ *     session_id, pid, platform, repo_path_hash, repo_name, branch,
+ *     started_at, last_heartbeat, status ('active'|'wave'|'idle'),
+ *     current_wave, host_class, mode (Epic #583 W2-I3),
+ *     role ('navigator'|null, optional, #1462 — display only, never ownership;
+ *           set by heartbeat(patch.role), NOT by registerSelf),
+ *     session_root (absolute realpath|null, optional, #1605 — where THIS
+ *           session's `.orchestrator/session.lock` and `current-session.json`
+ *           live; set by registerSelf),
+ *     work_root (absolute realpath|null, optional, #1605 — the working copy the
+ *           session works in; set by registerSelf, refreshed by
+ *           heartbeat(patch.workRoot) at every turn end)
+ *   }
+ *
+ * `session_root` / `work_root` are additive: readers that predate #1605 ignore
+ * them, and `_validEntry` does not require them.
+ *
+ * Schema v2 (Epic #583, W2-I3): `mode` field added so the exclusivity-matrix
+ * can classify cross-repo registry entries correctly. Without it, every
+ * registry-sourced peer was bucketed as `mode='session'` → classifyMode threw
+ * → fell back to `parallel-ok`, silently bypassing the exclusivity matrix
+ * for cross-repo entries (D5 from Epic #583 audit). `registerSelf()` writes
+ * `mode: null` when the caller passes none; on read an entry WITHOUT the key
+ * is still accepted — a deliberate fail-open for peer visibility (see
+ * `_validEntry`), not v1 back-compat, which ended with the #595 sunset
+ * (2026-10-02). See `skills/_shared/state-ownership.md` § Schema v1 Sunset.
+ */
+
+import path from 'node:path';
+import crypto from 'node:crypto';
+import { hostname } from 'node:os';
+import { promises as fs } from 'node:fs';
+import { setTimeout as delay } from 'node:timers/promises';
+import { digestSha256 } from './crypto-digest-utils.mjs';
+
+import { appendFileSync, chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync } from 'node:fs';
+
+import { utcTimestamp, appendJsonl } from './common.mjs';
+import { renameWithRetry } from './io.mjs';
+import { resolvePrivateConfigDir } from './config/private-config-dir.mjs';
+import { withFileLock } from './file-lock.mjs';
+import { hostnamesMatch, lockHostCandidate } from './host-identity.mjs';
+import { FUTURE_HEARTBEAT_TOLERANCE_MS } from './session-lock.mjs';
+
+// ---------------------------------------------------------------------------
+// Paths
+// ---------------------------------------------------------------------------
+
+/**
+ * Parent directory for all session-registry state.
+ *
+ * Precedence: `SO_SESSION_REGISTRY_DIR` (names the `sessions/` dir ITSELF —
+ * highest, and what every existing test uses for isolation) > the host-private
+ * config dir resolved by `resolvePrivateConfigDir()` (`SO_CONFIG_HOME` >
+ * `XDG_CONFIG_HOME` > `~/.config/session-orchestrator`).
+ *
+ * Hardcoding `~/.config` here was the #1223 hazard class in its registry form:
+ * a sandboxed probe run that set `SO_CONFIG_HOME=<tmp>` moved every OTHER
+ * host-private artefact but not this one, so the throwaway session registered
+ * itself in the operator's REAL registry and was then discovered as a live peer.
+ * `.trim()` guards the whitespace-only env value (`development.md` § Error
+ * Handling) — `'   '` is truthy and would otherwise be returned verbatim.
+ */
+export function registryBaseDir() {
+  const override = (process.env.SO_SESSION_REGISTRY_DIR || '').trim();
+  if (override) return override;
+  return path.join(resolvePrivateConfigDir(), 'sessions');
+}
+
+/** Directory holding one JSON file per active session. */
+export function activeDir() {
+  return path.join(registryBaseDir(), 'active');
+}
+
+/** Zombie-sweep observability log (JSONL). */
+export function sweepLogPath() {
+  return path.join(registryBaseDir(), 'sweep.log');
+}
+
+function entryPath(sessionId) {
+  _assertSessionId(sessionId);
+  return path.join(activeDir(), `${sessionId}.json`);
+}
+
+// ---------------------------------------------------------------------------
+// Primitives
+// ---------------------------------------------------------------------------
+
+/**
+ * Stable SHA-256 hex of a canonical repo path. Used so registry entries can be
+ * correlated by repo without exposing local filesystem layout.
+ */
+export function repoPathHash(absPath) {
+  if (typeof absPath !== 'string' || absPath.length === 0) {
+    throw new TypeError('repoPathHash: absPath must be a non-empty string');
+  }
+  return digestSha256(resolveRepoPath(absPath));
+}
+
+/** Resolve symlinks and on-disk casing; unavailable paths keep their old identity. */
+function resolveRepoPath(repoPath) {
+  const resolved = path.resolve(repoPath);
+  try {
+    return realpathSync.native(resolved);
+  } catch {
+    return resolved;
+  }
+}
+
+/**
+ * Canonical spelling of an optional absolute root for `session_root` /
+ * `work_root` (#1605): `null` when absent, the realpath otherwise.
+ *
+ * @param {unknown} value
+ * @param {string} name  option name for the error message
+ * @returns {string|null}
+ * @throws {TypeError} when `value` is neither nullish nor an absolute path string
+ */
+function _optionalRoot(value, name) {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== 'string' || !path.isAbsolute(value)) {
+    throw new TypeError(`${name} must be an absolute path when provided`);
+  }
+  return resolveRepoPath(value);
+}
+
+function _assertSessionId(sessionId) {
+  if (typeof sessionId !== 'string' || sessionId.length === 0) {
+    throw new TypeError('session_id must be a non-empty string');
+  }
+  // Guard against path separators / traversal in filename.
+  if (sessionId.includes('/') || sessionId.includes('\\') || sessionId.includes('\x00') || sessionId === '.' || sessionId === '..') {
+    throw new TypeError('session_id must not contain path separators or null bytes');
+  }
+}
+
+async function _writeJsonAtomic(filePath, data, { mode = 0o600 } = {}) {
+  // 0o700: the registry sits in the private config dir; a bare mkdir leaves it
+  // 0777 under umask 000 and breaks the owner-policy check beside it (#1629).
+  await fs.mkdir(path.dirname(filePath), { recursive: true, mode: 0o700 });
+  const tmp = `${filePath}.tmp-${process.pid}-${crypto.randomBytes(4).toString('hex')}`;
+  // A process that dies between writeFile and rename leaves this tmp file
+  // behind permanently; sweepZombies' ORPHANED_TMP_RE branch removes it.
+  // The tmp is staged here, not via atomicWriteText: that helper has no `mode`
+  // option and its tmp name would escape ORPHANED_TMP_RE. renameWithRetry adds
+  // the win32 retry (GH#79 / #1865); a failed write unlinks its own tmp.
+  try {
+    await fs.writeFile(tmp, JSON.stringify(data, null, 2) + '\n', { encoding: 'utf8', mode }); // no 0666 window (#1632)
+    await renameWithRetry(tmp, filePath);
+  } catch (err) {
+    try { await fs.unlink(tmp); } catch { /* never created, or already gone */ }
+    throw err;
+  }
+  try { await fs.chmod(filePath, mode); } catch { /* best effort */ }
+}
+
+/**
+ * Filename shape `_writeJsonAtomic` leaves behind when a process dies between
+ * writeFile and rename: `<session-id>.json.tmp-<pid>-<8 hex>`. Matched
+ * explicitly rather than by a bare `.tmp` substring so the sweep can never
+ * reach a file it did not write.
+ */
+const ORPHANED_TMP_RE = /\.json\.tmp-\d+-[0-9a-f]{8}$/;
+
+async function _readJsonSafe(filePath) {
+  try {
+    const raw = await fs.readFile(filePath, 'utf8');
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+function _validEntry(obj) {
+  if (!obj
+    || typeof obj !== 'object'
+    || typeof obj.session_id !== 'string'
+    || typeof obj.last_heartbeat !== 'string'
+    || typeof obj.started_at !== 'string') {
+    return false;
+  }
+  // `mode`: when present it MUST be null or a string (no number / object /
+  // array smuggling). When ABSENT the entry is still accepted — a deliberate
+  // fail-open for peer visibility, not schema-v1 compat. No writer omits the
+  // key (`registerSelf()` writes `mode: null` at worst), so a mode-less entry
+  // is foreign or damaged; but it still carries a heartbeat, and rejecting it
+  // would drop a possibly LIVE peer from `readRegistry()` / `detectPeers()`,
+  // hiding it from parallel-session detection. Accepting it costs nothing:
+  // `acquire()` already buckets an unclassifiable peer mode as `parallel-ok`.
+  // Decided at the #595 sunset (2026-10-02), see
+  // `skills/_shared/state-ownership.md` § Schema v1 Sunset.
+  if ('mode' in obj && obj.mode !== null && typeof obj.mode !== 'string') {
+    return false;
+  }
+  // #1462: `role` is optional and a DISPLAY field only — the registry shows who
+  // claims to be navigator, it never decides it. The authoritative claim is the
+  // navigator lease under `~/.config/navigator/leases/navigator.json`, and
+  // classifyMode ignores `role`. When present it MUST be null or a string (no
+  // number / object smuggling); absent is accepted, like an absent `mode`.
+  if ('role' in obj && obj.role !== null && typeof obj.role !== 'string') {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * True when `isoTimestamp` lies further in the future than the lock module's
+ * {@link FUTURE_HEARTBEAT_TOLERANCE_MS} (#1505.1). Such a heartbeat was not
+ * written by a live writer on this clock — a hand edit or a clock stepped
+ * backwards — so it measures nothing.
+ */
+function _isFutureStamp(isoTimestamp, now) {
+  const t = Date.parse(isoTimestamp);
+  return !Number.isNaN(t) && t > now + FUTURE_HEARTBEAT_TOLERANCE_MS;
+}
+
+/**
+ * Minutes since `isoTimestamp`. `Infinity` — never fresh — when it is
+ * unparseable or stamped beyond the future tolerance (#1505.1: `now - t` went
+ * negative, stayed under every freshness window, and kept the entry "fresh"
+ * forever, exactly the flaw `isLockLive()` closed in #1494). Within the
+ * tolerance the age clamps to 0 instead of going negative.
+ */
+function _ageMinutes(isoTimestamp, now = Date.now()) {
+  const t = Date.parse(isoTimestamp);
+  if (Number.isNaN(t)) return Infinity;
+  if (_isFutureStamp(isoTimestamp, now)) return Infinity;
+  return Math.max(0, now - t) / 60_000;
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+/**
+ * Append a single JSONL observability event to sweep.log. Non-throwing:
+ * if writing to sweep.log itself fails the error is silently swallowed so
+ * callers never cascade a log-write failure into a blocking error.
+ *
+ * Uses appendFileSync (sync) intentionally — this is called from a catch
+ * branch where fire-and-forget sync writes are simpler and safer than
+ * spawning a new async chain. Lines stay well under PIPE_BUF (4 KiB) so
+ * the append is effectively atomic on POSIX.
+ *
+ * @param {{ event: string, session_id: string|null, error: string }} opts
+ */
+export function logSweepEvent({ event, session_id, error }) {
+  const line = JSON.stringify({
+    timestamp: new Date().toISOString(),
+    event,
+    session_id: session_id ?? null,
+    error: typeof error === 'string' ? error : String(error),
+  }) + '\n';
+  try {
+    const logPath = sweepLogPath();
+    try { mkdirSync(path.dirname(logPath), { recursive: true, mode: 0o700 }); } catch { /* best effort */ } // #1629
+    appendFileSync(logPath, line, { encoding: 'utf8', mode: 0o600 }); // #1632
+    // `mode` applies on creation only: tighten a loose pre-existing log too (#1636).
+    try { chmodSync(logPath, 0o600); } catch { /* best effort */ }
+  } catch { /* last-resort silent no-op — never let log-write cascade */ }
+}
+
+/**
+ * Create the heartbeat file for this session.
+ *
+ * @param {object} opts
+ * @param {string} opts.sessionId — unique id (from hook stdin payload preferred; uuid fallback)
+ * @param {string} opts.projectRoot — absolute path to the project root
+ * @param {string} [opts.branch] — current git branch (optional)
+ * @param {string} [opts.platform] — 'claude' | 'codex' | 'cursor' | null
+ * @param {string} [opts.hostClass] — from getHostFingerprint().host_class
+ * @param {number} [opts.pid] — defaults to process.pid
+ * @param {string} [opts.status] — 'active' | 'wave' | 'idle' (default 'active')
+ * @param {number} [opts.currentWave] — default 0
+ * @param {string} [opts.sessionRoot] — absolute root holding this session's
+ *   `session.lock` / `current-session.json` (#1605); stored as `session_root`.
+ * @param {string} [opts.workRoot] — absolute working copy the session works in
+ *   (#1605); stored as `work_root`.
+ * @param {string} [opts.mode] — session mode (e.g., 'deep', 'feature', 'housekeeping').
+ *   Schema v2 (Epic #583, W2-I3): when present, propagated into the entry so
+ *   discovery + exclusivity-matrix classification work for cross-repo peers.
+ *   Default: `null` (mode unknown — classified `parallel-ok` by `acquire()`).
+ * @returns {Promise<object>} the written entry
+ */
+export async function registerSelf(opts) {
+  if (!opts || typeof opts !== 'object') {
+    throw new TypeError('registerSelf: opts is required');
+  }
+  const { sessionId, projectRoot } = opts;
+  _assertSessionId(sessionId);
+  if (typeof projectRoot !== 'string' || projectRoot.length === 0) {
+    throw new TypeError('registerSelf: projectRoot must be a non-empty string');
+  }
+  // Schema v2 (Epic #583): validate mode shape if provided.
+  if (opts.mode !== undefined && opts.mode !== null && typeof opts.mode !== 'string') {
+    throw new TypeError('registerSelf: mode must be a string when provided');
+  }
+  // Schema v2.1 (Epic #583 W5-F1c — Q5 H1): semanticSessionId field for #587 completion.
+  if (opts.semanticSessionId !== undefined && opts.semanticSessionId !== null && typeof opts.semanticSessionId !== 'string') {
+    throw new TypeError('registerSelf: semanticSessionId must be a string when provided');
+  }
+  const sessionRoot = _optionalRoot(opts.sessionRoot, 'registerSelf: sessionRoot');
+  const workRoot = _optionalRoot(opts.workRoot, 'registerSelf: workRoot');
+  const now = utcTimestamp();
+  const entry = {
+    session_id: sessionId,
+    semantic_session_id: opts.semanticSessionId ?? null,
+    pid: opts.pid ?? process.pid,
+    platform: opts.platform ?? null,
+    repo_path_hash: repoPathHash(projectRoot),
+    repo_name: path.basename(resolveRepoPath(projectRoot)),
+    branch: opts.branch ?? null,
+    started_at: now,
+    last_heartbeat: now,
+    status: opts.status ?? 'active',
+    current_wave: opts.currentWave ?? 0,
+    host_class: opts.hostClass ?? null,
+    mode: opts.mode ?? null,
+    session_root: sessionRoot,
+    work_root: workRoot,
+  };
+  const file = entryPath(sessionId);
+  const writeEntry = () => _writeJsonAtomic(file, entry);
+  let result = await withRegistryEntryLock(file, writeEntry, { create: true });
+  // CEILING (BV-004): three attempts, with 300 ms of lock budgets plus 160 ms
+  // of backoff. Revisit if sweep.log shows repeated lock-related register-failed events.
+  for (const backoffMs of [40, 120]) {
+    if (result.ok || (result.reason !== 'timeout' && result.reason !== 'retired')) break;
+    await delay(backoffMs);
+    result = await withRegistryEntryLock(file, writeEntry, { create: true });
+  }
+  if (!result.ok) throw registryEntryLockError(result, 'registerSelf: entry lock: ');
+  return entry;
+}
+
+/** Roles `heartbeat(id, { role })` accepts besides `null` (#1462). */
+export const REGISTRY_ROLES = Object.freeze(['navigator']);
+
+const REGISTRY_ENTRY_LOCK_STALE_MS = 30_000;
+const RETIRED_ENTRY_LOCK = Symbol('retired registry entry lock');
+
+function staleRegistryEntryLock(file, now, { missing = false } = {}) {
+  try {
+    const stat = lstatSync(file);
+    if (!stat.isFile() || now - stat.mtimeMs <= REGISTRY_ENTRY_LOCK_STALE_MS) return false;
+    const lock = JSON.parse(readFileSync(file, 'utf8'));
+    return hostnamesMatch(lockHostCandidate(lock), hostname());
+  } catch (err) {
+    return missing && err.code === 'ENOENT';
+  }
+}
+
+function registryEntryLockPath(file) {
+  const base = `${file}.lock`;
+  const now = Date.now();
+  for (let generation = 0; ; generation += 1) {
+    const lock = generation === 0 ? base : `${base}.${generation}`;
+    const retired = `${lock}.retired`;
+    if (existsSync(retired)) continue;
+    if (!staleRegistryEntryLock(`${lock}.acquire`, now) || !staleRegistryEntryLock(lock, now, { missing: true })) return lock;
+
+    // The shared helper cannot reclaim its acquisition guard. Retire the lock
+    // path atomically so contenders agree on the successor without unlinking a
+    // guard that may now belong to a different acquirer.
+    try { mkdirSync(retired, { mode: 0o700 }); } catch (err) {
+      if (err.code !== 'EEXIST') throw err;
+    }
+  }
+}
+
+async function withRegistryEntryLock(file, mutate, { create = false, read } = {}) {
+  // withFileLock creates its parent with the default mode. Registration must
+  // create it privately first. Existing-entry operations leave it absent.
+  if (create) {
+    await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
+  } else if (!lstatSync(file, { throwIfNoEntry: false })) {
+    return { ok: true, value: null };
+  }
+
+  // An orphaned write temp belongs to the same lock as its published entry.
+  const lock = registryEntryLockPath(file.replace(ORPHANED_TMP_RE, '.json'));
+  const result = await withFileLock(lock, async () => {
+    if (!create && !lstatSync(file, { throwIfNoEntry: false })) return null;
+    const current = read ? await read(file) : undefined;
+    if (existsSync(`${lock}.retired`)) return RETIRED_ENTRY_LOCK;
+    return mutate(current);
+  }, {
+    timeoutMs: 100,
+    pollMs: 10,
+    staleCheck: 'mtime',
+    staleMs: REGISTRY_ENTRY_LOCK_STALE_MS,
+    holder: crypto.randomUUID(),
+    warn: () => {},
+  });
+  return result.ok && result.value === RETIRED_ENTRY_LOCK ? { ok: false, reason: 'retired' } : result;
+}
+
+function registryEntryLockError(result, prefix = '') {
+  const error = new Error(prefix + (result.error ?? result.reason));
+  if (result.reason === 'fs-error' && result.code !== undefined) error.code = result.code;
+  return error;
+}
+
+/**
+ * Refresh last_heartbeat on the existing entry (and optionally status /
+ * current_wave / role). No-op if the entry is missing or its lock cannot be acquired.
+ *
+ * `patch.role`: `undefined` keeps the stored role, `null` clears it, a member
+ * of `REGISTRY_ROLES` sets it. Anything else throws before the file is touched.
+ * `patch.workRoot` (#1605): `undefined` keeps the stored `work_root`, an
+ * absolute path replaces it (stored as its realpath).
+ *
+ * @param {string} sessionId
+ * @param {{ status?: string, currentWave?: number, role?: string|null, workRoot?: string }} [patch]
+ * @returns {Promise<object|null|{skipped: 'lock'}>} the updated entry, null for
+ *   a missing or invalid entry, or `{ skipped: 'lock' }` when the lock is unavailable.
+ * @throws {TypeError} when `patch.role` is neither undefined, null, nor a REGISTRY_ROLES
+ *   member, or `patch.workRoot` is neither undefined nor an absolute path.
+ */
+export async function heartbeat(sessionId, patch = {}) {
+  if (patch.role !== undefined && patch.role !== null && !REGISTRY_ROLES.includes(patch.role)) {
+    throw new TypeError('heartbeat: role must be "navigator" or null');
+  }
+  const workRoot = patch.workRoot === undefined ? undefined : _optionalRoot(patch.workRoot, 'heartbeat: workRoot');
+  const file = entryPath(sessionId);
+  const result = await withRegistryEntryLock(file, async (existing) => {
+    if (!_validEntry(existing)) return null;
+    const updated = {
+      ...existing,
+      last_heartbeat: utcTimestamp(),
+      ...(patch.status !== undefined ? { status: patch.status } : {}),
+      ...(patch.currentWave !== undefined ? { current_wave: patch.currentWave } : {}),
+      ...(patch.role !== undefined ? { role: patch.role } : {}),
+      ...(workRoot !== undefined && workRoot !== null ? { work_root: workRoot } : {}),
+    };
+    await _writeJsonAtomic(file, updated);
+    return updated;
+  }, { read: _readJsonSafe });
+  if (result.ok) return result.value;
+
+  logSweepEvent({
+    event: 'heartbeat-lock-skipped', session_id: sessionId, error: result.reason,
+  });
+  return { skipped: 'lock' };
+}
+
+/**
+ * Read every valid heartbeat entry, failing loudly when the registry directory
+ * itself cannot be listed (#1941).
+ *
+ * Only ENOENT (the active dir was never created) is a measured "no entries"
+ * and yields `[]`; any other `readdir` failure (EACCES, ENOTDIR, EMFILE, …)
+ * is rethrown unchanged, so a caller that reports a count can tell "read,
+ * zero" from "not read".
+ *
+ * Ceiling (BV-004): an individual entry file that cannot be read or parsed is
+ * still skipped silently, exactly as in readRegistry(), so a corrupt or
+ * unreadable `<id>.json` undercounts without making the read fail. Entries are
+ * written via tmp+rename, so a half-written file is not the expected cause.
+ * Revisit-Trigger: a measured undercount traced to a skipped entry file, or a
+ * consumer that must report per-file read gaps — then return the skip count
+ * beside the entries instead of throwing on one bad file.
+ *
+ * @returns {Promise<object[]>} valid entries.
+ * @throws {NodeJS.ErrnoException} the original `readdir` error when its code is not ENOENT.
+ */
+export async function readRegistryStrict() {
+  const dir = activeDir();
+  let names;
+  try {
+    names = await fs.readdir(dir);
+  } catch (err) {
+    if (err && err.code === 'ENOENT') return [];
+    throw err;
+  }
+  const entries = [];
+  for (const name of names) {
+    if (!name.endsWith('.json')) continue;
+    const parsed = await _readJsonSafe(path.join(dir, name));
+    if (_validEntry(parsed)) entries.push(parsed);
+  }
+  return entries;
+}
+
+/**
+ * Read every valid heartbeat entry (ignoring malformed files). Fail-open: any
+ * failure to list the registry directory yields `[]`. Callers that must tell
+ * "read, zero entries" from "not read" use {@link readRegistryStrict}.
+ *
+ * @returns {Promise<object[]>}
+ */
+export async function readRegistry() {
+  try {
+    return await readRegistryStrict();
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Determine whether a registry entry is "fresh" — last_heartbeat within
+ * `freshnessMin` minutes of `now`. Mirrors detectPeers()'s age filter but
+ * exposes the rule as a pure function so callers (session-discovery,
+ * exclusivity-matrix consumers) can apply it without re-deriving the formula.
+ *
+ * Schema v2 (Epic #583, W2-I3): used by discoverActiveSessions() to filter
+ * registry-sourced sessions when locks are absent / stale.
+ *
+ * @param {object} entry  Registry entry object
+ * @param {object} [opts]
+ * @param {number} [opts.freshnessMin=15]
+ * @param {number} [opts.now]  ms-since-epoch (test seam)
+ * @returns {boolean}
+ */
+export function isRegistryEntryFresh(entry, { freshnessMin = REGISTRY_FRESHNESS_MIN, now = Date.now() } = {}) {
+  if (!_validEntry(entry)) return false;
+  return _ageMinutes(entry.last_heartbeat, now) <= freshnessMin;
+}
+
+/**
+ * Default registry freshness window in minutes — the one threshold
+ * {@link isRegistryEntryFresh}, {@link detectPeers} and
+ * {@link registryEntryLiveness} share. Exported so a consumer that renders a
+ * liveness verdict never invents a second threshold (#1850).
+ */
+export const REGISTRY_FRESHNESS_MIN = 15;
+
+/**
+ * Three-state liveness of a registry entry, judged on its heartbeat with the
+ * SAME rule as {@link isRegistryEntryFresh} (#1850):
+ *   - `live`    — heartbeat within `freshnessMin` minutes;
+ *   - `stale`   — heartbeat measurable and older than that;
+ *   - `unknown` — no valid entry, or a heartbeat that measures nothing
+ *                 (unparseable, or stamped beyond the future tolerance).
+ * `unknown` is never folded into `stale`: a missing measurement is not a
+ * verdict that the session ended.
+ *
+ * @param {object|null|undefined} entry
+ * @param {{freshnessMin?:number, now?:number}} [opts]
+ * @returns {{state:'live'|'stale'|'unknown', ageMin:number|null}}
+ */
+export function registryEntryLiveness(entry, { freshnessMin = REGISTRY_FRESHNESS_MIN, now = Date.now() } = {}) {
+  if (!_validEntry(entry)) return { state: 'unknown', ageMin: null };
+  const ageMin = _ageMinutes(entry.last_heartbeat, now);
+  if (!Number.isFinite(ageMin)) return { state: 'unknown', ageMin: null };
+  return { state: ageMin <= freshnessMin ? 'live' : 'stale', ageMin };
+}
+
+/**
+ * Live peers on this host — excludes self and entries whose last_heartbeat is
+ * older than `freshnessMin` minutes. Stale entries remain on disk (sweep is
+ * the only thing that removes them).
+ *
+ * Fail-open by default: an unlistable registry yields `[]`, which suits a
+ * caller that only needs a peer LIST. A caller that turns the result into a
+ * COUNT passes `strict: true` (#1946): the read then goes through
+ * {@link readRegistryStrict} and rejects on any readdir failure except ENOENT,
+ * so "not read" never reaches an event as a measured 0.
+ *
+ * @param {object} [opts]
+ * @param {string} [opts.sessionId]  Own session id, excluded.
+ * @param {number} [opts.freshnessMin=15]
+ * @param {boolean} [opts.strict=false]  Reject instead of returning `[]` when the registry cannot be listed.
+ * @returns {Promise<object[]>}
+ */
+export async function detectPeers({ sessionId, freshnessMin = REGISTRY_FRESHNESS_MIN, strict = false } = {}) {
+  const now = Date.now();
+  const all = strict ? await readRegistryStrict() : await readRegistry();
+  return all.filter((e) => {
+    if (sessionId && e.session_id === sessionId) return false;
+    return _ageMinutes(e.last_heartbeat, now) <= freshnessMin;
+  });
+}
+
+/**
+ * Count registry entries whose `started_at` lies within the last `windowMin`
+ * minutes — the start-wave signal (#1650). Pure: pass the entries you already
+ * hold. Passing detectPeers() output is complete as long as `windowMin` is at
+ * most detectPeers' `freshnessMin` (15): registerSelf() writes `started_at`
+ * and `last_heartbeat` with the same stamp, so every entry started inside the
+ * window is still heartbeat-fresh. Self must already be excluded by the caller.
+ * Unparseable or future `started_at` never counts (`_ageMinutes` → Infinity).
+ *
+ * @param {object[]} entries  Registry entries (e.g. detectPeers() result)
+ * @param {object} [opts]
+ * @param {number} [opts.windowMin=5]
+ * @param {number} [opts.now]  ms-since-epoch (test seam)
+ * @returns {number}
+ */
+export function countRecentStarts(entries, { windowMin = 5, now = Date.now() } = {}) {
+  if (!Array.isArray(entries)) return 0;
+  return entries.filter((e) => e && _ageMinutes(e.started_at, now) <= windowMin).length;
+}
+
+/**
+ * Remove heartbeat entries older than `thresholdMin` minutes. Appends one
+ * JSONL line per removal to sweepLogPath() for observability.
+ *
+ * @returns {Promise<{removed: string[], logged: number}>}
+ */
+export async function sweepZombies({ thresholdMin = 60, now = Date.now() } = {}) {
+  const dir = activeDir();
+  let names;
+  try {
+    names = await fs.readdir(dir);
+  } catch {
+    return { removed: [], logged: 0 };
+  }
+  const removed = [];
+  let logged = 0;
+  for (const name of names) {
+    const orphanedTmp = ORPHANED_TMP_RE.test(name);
+    if (!name.endsWith('.json') && !orphanedTmp) continue;
+    const full = path.join(dir, name);
+    const candidate = await readSweepCandidate(full, orphanedTmp, now);
+    if (!(candidate.age > thresholdMin)) continue;
+    try {
+      const result = await withRegistryEntryLock(full, async (current) => {
+        if (!(current.age > thresholdMin)) return null;
+        await fs.unlink(full);
+        return current;
+      }, { read: (file) => readSweepCandidate(file, orphanedTmp, now) });
+      if (!result.ok) {
+        logSweepEvent({ event: 'sweep-lock-skipped', session_id: candidate.parsed?.session_id, error: result.reason });
+        continue;
+      }
+      if (!result.value) continue;
+      const { parsed, valid, age } = result.value;
+      removed.push(name);
+      await appendJsonl(sweepLogPath(), {
+        timestamp: new Date(now).toISOString(),
+        session_id: parsed?.session_id ?? null,
+        // lead report 2026-11-10: preserve the registration's hardware class for detection.
+        host_class: parsed?.host_class ?? null,
+        file: name,
+        age_minutes: Number.isFinite(age) ? Math.round(age) : null,
+        reason: orphanedTmp ? 'orphaned-tmp' : valid ? 'stale-heartbeat' : 'malformed-entry',
+      }, { mode: 0o600 }); // #1632
+      logged += 1;
+    } catch { /* removal and logging are best effort */ }
+  }
+  return { removed, logged };
+}
+
+async function readSweepCandidate(file, orphanedTmp, now) {
+  const parsed = await _readJsonSafe(file);
+  const valid = _validEntry(parsed) && !orphanedTmp;
+  if (valid && !_isFutureStamp(parsed.last_heartbeat, now)) {
+    return { parsed, valid, age: _ageMinutes(parsed.last_heartbeat, now) };
+  }
+
+  // The mtime preserves fresh semantic-session claims and in-flight writes.
+  // It also ages future-stamped heartbeats whose timestamps are unusable (#1505.1).
+  let age = Infinity;
+  try {
+    const info = await fs.stat(file);
+    age = (now - info.mtimeMs) / 60_000;
+  } catch { /* unlink will handle missing or inaccessible files */ }
+  return { parsed, valid, age };
+}
+
+/**
+ * Remove this session's heartbeat file. Idempotent — missing file is not an
+ * error (clean-stop after a crashed-sweep scenario).
+ *
+ * @returns {Promise<boolean>} true if a file was removed, false if absent or lock held
+ */
+export async function deregisterSelf(sessionId) {
+  const file = entryPath(sessionId);
+  try {
+    const result = await withRegistryEntryLock(file, async () => {
+      await fs.unlink(file);
+      return true;
+    });
+    if (result.ok) return result.value === true;
+    if (result.reason === 'fs-error') throw registryEntryLockError(result);
+    logSweepEvent({ event: 'deregister-lock-skipped', session_id: sessionId, error: result.reason });
+    return false;
+  } catch (err) {
+    if (err && err.code === 'ENOENT') return false;
+    throw err;
+  }
+}

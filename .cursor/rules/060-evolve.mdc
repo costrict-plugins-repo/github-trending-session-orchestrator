@@ -1,0 +1,247 @@
+---
+description: "When the user types /evolve or asks about session learnings, pattern extraction, or learning management"
+globs: ""
+alwaysApply: false
+---
+
+# Evolve — Session Learning Extraction
+
+Extract patterns from session history into reusable learnings. Three modes of operation.
+
+## Prerequisites
+
+- **Persistence gate**: `persistence: true` must be set in Session Config. If not, abort: "Learnings require persistence to be enabled in Session Config."
+- Session history must exist at `.orchestrator/metrics/sessions.jsonl`
+- Learnings are stored at `.orchestrator/metrics/learnings.jsonl`
+- Config field: `learning-expiry-days` (default: 30) — legacy window used only by the Review-mode *Extend expiry* action; new and confirmed learnings derive `expires_at` per `type` via `deriveExpiresAt()` (`LEARNING_TTL_DAYS`)
+
+## Cursor Adaptation
+
+**No AskUserQuestion tool on Cursor.** Present all choices as numbered Markdown lists:
+```
+Which learnings should be saved?
+
+1. [fragile-file] src/lib/auth.ts — Changed in 4 of last 5 sessions (confidence: 0.5 new)
+2. [scope-guidance] optimal-scope-per-session-type — 3 issues/session works well (+0.15 update)
+3. Skip all — do not save any learnings
+
+Reply with the number(s) of your choice.
+```
+
+## Mode Selection
+
+Determine mode from user input (default: `analyze`):
+
+| Mode | Purpose |
+|------|---------|
+| `analyze` | Extract new learnings from session history |
+| `review` | Edit/manage existing learnings interactively |
+| `list` | Display active learnings (read-only) |
+
+---
+
+## Mode 1: Analyze
+
+Extract learnings from `.orchestrator/metrics/sessions.jsonl`.
+
+### Step 1: Load Session Data
+
+1. Read all entries from `sessions.jsonl`, parse each line as JSON
+2. Sort by `completed_at` descending (most recent first)
+3. If no sessions found, abort: "No session data available."
+
+### Step 2: Pattern Extraction
+
+Apply these heuristics for each learning type:
+
+#### fragile-file
+- Same file appears in 3+ waves' `files_changed` within a session, or in 3+ different sessions
+- Subject = relative file path
+
+#### effective-sizing
+- Compare `total_agents` and `total_waves` across session types
+- Calculate average agents per wave per session type
+- Subject = e.g. `deep-session-sizing` or `feature-session-sizing`
+
+#### recurring-issue
+- `agent_summary` shows `failed` or `partial` > 0 across multiple sessions
+- Repeated failures in wave `quality` fields
+- Subject = issue pattern identifier (e.g. `test-failures-in-wave-execution`)
+
+#### scope-guidance
+- Cross-reference `effectiveness.planned_issues` vs `effectiveness.completion_rate`
+- Skip sessions lacking the `effectiveness` field
+- If completion_rate consistently 1.0 with N issues: "N issues per session works well"
+- If completion_rate < 0.7: "scope was too large"
+- Subject = `optimal-scope-per-session-type`
+
+#### deviation-pattern
+- Read `.cursor/STATE.md` if it exists, check `## Deviations` section
+- Cross-reference session duration vs planned waves
+- Subject = pattern name (e.g. `scope-creep-in-feature-sessions`)
+
+### Step 3: Deduplicate
+
+For each extracted pattern, check if a learning with same `type` + `subject` exists in `learnings.jsonl`:
+- **Exists:** propose confidence update (+0.15 if confirmed, -0.2 if contradicted)
+- **New:** propose as new learning with confidence 0.5
+
+### Step 4: Present to User
+
+Present extracted patterns as a numbered Markdown list (see Cursor Adaptation above). Let the user select which to save. Include a "Skip all" option.
+
+If user skips or selects nothing: "No learnings saved."
+
+If zero patterns were extracted, report: "No patterns found in session history." and stop.
+
+### Step 5: Write Confirmed Learnings
+
+Write through the archive-safe pipeline — never a shell redirect (#1017, #1446):
+1. Snapshot the store into the sidecar: `node scripts/sweep-expired-learnings.mjs --prune --snapshot .orchestrator/tmp/learnings-next.jsonl`. It writes every record of `learnings.jsonl` behind a line-1 `{"_store_generation": "sha256:…", "_store_path": "…"}` header naming the exact store state and the store they came from (#1486). Work on the SIDECAR, never on a separate read of `learnings.jsonl`. On a non-default store pass the same `--file` / `--archive` here as to the apply below. Exit `1` here (a PATH that would replace a ledger) wrote nothing: report it and stop. A malformed (unparseable) store line does not stop the snapshot: it prints a stderr WARN with the line numbers and a `malformed` count, and the apply below keeps those lines verbatim — report the count, never hand-edit the store; the one sanctioned repair is `node scripts/sweep-expired-learnings.mjs --drop-malformed --line N` (dry run by default: previews plus the store generation), then `--drop-malformed --line N --apply --generation <TOKEN> --repo-root "$(pwd)"` once the operator confirmed the previews (`--accept-embedded` for a line still holding a readable record; a changed store exits `3`)
+2. Apply confidence updates for confirmed existing learnings (+0.15, cap at 1.0; reset `expires_at` via `deriveExpiresAt(now, type)`)
+3. Apply confidence decrements for contradicted learnings (-0.2; `expires_at` unchanged)
+4. Add new learnings with confidence 0.5 in the canonical shape (see Learning JSONL Format below)
+5. Edit the sidecar `.orchestrator/tmp/learnings-next.jsonl` into that full next generation via the file-write or edit tool, **keeping line 1 — the `_store_generation` header — unchanged and first** (under `tmp/`, never `metrics/`: a metrics-dir sidecar makes the cleanup `rm` a blocked command, #1453). A peer session may append to the store while you edit; the helper compares the store with the header under its lock and refuses on any difference, because such a record is absent from your sidecar and would otherwise be archived `pruned`. Then let the `/evolve` helper prune (`expires_at` < now OR `confidence` <= 0.0), consolidate duplicates (same `type` + `subject`, highest confidence wins), archive every removed record and rewrite the store with a `.bak-<ISO>` snapshot. The `--apply` call is also `/evolve`'s only `orchestrator.evolve.completed` emit (#1206): export `N` (new learnings from item 4), `M` (existing learnings confirmed in item 2) and `DURATION_MS` (elapsed ms since this `/evolve` run started) first — without them the event records zero counters. Preview first, then apply:
+
+   ```bash
+   NEXT=".orchestrator/tmp/learnings-next.jsonl"
+   node scripts/sweep-expired-learnings.mjs --prune --dry-run --json --entries "$NEXT" --repo-root "$(pwd)"
+   node scripts/sweep-expired-learnings.mjs --prune --apply --json --entries "$NEXT" \
+     --appended "${N:-0}" --boosted "${M:-0}" --duration-ms "${DURATION_MS:-0}" \
+     --repo-root "$(pwd)" && rm -f "$NEXT"
+   ```
+
+   Exit `1` = the sidecar is absent, malformed, empty, lacks its line-1 header, or was snapshotted from another store than `--file`; `2` = the prune failed inside the helper. On `1` and `2`, report the error and stop — store and archive untouched. Exit `3` = the store changed after step 1, nothing written. Retry once: snapshot into a FRESH path (`--prune --snapshot .orchestrator/tmp/learnings-next-retry.jsonl`, same `--file` / `--archive` as the apply), re-apply this run's decisions to the records in that file, and run the block above with `NEXT` set to it; a second consecutive `3`: stop and report. Never move the fresh header onto the old sidecar's records — they lack the peer change the header protects. Never delete `$NEXT` by hand: the `&&` keeps it on failure as the record of this run's decisions.
+
+Report: "Saved N new learnings, updated M existing. Total active: K."
+
+---
+
+## Mode 2: Review
+
+Interactive management of existing learnings.
+
+### Step 1: Load and Display
+
+Read `learnings.jsonl`. If empty or missing: "No learnings found. Run `/evolve analyze` first."
+
+Display as a formatted table grouped by type:
+
+```
+## Active Learnings
+
+| # | Type | Subject | Confidence | Expires | Insight |
+|---|------|---------|------------|---------|---------|
+| 1 | fragile-file | src/lib/auth.ts | 0.80 | 2026-07-05 | Changed in 4 of last 5 sessions |
+
+Summary: N active learnings (M high confidence, K expiring soon)
+```
+
+### Step 2: Interactive Management
+
+Present as a numbered Markdown list (see Cursor Adaptation above):
+- **Boost confidence** — select learnings to boost (+0.15, cap 1.0)
+- **Reduce confidence** — select learnings to reduce (-0.2)
+- **Delete specific learnings** — remove selected entries
+- **Extend expiry** — reset `expires_at` to current date + `learning-expiry-days`
+- **Done** — exit without changes
+
+### Step 3: Apply Changes
+
+Same pipeline as analyze mode Step 5, exit codes included: snapshot the store into the sidecar with `--prune --snapshot "$NEXT"`, modify the selected entries in the sidecar keeping its line-1 header (a deleted entry is simply left out of the sidecar — the helper archives it), then run `node scripts/sweep-expired-learnings.mjs --prune --dry-run --json --entries "$NEXT" --repo-root "$(pwd)"` followed by `--prune --apply --json --entries "$NEXT" --repo-root "$(pwd)"`.
+
+Report: "Updated N learnings. Total active: K."
+
+---
+
+## Mode 3: List
+
+Read-only display of active learnings.
+
+### Output Format
+
+Display grouped by type:
+
+```
+## Active Learnings
+
+### fragile-file
+| Subject | Confidence | Expires | Insight |
+|---------|------------|---------|---------|
+
+### effective-sizing
+| Subject | Confidence | Expires | Insight |
+|---------|------------|---------|---------|
+
+(repeat for each type with entries)
+```
+
+### Summary Line
+
+```
+N active learnings (M high confidence, K expiring soon)
+```
+
+- **High confidence** = confidence > 0.7
+- **Expiring soon** = `expires_at` within 14 days of current date
+
+---
+
+## Learning JSONL Format
+
+Each line in `.orchestrator/metrics/learnings.jsonl` is a JSON object:
+
+```json
+{
+  "schema_version": 1,
+  "id": "uuid-v4",
+  "type": "fragile-file|effective-sizing|recurring-issue|scope-guidance|deviation-pattern",
+  "subject": "identifier for the pattern",
+  "insight": "human-readable description",
+  "evidence": "specific data points supporting the pattern",
+  "confidence": 0.5,
+  "source_session": "session-id",
+  "scope": "local",
+  "host_class": null,
+  "anonymized": false,
+  "file_paths": ["src/lib/auth.ts"],
+  "created_at": "2026-04-07T00:00:00Z",
+  "expires_at": "2026-05-07T00:00:00Z"
+}
+```
+
+`schema_version` is the integer `1`. `scope` MUST be `local|private|public` — a file path belongs in `file_paths`, never in `scope` (GH#69). `expires_at` is derived per `type` via `deriveExpiresAt()` (`LEARNING_TTL_DAYS`).
+
+### Confidence Lifecycle
+
+| Event | Change |
+|-------|--------|
+| Created | 0.5 |
+| Confirmed (new evidence or user boost) | +0.15 (cap 1.0) |
+| Contradicted or user reduce | -0.2 |
+| Past `expires_at` date | Pruned on next write |
+| Confidence <= 0.0 | Pruned on next write |
+
+### Valid Learning Types
+
+| Type | What it captures |
+|------|-----------------|
+| `fragile-file` | Files changed too frequently across sessions/waves |
+| `effective-sizing` | Optimal agent/wave sizing per session type |
+| `recurring-issue` | Repeated failures or partial completions |
+| `scope-guidance` | How many issues fit well in a session |
+| `deviation-pattern` | Scope creep, underestimation, plan deviations |
+
+---
+
+## Critical Rules
+
+- NEVER modify `learnings.jsonl` without reading it first
+- NEVER skip deduplication (check `type` + `subject` match)
+- NEVER write learnings without user confirmation
+- ALWAYS use uuid-v4 for new learning IDs (generate via `uuidgen`)
+- ALWAYS derive `expires_at` per type via `deriveExpiresAt()` unless the candidate supplies one
+- ALWAYS write through `scripts/sweep-expired-learnings.mjs --prune` (snapshot, modify the sidecar keeping its header line, prune) — NEVER a shell rewrite of the store
+- ALWAYS cap confidence at 1.0
+- NEVER fabricate patterns -- only extract from actual session data with verifiable evidence
+- NEVER append to `learnings.jsonl` with `>>` -- the only write is the prune helper's atomic tmp-file + rename, which keeps a `.bak-<ISO>` snapshot

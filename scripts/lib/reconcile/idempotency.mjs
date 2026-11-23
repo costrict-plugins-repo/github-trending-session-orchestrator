@@ -1,0 +1,534 @@
+/**
+ * idempotency.mjs — Record-store I/O + logical dedupe + idempotency for the
+ * #695 FA2 Reconciliation Engine (Epic #693).
+ *
+ * This module OWNS all disk access for reconcile candidates. It is the
+ * reconcile-side sibling of `scripts/lib/skill-evolution/idempotency.mjs`
+ * (the C2 repair-candidates store) and mirrors its defensive posture: the
+ * store is ALWAYS rewritten in full via tmp-file + atomic rename and is NEVER
+ * appended to, because dedupe-by-`learning_key` must mutate/replace existing
+ * lines — an append would leave stale duplicates.
+ *
+ * Store: `.orchestrator/runtime/reconcile-candidates.jsonl` — a mutable
+ * work-queue in JSON-Lines format (one ReconcileCandidate per line). The store
+ * is OWNED by `mergeCandidates`: it is the only sanctioned writer. Nothing else
+ * — no report, no analysis run, no agent — may append to it; a read-side shape
+ * guard drops any record that is not a ReconcileCandidate and COUNTS the drop.
+ * The count reaches readers through the ONE reader ({@link loadCandidates}
+ * returns `{records, skipped}`) and writers through `mergeCandidates`'s
+ * `skipped` — there is deliberately no lossy array-only variant beside them.
+ *
+ * Two responsibilities differ from the repair store:
+ *   1. The IDEMPOTENCY KEY is the LOGICAL `learning_key` (issue #695), not the
+ *      physical hashed `id`. Two candidates with the same `learning_key`
+ *      describe the same reconciliation; the latest one replaces the older —
+ *      UNLESS the older is already processed (`processed_at !== null`), in
+ *      which case the processed verdict wins and is never regressed.
+ *   2. `makeCandidateId` mints the deterministic physical id from
+ *      `(learning_key, slug)` for stable referencing.
+ *
+ * I/O contract: this module NEVER throws on I/O. Reads return safe defaults
+ * (`[]`); the write helper swallows filesystem errors and `mergeCandidates`
+ * reports `written: false` on a write failure.
+ *
+ * Part of Epic #693 → issue #695 (FA2 Reconciliation Engine).
+ *
+ * @typedef {Object} ReconcileCandidate
+ * @property {string} id              - deterministic `rc-<sha256(learning_key + '\0' + slug)[:8]>`.
+ * @property {number} schema_version  - schema version (1).
+ * @property {string} learning_key    - THE logical dedupe key.
+ * @property {string} slug            - the `.claude/rules/<slug>.md` slug.
+ * @property {'proposed'|'rejected'} status
+ * @property {string} reason
+ * @property {number} confidence
+ * @property {string} created_at      - ISO timestamp.
+ * @property {string|null} processed_at  - terminal stamp (mirrors repair store).
+ * @property {string|null} superseded_by
+ * @property {string|null} [outcome]  - terminal disposition, one of:
+ *        `'written'` (writer.mjs persisted the rule file), `'already-on-disk'`
+ *        (engine.mjs found a matching `.claude/rules/` provenance block before
+ *        proposing — issue #484), or `'rejected'` (the operator declined the
+ *        proposal in the approval AUQ and writer.mjs archived it — issue #1042).
+ *        Optional and additive: `isCandidateShape` only requires `learning_key`
+ *        + `created_at`, so an older record without this field still round-trips
+ *        through the store unchanged, and nothing BRANCHES on the value —
+ *        terminality is `processed_at` alone (see {@link isProcessed}), so a
+ *        pre-#1042 record with no `outcome` keeps behaving exactly as before
+ *        (absence reads as `'written'`, the only outcome that existed then).
+ */
+
+import { readFileSync } from 'node:fs';
+import { isAbsolute, join } from 'node:path';
+import { createHash } from 'node:crypto';
+import { atomicWriteWithBackup } from '../io.mjs';
+import { appendVerdicts, isDecisionOutcome, loadVerdictLedger } from './verdict-ledger.mjs';
+
+/** Default repo-relative location of the reconcile-candidate work-queue. */
+export const DEFAULT_STORE_PATH = '.orchestrator/runtime/reconcile-candidates.jsonl';
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolve the store path against repoRoot when it is relative. An absolute
+ * storePath is honoured as-is. Falls back to {@link DEFAULT_STORE_PATH}, and
+ * to `process.cwd()` when no repoRoot is supplied.
+ * @param {string|undefined} repoRoot
+ * @param {string|undefined} storePath
+ * @returns {string}
+ */
+function resolveStorePath(repoRoot, storePath) {
+  const rel = typeof storePath === 'string' && storePath.length > 0 ? storePath : DEFAULT_STORE_PATH;
+  if (isAbsolute(rel)) return rel;
+  const root = typeof repoRoot === 'string' && repoRoot.length > 0 ? repoRoot : process.cwd();
+  return join(root, rel);
+}
+
+/**
+ * Minimal shape guard for a persisted store line. A record is accepted only
+ * when it carries the two fields every consumer of this store depends on:
+ *   - `learning_key` — THE logical dedupe key (`mergeCandidates`, `isProcessed`).
+ *   - `created_at`   — the recency axis (`reconcile-nudge-banner.mjs` `_lastRunAt`).
+ *
+ * This is deliberately NOT a full schema check: the store is a mutable
+ * work-queue whose records may gain fields across schema versions, so
+ * over-strict validation would silently drop legitimate future records. It
+ * rejects only records that no writer in this repo produces — the concrete
+ * incident being a hand-written report artefact using `candidate_id` /
+ * `generated_at` / `status:"candidate"` (2026-07-31, see
+ * `docs/reconcile/2026-07-31-reconcile-candidates.md`).
+ * @param {unknown} rec
+ * @returns {boolean}
+ */
+function isCandidateShape(rec) {
+  if (!rec || typeof rec !== 'object' || Array.isArray(rec)) return false;
+  const r = /** @type {Record<string, unknown>} */ (rec);
+  if (typeof r.learning_key !== 'string' || r.learning_key.length === 0) return false;
+  if (typeof r.created_at !== 'string') return false;
+  return true;
+}
+
+/**
+ * Read + defensively parse the store's JSONL lines into ReconcileCandidate
+ * records. Malformed lines (bad JSON, non-object) and shape-foreign records
+ * (see {@link isCandidateShape}) are skipped — the latter are COUNTED, because
+ * the store is a mutable work-queue that `mergeCandidates` rewrites in full, so
+ * a skipped line is dropped from disk on the next merge and a silent drop would
+ * be unattributable data loss. A missing file yields `{ records: [], skipped: 0 }`.
+ * Never throws.
+ * @param {string} absPath
+ * @returns {{ records: ReconcileCandidate[], skipped: number }}
+ */
+function readStore(absPath) {
+  let raw;
+  try {
+    raw = readFileSync(absPath, 'utf8');
+  } catch {
+    // ENOENT or any read error → empty store.
+    return { records: [], skipped: 0 };
+  }
+
+  /** @type {ReconcileCandidate[]} */
+  const records = [];
+  let skipped = 0;
+  for (const line of raw.split('\n')) {
+    const trimmed = line.trim();
+    if (trimmed.length === 0) continue;
+    let parsed;
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch {
+      skipped += 1;
+      continue; // skip malformed line
+    }
+    if (isCandidateShape(parsed)) {
+      records.push(/** @type {ReconcileCandidate} */ (parsed));
+    } else {
+      skipped += 1;
+    }
+  }
+  return { records, skipped };
+}
+
+/**
+ * Atomically rewrite the entire store from an in-memory record array. Creates
+ * the parent dir with mkdir -p semantics, writes a tmp file, then renames over
+ * the target (same-filesystem rename is atomic on POSIX). Never appends.
+ * Never throws — filesystem errors are returned as `{ ok: false, ... }`.
+ * @param {string} absPath
+ * @param {ReconcileCandidate[]} records
+ * @returns {{ ok: true, lines: number } | { ok: false, reason: 'fs-error', error: string }}
+ */
+function writeStore(absPath, records) {
+  let content;
+  try {
+    const body = records.map((r) => JSON.stringify(r)).join('\n');
+    content = records.length > 0 ? body + '\n' : '';
+  } catch (err) {
+    return { ok: false, reason: 'fs-error', error: err?.message ?? String(err) };
+  }
+  // mkdir -p + tmp + rename; its failure envelope is this function's own.
+  const res = atomicWriteWithBackup(absPath, content, { tmpPrefix: '.reconcile-candidates.tmp' });
+  return res.ok ? { ok: true, lines: records.length } : res;
+}
+
+/**
+ * True iff a candidate has a terminal `processed_at` stamp.
+ * @param {ReconcileCandidate|undefined|null} cand
+ * @returns {boolean}
+ */
+function isTerminal(cand) {
+  return !!cand && cand.processed_at !== null && cand.processed_at !== undefined;
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+/**
+ * Mint the deterministic physical id for a reconcile candidate. The same
+ * `(learningKey, slug)` pair always yields the same id, so it is a stable
+ * reference key. A NUL separator avoids cross-field collisions
+ * (e.g. `('ab','c')` vs `('a','bc')`). Never throws — coerces inputs to string.
+ * @param {string} learningKey
+ * @param {string} slug
+ * @returns {string} `rc-<sha256(learningKey + '\0' + slug)[:8]>`
+ */
+export function makeCandidateId(learningKey, slug) {
+  const key = typeof learningKey === 'string' ? learningKey : String(learningKey ?? '');
+  const s = typeof slug === 'string' ? slug : String(slug ?? '');
+  return 'rc-' + createHash('sha256').update(key + '\0' + s).digest('hex').slice(0, 8);
+}
+
+/**
+ * Build a ReconcileCandidate line-record for a proposed or rejected learning.
+ *
+ * Lives here — beside the {@link ReconcileCandidate} typedef it instantiates and
+ * the read-side `isCandidateShape` guard that judges it — so ONE file decides
+ * which fields a persisted record carries. It deliberately does NOT mint the
+ * `id` (see {@link makeCandidateId}): rejections currently derive their id from
+ * `(learningKey, 'rejected-<type>')` while storing `slug: ''`, so folding the
+ * mint in here using the record's own slug would change every rejection
+ * candidate's id and orphan every rejection row already on disk. Caller-supplied
+ * `id` keeps that decision at the call site.
+ *
+ * `created_at` is caller-supplied (from the engine's injectable clock) so output
+ * stays deterministic under test. `processed_at`/`superseded_by` always start
+ * null — only the merge/approval path stamps them. Never throws.
+ *
+ * @param {Object} params
+ * @param {string} params.id - deterministic physical id, see {@link makeCandidateId}.
+ * @param {string|null} params.learningKey - logical dedupe key; a non-string coerces to `''`.
+ * @param {string} params.slug - `.claude/rules/<slug>.md` slug (`''` for rejections).
+ * @param {'proposed'|'rejected'} params.status
+ * @param {string} params.reason
+ * @param {number} params.confidence
+ * @param {string} params.createdAt - ISO timestamp.
+ * @returns {ReconcileCandidate}
+ */
+export function buildCandidate({ id, learningKey, slug, status, reason, confidence, createdAt }) {
+  return {
+    id,
+    schema_version: 1,
+    learning_key: typeof learningKey === 'string' ? learningKey : '',
+    slug,
+    status,
+    reason,
+    confidence,
+    created_at: createdAt,
+    processed_at: null,
+    superseded_by: null,
+  };
+}
+
+/**
+ * Load the persisted store: every ReconcileCandidate that survives the read-side
+ * shape guard, PLUS the count of lines it rejected. Reads JSONL, skips malformed
+ * lines and shape-foreign records (missing `learning_key` / `created_at`),
+ * yields `{ records: [], skipped: 0 }` for a missing file. Does NOT create the
+ * runtime dir (mkdir -p happens only on write). Never throws.
+ *
+ * `skipped` is part of the return value rather than a second, "diagnostics"
+ * reader beside this one, because `records.length === 0` is AMBIGUOUS on its
+ * own: a missing store and a store whose every line is shape-foreign both yield
+ * `[]`, and a consumer that sees only the array reports "no reconcile run on
+ * record" for a store that in fact holds quarantined evidence of one (the
+ * concrete defect in `scripts/lib/reconcile-nudge-banner.mjs`, GitLab #955
+ * finding 2). Splitting the honest reader off under a longer name left the
+ * OBVIOUS name as the lossy one — the next consumer would reach for
+ * `loadCandidates`, get `[]`, and re-derive the same wrong conclusion. One
+ * reader, one answer.
+ *
+ * Read-only: unlike {@link mergeCandidates} this does NOT rewrite the store, so
+ * the skipped lines are still on disk after this call.
+ * @param {Object} [params]
+ * @param {string} [params.repoRoot] - repo root; relative `storePath` is resolved against it (defaults to `process.cwd()`).
+ * @param {string} [params.storePath] - store path (relative ⇒ joined to repoRoot). Defaults to {@link DEFAULT_STORE_PATH}.
+ * @returns {{ records: ReconcileCandidate[], skipped: number }}
+ */
+export function loadCandidates({ repoRoot, storePath } = {}) {
+  const absPath = resolveStorePath(repoRoot, storePath);
+  return readStore(absPath);
+}
+
+/**
+ * True iff `existing` already holds a candidate that shares `candidate`'s
+ * `learning_key` AND has a terminal `processed_at` stamp. The reconcile engine
+ * uses this to idempotently SKIP re-proposing a learning whose verdict is
+ * already terminal.
+ *
+ * Deliberately OUTCOME-AGNOSTIC: `processed_at` alone decides. A rule the
+ * operator DECLINED (`outcome: 'rejected'`, issue #1042) is therefore just as
+ * terminal as one that was written — an explicit "no" is a verdict, and
+ * re-asking every run is how it gets forgotten. By the same token a pre-#1042
+ * record carrying no `outcome` at all keeps its old meaning unchanged.
+ *
+ * Never throws.
+ * @param {ReconcileCandidate} candidate - the candidate under consideration.
+ * @param {ReconcileCandidate[]} existing - the currently-persisted candidates.
+ * @returns {boolean}
+ */
+export function isProcessed(candidate, existing) {
+  if (!candidate || typeof candidate !== 'object') return false;
+  const key = candidate.learning_key;
+  if (typeof key !== 'string' || key.length === 0) return false;
+  const list = Array.isArray(existing) ? existing : [];
+  return list.some((rec) => rec && rec.learning_key === key && isTerminal(rec));
+}
+
+/**
+ * Merge new candidates into the store, deduping by `learning_key`, then
+ * atomically rewrite the full store.
+ *
+ * Dedupe rule, per incoming candidate:
+ *   - If an existing candidate shares the same `learning_key` AND is already
+ *     processed (`processed_at !== null`) → KEEP existing (idempotent; do not
+ *     regress a terminal verdict).
+ *   - Else if an existing candidate shares the same `learning_key` → the NEW
+ *     candidate REPLACES it (keep latest).
+ *   - Else → add the new candidate.
+ *
+ * The runtime dir is created with mkdir -p semantics. The store is rewritten in
+ * full (read-all → merge → atomic tmp+rename), never appended. Output lines are
+ * sorted by `learning_key` for deterministic output. Never throws; on write
+ * failure returns `written: false`.
+ *
+ * `skipped` reports how many persisted lines the read-side shape guard rejected
+ * (malformed JSON, or a record missing `learning_key`/`created_at`). Because the
+ * store is rewritten in full, those lines are DROPPED from disk by this call —
+ * the count is what makes that loss attributable instead of silent.
+ *
+ * Verdict ledger (#1710): after a successful store write, and ONLY when
+ * `repoRoot` was passed explicitly, every terminal DECISION of the merged store
+ * (`isDecisionOutcome` — not the branch-scoped `written` / `already-on-disk` /
+ * absent outcome, see `BRANCH_SCOPED_OUTCOMES`) whose `learning_key` the
+ * append-only ledger (`./verdict-ledger.mjs`) does not yet hold is appended
+ * there — new stamps AND older sidecar verdicts (a one-time backfill). The
+ * ledger outlives the gitignored, checkout-local sidecar, so a fresh worktree
+ * keeps an operator decline. A ledger failure never turns a successful store
+ * write into a failure; it is reported in the additive `ledger` field (absent
+ * when the ledger was not consulted) and as ONE stderr WARN.
+ * @param {Object} [params]
+ * @param {ReconcileCandidate[]} [params.candidates] - newly minted candidates to merge.
+ * @param {string} [params.repoRoot]
+ * @param {string} [params.storePath]
+ * @returns {{ merged: ReconcileCandidate[], written: boolean, skipped: number, ledger?: { ok: boolean, appended: number, error?: string } }}
+ */
+export function mergeCandidates({ candidates, repoRoot, storePath } = {}) {
+  const absPath = resolveStorePath(repoRoot, storePath);
+  const { records: store, skipped } = readStore(absPath);
+
+  // Index existing records by learning_key for O(1) lookup. Last write wins for
+  // any pre-existing duplicates in the file (defensive — store should be unique).
+  /** @type {Map<string, ReconcileCandidate>} */
+  const byKey = new Map();
+  for (const rec of store) {
+    if (rec && typeof rec.learning_key === 'string') byKey.set(rec.learning_key, rec);
+  }
+
+  const incoming = Array.isArray(candidates) ? candidates : [];
+  for (const cand of incoming) {
+    if (!cand || typeof cand !== 'object' || typeof cand.learning_key !== 'string') continue;
+
+    const existing = byKey.get(cand.learning_key);
+    if (existing && isTerminal(existing)) {
+      // Terminal verdict wins — do not regress a processed candidate.
+      continue;
+    }
+    // New key, or live existing → the latest candidate replaces it.
+    byKey.set(cand.learning_key, cand);
+  }
+
+  const merged = Array.from(byKey.values()).sort((a, b) =>
+    String(a.learning_key).localeCompare(String(b.learning_key)),
+  );
+
+  const result = writeStore(absPath, merged);
+  const written = result.ok === true;
+  if (!written || typeof repoRoot !== 'string' || repoRoot.length === 0) {
+    return { merged, written, skipped };
+  }
+
+  const ledger = loadVerdictLedger(repoRoot);
+  if (ledger.readError) {
+    // Unreadable ledger: appending blind would duplicate every verdict.
+    process.stderr.write('⚠ mergeCandidates: verdict ledger unreadable — no verdicts mirrored this merge\n');
+    return { merged, written, skipped, ledger: { ok: false, appended: 0, error: 'ledger unreadable' } };
+  }
+  const missing = merged.filter(
+    (rec) => isTerminal(rec) && isDecisionOutcome(rec.outcome) && !ledger.terminalKeys.has(rec.learning_key),
+  );
+  const appended = appendVerdicts(repoRoot, missing);
+  if (appended.ok !== true) {
+    process.stderr.write(
+      `⚠ mergeCandidates: verdict ledger append failed (${appended.error ?? 'unknown error'}) — ` +
+        `${missing.length} verdict(s) not mirrored\n`,
+    );
+  }
+  return { merged, written, skipped, ledger: appended };
+}
+
+/**
+ * Stamp the persisted candidate for `learningKey` as terminally processed and
+ * write it back through {@link mergeCandidates} — the ONLY writer of this
+ * store, so this function opens no second write path and no new persisted
+ * format: `outcome` is an ordinary field alongside `processed_at`, and the
+ * read-side shape guard (`isCandidateShape`) only requires `learning_key` +
+ * `created_at`, so it accepts the stamped record unchanged.
+ *
+ * Looks up the existing record by `learningKey` first, so the write preserves
+ * everything the run that proposed it originally recorded (`slug`, `reason`,
+ * `confidence`, `created_at`) and only ADDS the terminal stamp. When no record
+ * exists yet — e.g. the proposing run used `dryRun` and never merged into the
+ * store, or `engine.mjs` discovered the on-disk `.claude/rules/` file directly
+ * without ever having proposed it in a prior run — a fresh terminal record is
+ * minted from the caller-supplied `fallback*` fields so a LATER run can still
+ * dedupe against it.
+ *
+ * `mergeCandidates`'s own dedupe rule still applies underneath this call: if
+ * the existing record is ALREADY terminal (a prior `processed_at`), the merge
+ * keeps the existing verdict and this call is a no-op on disk — a terminal
+ * verdict is never regressed, even by a second stamp attempt. One exception
+ * (#1710): a DECISION (`isDecisionOutcome`) stamped over a kept `written` /
+ * `already-on-disk` record is still appended to the verdict ledger (explicit
+ * `repoRoot` only), so a dropped or swept rule stays dropped in other checkouts.
+ *
+ * Never throws (delegates to the never-throwing `loadCandidates`/
+ * `mergeCandidates`); on write failure returns `{ written: false, ... }`.
+ *
+ * @param {Object} [params]
+ * @param {string} [params.learningKey] - required; a missing/empty key is a no-op (`{written:false, stamped:null}`).
+ * @param {'written'|'already-on-disk'|'rejected'|string} [params.outcome]
+ * @param {string} [params.processedAt] - ISO timestamp; defaults to `new Date().toISOString()`.
+ * @param {string} [params.fallbackSlug] - used only when no existing record is found.
+ * @param {string} [params.fallbackCandidateId] - used only when no existing record is found; defaults to `makeCandidateId(learningKey, fallbackSlug)`.
+ * @param {number} [params.fallbackConfidence] - used only when no existing record is found.
+ * @param {string} [params.repoRoot]
+ * @param {string} [params.storePath]
+ * @returns {{ written: boolean, stamped: ReconcileCandidate|null, alreadyProcessed?: boolean }}
+ *   `stamped` is the record as PERSISTED (read back out of `mergeCandidates`'s
+ *   merged array), never the one this call merely proposed — when a prior
+ *   terminal verdict wins the dedupe, the two differ and only the former is
+ *   true. `alreadyProcessed: true` marks exactly that case; `written` stays
+ *   `true` there, because the store holds the intended terminal state and
+ *   `written: false` means a WRITE FAILURE to the one production caller
+ *   (`writer.mjs`, which turns it into an operator-visible error).
+ */
+export function markCandidateProcessed({
+  learningKey,
+  outcome,
+  processedAt,
+  fallbackSlug,
+  fallbackCandidateId,
+  fallbackConfidence,
+  repoRoot,
+  storePath,
+} = {}) {
+  if (typeof learningKey !== 'string' || learningKey.length === 0) {
+    return { written: false, stamped: null };
+  }
+
+  const stampAt =
+    typeof processedAt === 'string' && processedAt.length > 0 ? processedAt : new Date().toISOString();
+
+  const { records: existing } = loadCandidates({ repoRoot, storePath });
+  const found = existing.find((rec) => rec && rec.learning_key === learningKey);
+
+  /** @type {ReconcileCandidate} */
+  let stamped;
+  if (found) {
+    stamped = { ...found, processed_at: stampAt, outcome: typeof outcome === 'string' ? outcome : (found.outcome ?? null) };
+  } else {
+    const slug = typeof fallbackSlug === 'string' ? fallbackSlug : '';
+    const finalOutcome = typeof outcome === 'string' ? outcome : null;
+    stamped = buildCandidate({
+      id:
+        typeof fallbackCandidateId === 'string' && fallbackCandidateId.length > 0
+          ? fallbackCandidateId
+          : makeCandidateId(learningKey, slug),
+      learningKey,
+      slug,
+      // A minted record is TERMINAL from birth (`processed_at` is set two lines
+      // below), so `status` must agree with `outcome` instead of always saying
+      // `'proposed'` — a record reading `status:'proposed'` while carrying
+      // `outcome:'rejected'` is self-contradictory and misreads as a live
+      // proposal to anything that renders `status`. The vocabulary is exactly
+      // the two members of the ReconcileCandidate typedef; nothing new is
+      // invented here: `'rejected'` for the operator-rejection outcome
+      // (writer.mjs, issue #1042), `'proposed'` for the accepted outcomes
+      // (`'written'` / `'already-on-disk'`), where the proposal stood.
+      status: finalOutcome === 'rejected' ? 'rejected' : 'proposed',
+      reason: 'stamped without a prior sidecar record',
+      confidence: typeof fallbackConfidence === 'number' ? fallbackConfidence : 0,
+      createdAt: stampAt,
+    });
+    stamped.processed_at = stampAt;
+    stamped.outcome = finalOutcome;
+  }
+
+  const result = mergeCandidates({ candidates: [stamped], repoRoot, storePath });
+
+  // Report what is PERSISTED, not what we asked for. `mergeCandidates`'s dedupe
+  // rule keeps an already-terminal existing record and DROPS the incoming one,
+  // so when `found` was already processed the store still holds the OLD
+  // `processed_at`/`outcome` — returning our freshly-built `stamped` would tell
+  // the caller a verdict that is nowhere on disk. `merged` IS the array that was
+  // just written, so reading the record back out of it is the honest answer.
+  const persisted = result.merged.find((rec) => rec && rec.learning_key === learningKey);
+
+  // A DECISION stamped over a kept branch-scoped terminal record (`written` /
+  // `already-on-disk`) never reaches the ledger through `mergeCandidates`: the
+  // store keeps the old outcome, and only decisions are mirrored. That is the
+  // rule-drop recipe and the expiry sweep's delete stamp — append it here so the
+  // drop holds in other checkouts too (#1710).
+  if (
+    result.written === true &&
+    typeof repoRoot === 'string' &&
+    repoRoot.length > 0 &&
+    isDecisionOutcome(outcome) &&
+    persisted &&
+    !isDecisionOutcome(persisted.outcome)
+  ) {
+    const ledger = loadVerdictLedger(repoRoot);
+    if (!ledger.readError && !ledger.terminalKeys.has(learningKey)) {
+      const appended = appendVerdicts(repoRoot, [{ learning_key: learningKey, outcome, processed_at: stampAt }]);
+      if (appended.ok !== true) {
+        process.stderr.write(
+          `⚠ markCandidateProcessed: verdict ledger append failed (${appended.error ?? 'unknown error'}) — ` +
+            `${outcome} for ${learningKey} not mirrored\n`,
+        );
+      }
+    }
+  }
+
+  return {
+    written: result.written === true,
+    stamped: persisted ?? stamped,
+    // `true` iff a prior terminal verdict won and this call changed nothing on
+    // disk. `written` deliberately stays `true` in that case: the store IS in
+    // the intended terminal state, and writer.mjs treats `written:false` as a
+    // stamp FAILURE worth an operator-visible error.
+    alreadyProcessed: isTerminal(found),
+  };
+}

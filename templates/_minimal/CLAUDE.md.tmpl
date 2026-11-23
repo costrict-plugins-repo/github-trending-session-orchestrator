@@ -1,0 +1,41 @@
+<!-- source: session-orchestrator plugin (canonical: templates/_minimal/CLAUDE.md.tmpl) — customize freely; this header records provenance only -->
+# {{PROJECT_TITLE}}
+
+{{PROJECT_DESCRIPTION}}
+
+## Stack Defaults
+
+- Language / runtime: {{STACK_LANGUAGE}}
+- Package manager: {{STACK_PACKAGE_MANAGER}}
+- Test runner: {{STACK_TEST_RUNNER}}
+- Linter: {{STACK_LINTER}}
+
+## Commands
+
+- Dev: `{{CMD_DEV}}`
+- Test: `{{CMD_TEST}}`
+- Build: `{{CMD_BUILD}}`
+- Lint: `{{CMD_LINT}}`
+
+## Conventions
+
+{{CONVENTIONS}}
+
+## Hard Rules
+
+{{HARD_RULES_TABLE}}
+
+## Session Config
+
+project-name: {{PROJECT_NAME}}
+vcs: {{VCS}}
+persistence: true
+enforcement: warn   # strict | warn | off
+waves: 5
+agents-per-wave: 6
+test-command: {{TEST_COMMAND}}
+typecheck-command: {{TYPECHECK_COMMAND}}
+lint-command: {{LINT_COMMAND}}
+plan-baseline-path: {{PLAN_BASELINE_PATH}}
+recent-commits: 20
+stale-branch-days: 7

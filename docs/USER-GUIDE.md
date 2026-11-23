@@ -1,0 +1,1539 @@
+# Session Orchestrator — User Guide
+
+Session Orchestrator is a plugin for Claude Code, Codex CLI, Cursor IDE and Pi that brings structured, wave-based development sessions to any project. It handles session planning, parallel agent execution, VCS integration, quality gates, and session close-out — so you can focus on deciding *what* to build while it orchestrates *how*.
+
+---
+
+## Table of Contents
+
+1. [Quick Start](#1-quick-start)
+2. [Bootstrap Gate](#2-bootstrap-gate)
+3. [Commands Reference](#3-commands-reference)
+4. [Session Types](#4-session-types)
+5. [Session Config Reference](#5-session-config-reference)
+6. [The Wave Pattern](#6-the-wave-pattern)
+7. [Workflow Walkthrough](#7-workflow-walkthrough)
+8. [VCS Integration](#8-vcs-integration)
+9. [Quality Gates](#9-quality-gates)
+10. [Design-Code Alignment (Pencil Integration)](#10-design-code-alignment-pencil-integration)
+11. [Ecosystem Health](#11-ecosystem-health)
+12. [Quality Discovery](#12-quality-discovery)
+13. [Harness Audit](#13-harness-audit)
+14. [Session Persistence](#14-session-persistence)
+15. [Safety Features](#15-safety-features)
+16. [Session Metrics](#16-session-metrics)
+17. [Cross-Session Learning](#17-cross-session-learning)
+18. [Adaptive Wave Sizing](#18-adaptive-wave-sizing)
+19. [Cheat Sheet](#19-cheat-sheet)
+20. [FAQ](#20-faq)
+21. [Troubleshooting](#21-troubleshooting)
+
+---
+
+## 1. Quick Start
+
+### Install the plugin
+
+#### Claude Code
+
+Claude Code also has a `claude plugin` shell CLI (`claude plugin --help` lists subcommands). For end-user installation, use the slash commands inside a running session — run these in the Claude Code prompt:
+
+**From GitHub (recommended for end users):**
+
+```text
+/plugin marketplace add Kanevry/session-orchestrator
+/plugin install session-orchestrator@kanevry
+```
+
+**From a local clone (for contributors or offline work):**
+
+```text
+/plugin marketplace add /absolute/path/to/session-orchestrator
+/plugin install session-orchestrator@kanevry
+```
+
+After installation, starting Claude Code will display:
+
+```
+🎯 Session Orchestrator vX.Y.Z — /session [housekeeping|feature|deep] | /plan [new|feature|retro] | /discovery [scope] | /evolve [analyze|review|list]
+```
+
+#### Codex
+
+Clone the repository, then run the installer from the plugin root:
+
+```bash
+git clone https://github.com/Kanevry/session-orchestrator.git
+cd session-orchestrator
+npm install
+node scripts/codex-install.mjs
+codex plugin list --available --json
+```
+
+The installer uses Codex's public `plugin marketplace add` and `plugin add` lifecycle. Marketplace configuration only makes the plugin discoverable; the list output must separately show `session-orchestrator@kanevry` as installed and enabled. Next, fully restart Codex or start a fresh task, run `/hooks`, and review the bundle before approving it. Hook trust is operator-controlled and is never written or bypassed by the installer.
+
+Rerun the installer after pulling changes. It performs `plugin add` on every run to refresh the installed bundle. The committed `.codex-plugin/plugin.json` version uses `+codex.<UTC timestamp>` as an explicit invalidation marker; the installer validates that tracked version but never rewrites it. For the full lifecycle, hook subset, and troubleshooting steps, see [`docs/codex-setup.md`](codex-setup.md).
+
+### Add Session Config to your project
+
+Open your project's Session Config host file and add a `## Session Config` section:
+
+- `CLAUDE.md` on Claude Code
+- `AGENTS.md` on Codex and Pi
+
+A minimal configuration looks like this:
+
+```markdown
+## Session Config
+
+test-command: npm test
+typecheck-command: npm run typecheck
+lint-command: npm run lint
+agents-per-wave: 6
+waves: 5
+persistence: true
+enforcement: warn
+vcs: github
+```
+
+If you skip this step, the plugin defaults to 6 agents per wave and auto-detects VCS. A bare `/session` defaults to `deep` (a fixed 5-wave shape — see [`docs/session-config-reference.md`](session-config-reference.md#session-shapes) § Session Shapes for the full per-type wave/agent-cap table). See [`docs/session-config-template.md`](session-config-template.md) for the full field walkthrough.
+
+### Run your first session
+
+```
+/session feature
+```
+
+The orchestrator researches your project state autonomously, presents findings with recommendations, and asks you to pick a direction. Once you agree on a plan, run `/go` to execute it across multiple parallel agents in structured waves. When done, run `/close` to verify, commit, and clean up.
+
+### What you get
+
+| What | How |
+|---|---|
+| Errors stop at the next check | Each wave runs your tests and typecheck; lint and the full suite run before the commit. `/debug` looks for the root cause before a fix. |
+| Agents keep to their files | Overlapping file lists are rejected before dispatch. A guard has 14 blocking and 4 warning rules for destructive commands (hard reset, `rm -rf`, force-push, `DROP TABLE`, …), see [`.orchestrator/policy/blocked-commands.json`](../.orchestrator/policy/blocked-commands.json). |
+| Pick up where you stopped | A crash or a second session in the same folder does not cost you the work: `STATE.md` and a heartbeat lock keep the thread. |
+| Audit and test on demand | `/test` drives web and macOS flows, `/ux-grill` audits a running web app, `/repo-audit` and `/harness-audit` score a repository, `/test-audit` removes tests that catch nothing, `/public-audit` measures a site's public technical discoverability from a manifest you provide (redirects, metadata, sitemaps, robots; no login, no ranking claims). |
+| Longer runs | `/autopilot` chains sessions and stops on any of 10 kill-switches; `/dispatcher` and `/portfolio` work across repositories. |
+
+Every skill, command, agent and hook: [components.md](components.md). What changed lately: [CHANGELOG.md](../CHANGELOG.md).
+
+---
+
+## 2. Bootstrap Gate
+
+The Bootstrap Gate ensures every repository has a minimal structure before any orchestrator command runs. It exists because LLMs will rationalize their way past soft warnings in empty repos — Codex was observed bypassing the `/plan` Phase-0 abort entirely by falling back to "pragmatic paths", leaving repos unstructured. The gate replaces soft warnings with a state-file-backed, non-bypassable check that works identically on all four tools (Claude Code, Codex CLI, Cursor IDE and Pi).
+
+### When the gate runs
+
+Phase 0 of every orchestrator skill — `/session`, `/go`, `/close`, `/plan`, `/discovery`, and `/evolve` — checks for three conditions before doing anything else:
+
+1. A `CLAUDE.md` (or `AGENTS.md` on Codex and Pi) exists in the project root
+2. That file contains a `## Session Config` section
+3. `.orchestrator/bootstrap.lock` is committed to the repository
+
+If all three are present, the gate passes silently in under a second. If any are missing, the bootstrap flow starts.
+
+### What happens in an empty repo
+
+When the gate triggers, the orchestrator:
+
+1. Reads your first prompt to infer what kind of project this is
+2. Recommends an intensity tier (see below) with one sentence of rationale
+3. Asks you to confirm with a single yes/no question (or choose a different tier)
+4. Runs the bootstrap flow for your tier
+5. Commits `.orchestrator/bootstrap.lock` and exits
+
+You then re-run your original command and proceed normally. The gate never fires again for this repo unless you delete the lock file.
+
+### The three tiers
+
+Tiers are cumulative — Standard includes everything Fast does, Deep includes everything Standard does.
+
+#### Fast — demos, spikes, prototypes
+
+Suitable for: a Glücksrad demo, a weekend prototype, a proof-of-concept you may throw away.
+
+Sets up:
+- Minimal `CLAUDE.md` with `## Session Config` (3-4 fields)
+- `.orchestrator/bootstrap.lock`
+
+No VCS issues, no PRD, no test scaffolding required.
+
+#### Standard — MVPs, internal tools, small SaaS
+
+Suitable for: a small SaaS product, an internal admin tool, a personal project you intend to maintain.
+
+Sets up everything in Fast, plus:
+- Standard `CLAUDE.md` with full Session Config
+- Baseline directory structure per archetype
+- VCS labels created (`priority::*`, `status:*`, `type:*`)
+- Initial `STATUS.md` SSOT file
+
+#### Deep — customer-facing systems, team repos, production
+
+Suitable for: a customer-facing product, a shared team repository, anything with SLAs or compliance requirements.
+
+Sets up everything in Standard, plus:
+- Full PRD scaffolding in `docs/prd/`
+- CI configuration baseline
+- Security policy stub
+- Comprehensive label taxonomy
+- `CONTRIBUTING.md` with session workflow conventions
+
+### Public path (no local baseline)
+
+If you do not have a local `projects-baseline` directory configured, the gate falls back to plugin-bundled minimal templates. Five archetypes are available:
+
+| Archetype | Use for |
+|-----------|---------|
+| `_minimal` | Any project not matching a specific archetype |
+| `static-html` | Static sites, landing pages |
+| `node-minimal` | Node.js scripts, CLI tools, Express APIs |
+| `nextjs-minimal` | Next.js applications |
+| `python-uv` | Python projects using uv |
+
+On Claude Code, `claude init` generates a baseline and then the gate proceeds normally. On Codex and Cursor, the plugin-bundled templates are used directly.
+
+### The `/bootstrap` command
+
+You can also run the bootstrap flow explicitly, outside of any session:
+
+```
+/bootstrap                    # Auto-detect tier from project context
+/bootstrap --fast             # Force Fast tier
+/bootstrap --standard         # Force Standard tier
+/bootstrap --deep             # Force Deep tier
+/bootstrap --upgrade standard # Upgrade an existing Fast repo to Standard
+/bootstrap --retroactive      # Bootstrap an existing repo without resetting it
+```
+
+`--retroactive` is the recommended path for existing repos that predate the Bootstrap Gate — it adds the missing `CLAUDE.md` structure and lock file without touching your existing code or configuration.
+
+### Use a configured baseline
+
+Standard and Deep bootstrap can read the validated archetype contract from your
+configured local baseline. Existing project markers select a matching archetype;
+an empty or unrecognized project presents the baseline's available choices.
+The selected contract supplies templates, runtime and package-manager versions,
+commands, CI expectations, and required rules. Existing project files are
+preserved and reported for review.
+
+Configuration resolves from `SO_BASELINE_PATH`, a matching named baseline,
+`owner.yaml` paths, then the project's `plan-baseline-path`. Lookup is offline
+and does not install packages. An absent baseline uses the bundled public
+templates; an invalid configured contract stops before writing files. Missing
+quality gates are reported as unavailable. See [Baseline integration](baseline.md)
+for the contract and configuration details.
+
+### Anti-bureaucracy promise
+
+- **Normal flow:** exactly 1 question (tier confirmation)
+- **Ambiguous public path:** maximum 2 questions (archetype selection + tier confirmation)
+- The gate is idempotent — re-running it on an already-bootstrapped repo is a no-op
+- `.orchestrator/bootstrap.lock` is the mechanical truth — no external service, no network call
+
+### Troubleshooting: retroactively bootstrapping an existing repo
+
+If you have an existing repo that was created before the Bootstrap Gate and every orchestrator command now stops at Phase 0:
+
+```
+/bootstrap --retroactive
+```
+
+This adds the required structure around your existing files without modifying them. It takes under a minute.
+
+---
+
+## 3. Commands Reference
+
+This section introduces the core commands of the session lifecycle — the ones the subsections below document in detail. Session Orchestrator ships many more; the full command inventory lives in [`docs/components.md`](components.md).
+
+| Command | Purpose | When to use |
+|---------|---------|-------------|
+| `/session [type]` | Start a new session | Beginning of a work session |
+| `/go` | Approve the plan and begin wave execution | After reviewing the proposed wave plan |
+| `/close` | End the session with verification and commits | When all waves are complete |
+| `/discovery [scope]` | Systematic quality discovery and issue detection | Anytime, or automatically during `/close` |
+| `/plan [mode]` | Structured project planning and PRD generation | Before starting a session, or standalone |
+| `/evolve [mode]` | Extract and manage cross-session learnings | After 2+ sessions, or to review/prune learnings |
+
+### `/session [type]`
+
+Starts a new development session. Accepts one argument: `housekeeping`, `feature`, or `deep`. With no argument, `/session` defaults to `deep`. In a repo with no measured session history, an interactive `/session` asks for the task and mode first and recommends `feature`.
+
+```
+/session feature
+/session housekeeping
+/session deep
+```
+
+This triggers autonomous research: git state, open issues, SSOT freshness, CI status, cross-repo health, and more. You then review findings and pick a direction before any code changes happen.
+
+### `/go`
+
+Approves the wave plan and begins execution. You can optionally pass additional instructions:
+
+```
+/go
+/go focus on the API endpoints first
+```
+
+This dispatches parallel subagents wave by wave. You do not need to intervene during execution — the orchestrator handles inter-wave reviews and plan adaptation automatically.
+
+### `/close`
+
+Ends the session. This runs a full verification against the agreed plan, creates issues for any gaps, runs quality gates, commits cleanly, pushes, mirrors (if configured), and presents a session summary. If the session changed UI files that the repo can render and no design review covers them, `/close` warns that it would refuse (warn-only, with no automatic switch; `design-review.close-gate: refuse` enforces it); where nothing can be rendered or the change cannot be measured, `/close` passes with a WARNING (`docs/session-config-reference.md` § Design Review).
+
+```
+/close
+```
+
+### `/plan [mode]`
+
+Structured requirement gathering, PRD generation, and issue creation. Accepts one argument: `new`, `feature`, or `retro`.
+
+```
+/plan new
+/plan feature
+/plan retro
+```
+
+**`/plan new`** — Full project kickoff. Gathers requirements across 3 waves of questions (core decisions, technical details, business scope), generates an 8-section PRD, optionally scaffolds the repository, and creates a prioritized Epic with sub-issues. Typically 30-45 minutes.
+
+**`/plan feature`** — Compact feature planning. Gathers requirements in 1-2 waves, generates a 5-section PRD with acceptance criteria, and creates feature sub-issues. Typically 5-15 minutes.
+
+**`/plan retro`** — Data-driven retrospective. Reads session metrics from `.orchestrator/metrics/sessions.jsonl`, surfaces trends and patterns, guides reflection, and creates improvement issues. Typically 10-20 minutes.
+
+**When to use `/plan` vs `/session`:**
+- `/plan` answers **"What should we build?"** — requirements, PRDs, issues
+- `/session` answers **"How do we build it?"** — wave planning, agent execution, verification
+
+`/plan` runs outside of sessions. Its output (PRD + issues) feeds into the next `/session`, which picks from those issues and executes them. You can skip `/plan` entirely and create issues manually — sessions work with any existing issues.
+
+**Optional, used by `/plan new`:** `plan-baseline-path` in Session Config (or resolved host-locally, see below). `/plan new` uses it when configured, else the plugin-bundled templates (`static-html`, `node-minimal`, `nextjs-minimal`, `python-uv`) — the same fallback `/bootstrap` uses. `/plan feature` and `/plan retro` run without it.
+
+**Optional private capability context:** For new-project or session planning, you can
+supply a small catalog excerpt or authorize a particular offline, read-only local
+catalog lookup and state that its planning destination is private/internal. The
+planner uses at most five matches to explain reuse alternatives and remaining
+contract checks. Existing authorization carries forward. Missing or unsuitable
+context leaves ordinary planning available; a match does not authorize adoption.
+Private findings stay out of public output and generated repositories. This needs
+no new Session Config key; see the [shared procedure](../skills/_shared/private-capability-context.md).
+
+---
+
+## 4. Session Types
+
+Wave count, roles, and per-wave agent caps are resolved by one module — `scripts/lib/session-shape.mjs` — not derived by hand from `waves`/`agents-per-wave`. Run the CLI yourself to see exactly what a given mode resolves to before starting a session:
+
+```
+node scripts/session-shape.mjs --repo-root "$PWD" --session-type <housekeeping|feature|deep> \
+  [--profile ultradeep] [--known-scope true|false] --no-event
+```
+
+It prints one JSON line (`totalWaves`, `waves[]` with each wave's `role`/`agentCap`/`maxTurns`/`verification`, `discovery`, `wavesConfigHonored`, `notes`) and, without `--no-event`, records `orchestrator.session.shape_resolved` to `.orchestrator/metrics/events.jsonl`.
+
+### Housekeeping — the maintenance loop
+
+Best for: git cleanup, SSOT refresh, CI fixes, branch merges, documentation updates.
+
+- **Execution model:** **1 coordinator-direct wave.** Housekeeping *is* the maintenance loop: drift-check → expired-learnings sweep → `/evolve analyze` → `/reconcile` → `/evolve dialectic` → `/memory-cleanup` → `/backlog`, then any operator-selected housekeeping issues appended in the order picked. No wave-executor dispatch for the loop itself — most of those steps are `AskUserQuestion`-gated, and AUQ does not exist inside a dispatched subagent.
+- **Agents:** 0 dispatched for the loop (the coordinator runs it directly); the dialectic step dispatches the read-only `dialectic-deriver` subagent.
+- **Typical duration:** Short
+- **Use when:** Your repo needs maintenance, not new features — or when the session-start `maintenance-due` banner tells you it's overdue.
+
+```
+/session housekeeping
+```
+
+### Feature — 3 waves
+
+Best for: frontend/backend feature work, implementing issues, standard development.
+
+- **Execution model:** 3 waves — Impl-Core → Impl-Polish+Quality → Finalization.
+- **Agents:** capped at 4 / 4 / 2 respectively (subject to `agents-per-wave`).
+- **Typical duration:** Medium
+- **Use when:** You have feature issues to implement
+
+```
+/session feature
+```
+
+### Deep — 5 waves (4 when scope is already known)
+
+Best for: complex backend work, security audits, database refactoring, architecture changes.
+
+- **Execution model:** 5 waves — Discovery → Impl-Core → Impl-Polish → Quality → Finalization. When the agreed scope is already fully known (`--known-scope true`), Discovery is dropped and the rest renumbered to 4 waves.
+- **Agents:** capped at 8 / 10 / 8 / 6 / 4 per wave respectively (subject to `agents-per-wave`).
+- **Typical duration:** Longer
+- **Use when:** The work requires extensive discovery, testing, or touches critical systems
+
+```
+/session deep
+```
+
+### Ultradeep — 7 fixed waves (a profile over `deep`)
+
+Best for: sessions that outgrow 5 waves — large audits, work needing web research before implementation, or a release that benefits from an independent review panel.
+
+- **Execution model:** a **fixed 7-wave shape** — Research+Code-Discovery → Synthesis-Gate (coordinator-direct, 0 agents, blocking `AskUserQuestion`) → Impl-Core → Impl-Polish → Review-Panel (read-only) → Quality → Release/Finalization. It IGNORES the `waves` Session Config value outright (`wavesConfigHonored: false`) — there is no "waves < 7 is an error" check; the profile just reports that it ignored the configured number.
+- **Agents:** capped at 18 / 0 / 8 / 8 / 3 / 6 / 4 per wave respectively; `max-turns` is set PER WAVE (40 / — / 25 / 25 / 25 / 25 / 15), not one flat number.
+- **Typical duration:** Longest
+- **Use when:** `/session deep` would work but the scope needs research first, or you want a dedicated review panel before Quality.
+
+```
+/session deep --profile ultradeep    # or the /session ultradeep alias, per commands/session.md
+```
+
+---
+
+## 5. Session Config Reference
+
+> **Skill authors:** The authoritative field reference used by all skills is [`docs/session-config-reference.md`](session-config-reference.md). Update that file when adding or changing Session Config fields.
+
+Add a `## Session Config` section to your project's Session Config host file to configure how Session Orchestrator behaves in that repository:
+
+- `CLAUDE.md` on Claude Code
+- `AGENTS.md` on Codex and Pi
+
+### Example
+
+```markdown
+## Session Config
+
+- **agents-per-wave:** 6
+- **waves:** 5
+- **pencil:** designs/app.pen
+- **cross-repos:** [api-service, shared-lib]
+- **ssot-files:** [.claude/STATUS.md]
+- **mirror:** github
+- **ecosystem-health:** true
+- **vcs:** gitlab
+- **gitlab-host:** gitlab.company.com
+- **health-endpoints:** [{name: "API", url: "https://api.example.com/health"}, {name: "Worker", url: "http://worker:8080/healthz"}]
+- **special:** "Always run database migrations before testing"
+- **test-command:** pnpm vitest run
+- **stale-issue-days:** 14
+- **persistence:** true
+- **plan-baseline-path:** ~/Projects/projects-baseline
+- **plan-default-visibility:** internal
+- **plan-prd-location:** docs/prd/
+- **plan-retro-location:** docs/retro/
+- **memory-cleanup-threshold:** 5
+- **enforcement:** warn
+- **isolation:** auto
+- **max-turns:** auto
+```
+
+### Field Reference
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `agents-per-wave` | integer | `6` | Maximum number of parallel subagents per wave. Higher values increase parallelism but use more resources. Supports the per-type override syntax `6 (deep: 18)` — see [§ 4 Session Types](#4-session-types). |
+| `waves` | integer | `5` | Base wave count. The wave count actually used is resolved per session type by `scripts/session-shape.mjs` (see [§ 4 Session Types](#4-session-types)) — `feature` and `deep` each have one natural shape and ignore a disagreeing `waves` value; the `ultradeep` profile ignores it outright. |
+| `pencil` | string | none | Path to a `.pen` design file (relative to project root). Enables design-code alignment reviews after Impl-Core and Impl-Polish waves. |
+| `cross-repos` | list | none | Related repositories; the orchestrator checks their git state and critical issues during session start. A bare name resolves to `~/Projects/<name>`, an entry starting with `/` or `~/` is a path, a missing folder is skipped with a hint. Full rule: [Session Config Reference](session-config-reference.md), `cross-repos` row. |
+| `ssot-files` | list | none | Single Source of Truth files to track for freshness (e.g., `STATUS.md`, `STATE.md`). Flagged if older than 5 days. |
+| `mirror` | string | `none` | Mirror target after push. Set to `github` to automatically push to a GitHub remote after every session commit. |
+| `ecosystem-health` | boolean | `false` | Enable service health checks at session start. Requires `health-endpoints` to be configured. |
+| `vcs` | string | auto-detect | Version control platform: `github` or `gitlab`. Auto-detected from git remote URL if not set. |
+| `gitlab-host` | string | from remote | Custom GitLab hostname. Only needed if the host cannot be inferred from the git remote URL. |
+| `health-endpoints` | list | none | Service URLs to check health. Each entry is an object with `name` and `url` fields. |
+| `special` | string | none | Repo-specific instructions. Freeform text that the orchestrator reads and follows during sessions. |
+| `test-command` | string | `npm test` | Custom test command. Used by quality gates for all test invocations. |
+| `typecheck-command` | string | `npm run typecheck` | Custom TypeScript check command. Set to `skip` for non-TS projects. |
+| `lint-command` | string | `npm run lint` | Custom lint command. Used by the Full Gate quality check at session end. |
+| `ssot-freshness-days` | integer | `5` | Days before an SSOT file is flagged as stale during session start. |
+| `plugin-freshness-days` | integer | `30` | Days before the plugin itself is flagged as potentially outdated. |
+| `recent-commits` | integer | `20` | Number of recent commits to display during session start git analysis. |
+| `issue-limit` | integer | `50` | Maximum issues to fetch when querying VCS during session start. |
+| `stale-branch-days` | integer | `7` | Days of inactivity before a branch is flagged as stale. |
+| `stale-issue-days` | integer | `30` | Days without progress before an issue is flagged for triage. |
+| `discovery-on-close` | boolean | `true` | Run discovery probes automatically during `/close`. `auto` or an absent key means `true`; set `false` explicitly for a faster close. |
+| `discovery-probes` | list | `[all]` | Probe categories to run: `all`, `code`, `infra`, `ui`, `arch`, `session`, `audit`, `vault`, `feature`. |
+| `discovery-exclude-paths` | list | `[]` | Glob patterns to exclude from discovery scanning (e.g., `vendor/**`, `dist/**`). |
+| `discovery-severity-threshold` | string | `low` | Minimum severity for reported findings: `critical`, `high`, `medium`, `low`. |
+| `discovery-confidence-threshold` | integer | `60` | Minimum confidence score (0-100) for discovery findings to be reported. Findings below this threshold are auto-deferred. |
+| `issue-budget.max-per-session` | integer | `12` | Per-session cap on non-exempt issue creations. A **quantity** gate — unlike the two `discovery-*-threshold` filters above, which score individual findings and cannot bound volume. `priority::critical`, the carryover class and `broken-window` issues are exempt. |
+| `issue-budget.mode` | string | `strict` | `strict` blocks over-cap creations and parks them; `warn` allows with a stderr notice; `off` disables the gate. |
+| `issue-budget.overflow` | string | `collect-issue` | Where parked creations are drained at session-end: `collect-issue` (one `[Backlog-Sammel]` issue) or `vault-note` (one file under `vault/00-inbox/`). |
+| `persistence` | boolean | `true` | Enable session resumption via STATE.md and session memory files. |
+| `plan-baseline-path` | string | none | Path to projects-baseline directory (e.g., `~/Projects/projects-baseline`). Optional. When absent, `/plan new` and `/bootstrap` fall back to plugin-bundled minimal templates; `/plan feature` and `/plan retro` never need it. |
+| `plan-default-visibility` | string | `internal` | Default repo visibility for `/plan new`: `internal`, `private`, or `public`. |
+| `plan-prd-location` | string | `docs/prd/` | Directory where PRD documents are saved (relative to project root). |
+| `plan-retro-location` | string | `docs/retro/` | Directory where retrospective documents are saved (relative to project root). |
+| `memory-cleanup-threshold` | integer | `5` | Recommend `/memory-cleanup` after N accumulated session memory files. |
+| `memory-cleanup-soft-limit` | integer | `180` | Hard ceiling on accumulated memory files before the cleanup nudge escalates from soft suggestion to strong recommendation. PRD F2.2 / issue #502. |
+| `vault-mirror.quality.min-narrative-chars` | integer | `400` | Minimum free text (characters in the session record's `notes` / `narrative` / `summary`) before a session gets its own vault note; below it the session becomes a row in the month rollup `50-sessions/<repo>/_rollup-YYYY-MM.md`. PRD F1.2 / #504, #1513. |
+| `vault-mirror.quality.min-confidence` | float | `0.5` | Minimum learning confidence (0.0..1.0) before a learning note is mirrored. Set to `0.0` to mirror every learning regardless of confidence. PRD F1.2 / issue #504. |
+| `cold-start.enabled` | boolean | `true` | Master toggle for the cold-start detector. When `false`, no idle-time nudges fire at session-start. PRD F1.3 / issue #500. |
+| `cold-start.nudge-after-hours` | integer | `1` | Hours of wall-clock idle (since the last session-end) before the cold-start detector fires a nudge. PRD F1.3 / issue #500. |
+| `cold-start.silence-after-sessions` | integer | `1` | Consecutive silent sessions (no commits, no learnings) before the cold-start detector fires a nudge. PRD F1.3 / issue #500. |
+| `enforcement` | string | `warn` | Hook enforcement level for scope and command restrictions: `strict`, `warn`, or `off`. |
+| `isolation` | string | `auto` | Agent isolation mode: `worktree`, `none`, or `auto`. `auto` resolves per-wave via the graduated default (#194): ≤2 agents → `none`, 3–4 agents on feature/deep → `worktree`, ≥5 agents → `worktree`, housekeeping 3–4 → `none`. See Section 15 "Isolation Graduation" below. |
+| `max-turns` | integer or string | `auto` | Max agent turns before PARTIAL. Auto-resolves per session shape (`scripts/lib/session-shape.mjs`): 8 for housekeeping, 15 for feature, 25 for deep — applied to every wave. The `ultradeep` profile sets it PER WAVE instead (40 for Research+Code-Discovery, 25 for Impl-Core/Impl-Polish/Quality, 15 for Release/Finalization). See [§ 4 Session Types](#4-session-types). |
+
+> **Security:** Do not embed credentials, API keys, or auth tokens in Session Config fields — especially `health-endpoints` URLs. These values are stored in your config host file (`CLAUDE.md` / `AGENTS.md`) which may be committed to version control. Use header-based auth or separate secret management instead.
+
+### Minimal Config
+
+If you add no Session Config at all, the orchestrator uses these defaults:
+
+- Session type: `/session` defaults to `deep` independently of Session Config.
+- Agents per wave: `6`
+- Waves: `5`
+- VCS: auto-detected from git remote
+- Everything else: disabled/none
+
+See [examples](examples/) for project-specific configurations (Next.js, Express API, Swift iOS).
+
+---
+
+## 6. The Wave Pattern
+
+Feature and deep sessions execute work in structured waves drawn from the same 5 named roles (some combined into one wave, depending on session type — see [§ 4 Session Types](#4-session-types)). Each wave has a specific purpose, and agents within a wave run in parallel.
+
+### Wave Structure
+
+| Role | Purpose | Agents modify code? |
+|------|---------|---------------------|
+| **Discovery** | Understand the current state before changing anything | No (read-only) |
+| **Impl-Core** | Core feature work — the primary implementation | Yes |
+| **Impl-Polish** | Polish, fix Impl-Core issues, integration, edge cases | Yes |
+| **Quality** | Tests, TypeScript checks, lint, security review | Yes (tests only) |
+| **Finalization** | Documentation, issue cleanup, commit preparation | Minimal |
+
+### Role-to-Wave Mapping
+
+**As of 2026-09-09, this mapping is resolved by `scripts/session-shape.mjs` per session type — it is no longer a function of the `waves` config value.** The former table (`waves: 3/4/5/6+` → a re-combined role mapping) is retired; a `waves` value that disagrees with a type's natural shape is now IGNORED and reported in the shape's `notes`, never used to re-combine roles. See [§ 4 Session Types](#4-session-types) for the CLI, and the per-type wave lists there:
+
+| Session type | Waves | Roles |
+|---|---|---|
+| `housekeeping` | 1 | Housekeeping (coordinator-direct maintenance loop) |
+| `feature` | 3 | Impl-Core → Impl-Polish+Quality → Finalization |
+| `deep` (scope not yet known) | 5 | Discovery → Impl-Core → Impl-Polish → Quality → Finalization |
+| `deep` (scope known) | 4 | Impl-Core → Impl-Polish → Quality → Finalization |
+| `deep` + `ultradeep` profile | 7 (fixed, ignores `waves`) | Research+Code-Discovery → Synthesis-Gate → Impl-Core → Impl-Polish → Review-Panel → Quality → Release/Finalization |
+
+### Wave Details
+
+**Discovery**
+Agents audit affected code paths, verify assumptions from the plan, check existing test coverage, and identify edge cases. This wave is read-only: no files are modified. If discoveries warrant it, the plan is adjusted before Impl-Core begins.
+
+**Impl-Core**
+The primary implementation wave. Agents write core feature code, database changes, API endpoints, and primary UI components. Each agent has a clearly scoped set of files and acceptance criteria. Output: a working (possibly rough) implementation.
+
+**Impl-Polish**
+Agents fix issues discovered during Impl-Core, implement secondary features, handle integration between Impl-Core outputs, and address edge cases. If Pencil design review is configured, a design-code alignment check runs after this wave.
+
+**Quality**
+Before test writers run, the orchestrator dispatches 1-2 simplification agents that scan all files changed in the session (excluding test files) and clean up common AI-generated code patterns — unnecessary try-catch wrappers, over-documentation, re-implemented stdlib functions, and redundant boolean logic. These agents reference `slop-patterns.md` (produced by the discovery skill) and do not change functionality. After simplification, the remaining agents write and update tests, run quality checks per the quality-gates skill, and perform a security review. Goal: all tests passing, zero TypeScript errors, no lint violations.
+
+**Finalization**
+One or two agents update SSOT files, close or update issues, write session handover documentation, and prepare clean commits. No new feature work happens here.
+
+### Agent Counts by Session Type
+
+These are the shape table's RAW per-wave ceilings (`agentCapRaw` in the `scripts/session-shape.mjs` JSON) — not a range the orchestrator picks within by feel:
+
+| Session Type | Discovery | Impl-Core | Impl-Polish | Quality | Finalization |
+|-------------|-----------|-----------|-------------|---------|-------------|
+| housekeeping | — | — (0, coordinator-direct) | — | — | — |
+| feature | — | 4 | 4 (combined w/ Quality) | *(combined)* | 2 |
+| deep | 8 | 10 | 8 | 6 | 4 |
+
+**The number actually used (`agentCap`) is `min(raw, agents-per-wave)`.** With the documented default `agents-per-wave: 6`, a `deep` session's Discovery/Impl-Core/Impl-Polish waves are clipped DOWN to 6 — the 8/10/8 above only apply once you raise the cap for that type, e.g. `agents-per-wave: 6 (deep: 18)` (this plugin's own committed config). `feature`'s 4/4/2 already sit under the default 6 and are unaffected by it. These are still ceilings, not targets — the orchestrator adjusts DOWN based on task complexity, per the tier guidance below.
+
+The **Quality column is a cap, not a target**: since this version, test-writing capacity is need-gated on measured demand — roughly one test-writer per three HIGH/MED gaps the review panel actually found, capped by the number above. If no gaps were measured, the Quality wave writes no tests and is skipped (the read-only review panel still runs); with no measurement signal at all, the orchestrator allocates a conservative 1-2 rather than the full cap.
+
+### Inter-Wave Checkpoints
+
+Between each wave, the orchestrator:
+
+1. Reviews all agent outputs
+2. Checks for file conflicts between agents
+3. Runs verification based on wave role (Incremental after Impl-Core/Impl-Polish, Full Gate after Quality)
+4. Reviews the rendered UI when the wave changed UI files (after Impl-Core and Impl-Polish; on by default, `design-review.enabled: false` turns it off). The findings are recorded and shown (they create next-wave tasks only with `design-review.act-on-verdicts: true`), at most two rounds per page; a repo without a Playwright config is recorded as not reviewable. The Pencil comparison still runs when `pencil` is configured
+5. Adapts the plan for the next wave if needed (adds fix tasks, re-scopes)
+6. Reports progress to you
+
+---
+
+## 7. Workflow Walkthrough
+
+Here is what happens step by step when you run a full feature session.
+
+### Step 1: Start the session
+
+```
+/session feature
+```
+
+The orchestrator autonomously researches your project:
+
+- **Git analysis:** Branch state, recent commits, unpushed changes, stale branches
+- **VCS deep dive:** Open issues (categorized by priority), recently closed issues, open MRs/PRs, CI pipeline status, active milestones
+- **SSOT check:** Freshness of tracked files, TypeScript error count, test baseline
+- **Cross-repo status:** Git state and critical issues in related repositories
+- **Ecosystem health:** Service endpoint checks (if configured)
+- **Pattern recognition:** Recurring issue patterns, blocking chains, quick wins, synergies
+
+### Step 2: Review findings and pick a direction
+
+The orchestrator presents a structured overview:
+
+```
+## Session Overview
+- Type: feature
+- Repo: my-app on branch main
+- Git: 0 uncommitted, 0 unpushed, 3 open branches
+- VCS: 12 open issues (2 high, 4 medium), 1 open PR
+- Health: TypeScript: 0 errors | Tests: passing | CI: green
+- SSOT: STATUS.md fresh (2 days)
+
+## Recommended Focus
+Option A (recommended): Issues #42 + #45 — high synergy, shared code paths
+Option B: Issue #38 — standalone deep work, can be done independently
+Option C: Issues #50 + #51 + #52 — quick wins, clean up the backlog
+```
+
+You pick an option (or propose your own). The orchestrator does not proceed until you confirm.
+
+### Step 3: Review the wave plan
+
+After you choose a direction, the orchestrator decomposes the work into a role-based wave plan:
+
+```
+## Wave Plan (Session: feature)
+
+A `feature` session resolves to 3 waves — no Discovery wave; see [§ 4 Session Types](#4-session-types).
+
+### Wave 1: Impl-Core (4 agents)
+- Agent 1: Implement new API route → src/api/users.ts → endpoint returns 200
+- Agent 2: Add database migration → prisma/schema.prisma → check relations
+...
+
+### Wave 2: Impl-Polish+Quality (4 agents)
+- Agent 1: Build frontend form component → src/components/ → wired to the new route
+- Agent 2: Write and run tests → tests/api/users.test.mjs → passing
+...
+
+### Inter-Wave Checkpoints
+- After Impl-Core: Design review (Pencil configured)
+- After Impl-Polish+Quality: Full quality gate
+
+Ready to execute? Use /go to begin.
+```
+
+You can request changes to the plan. When satisfied:
+
+### Step 4: Execute
+
+```
+/go
+```
+
+Waves execute automatically. Agents within each wave run in parallel. Between waves, the orchestrator reviews results, runs checks, and adapts the plan if needed. You see progress updates after each wave:
+
+```
+## Wave 1 (Impl-Core) Complete ✓
+- Agent 1: done — API route implemented, returns correct schema
+- Agent 2: done — Database migration created
+- Tests: 3 new passing | TypeScript: 0 errors
+- Design: ALIGNED
+- Adaptations for Impl-Polish+Quality: none
+```
+
+### Step 5: Close the session
+
+After the Finalization wave completes:
+
+```
+/close
+```
+
+The orchestrator:
+
+1. **Verifies** every planned item against the agreed plan (with evidence)
+2. **Creates issues** for any work that was not completed (carryover issues)
+3. **Runs quality gates:** TypeScript (0 errors), tests (passing), lint (clean), no debug artifacts
+4. **Updates SSOT** files with current metrics
+5. **Commits** using Conventional Commits format, staging files individually
+6. **Pushes** to origin
+7. **Mirrors** to GitHub (if configured)
+8. **Closes/updates issues** on your VCS platform
+9. **Presents a session summary** with completed items, carryovers, new issues, metrics, and recommendations for the next session
+
+---
+
+## 8. VCS Integration
+
+Session Orchestrator works with both GitHub and GitLab. It manages issues, merge requests / pull requests, labels, milestones, and CI status throughout the session.
+
+### Auto-Detection
+
+The VCS platform is detected from your git remote URL:
+
+- Remote contains `github.com` --> uses `gh` CLI
+- All other remotes --> uses `glab` CLI
+
+To override auto-detection, set `vcs` in your Session Config:
+
+```markdown
+- **vcs:** github
+```
+
+or
+
+```markdown
+- **vcs:** gitlab
+- **gitlab-host:** gitlab.company.com
+```
+
+### What the orchestrator does with your VCS
+
+**At session start:**
+- Lists open issues, categorized by priority and status labels
+- Lists recently closed issues (context from last session)
+- Checks active milestones
+- Lists open MRs/PRs
+- Checks CI pipeline status
+
+**During execution:**
+- Marks selected issues as `status:in-progress`
+- Adds comments to issues noting which wave is working on them
+
+**At session end:**
+- Closes resolved issues with a summary comment
+- Updates issue labels to reflect actual state
+- Creates carryover issues for partially-completed work
+- Creates new issues for discovered problems
+- Updates milestone progress
+
+### Label Taxonomy
+
+The orchestrator uses a structured label system for issue management. For the complete label taxonomy (priority, status, area, and type labels), see the **Label Taxonomy** section of the `gitlab-ops` skill (`skills/gitlab-ops/SKILL.md`).
+
+Create these labels in your VCS platform if they do not already exist. The orchestrator will use them automatically during session start (categorizing issues), execution (marking in-progress), and close-out (updating status).
+
+### GitHub Mirroring
+
+If your primary VCS is GitLab but you also maintain a GitHub mirror, configure:
+
+```markdown
+- **mirror:** github
+```
+
+The orchestrator pushes to the `github` remote after every session commit. The remote must already be configured in your git config.
+
+---
+
+## 9. Quality Gates
+
+Session Orchestrator enforces quality at two levels: inter-wave checks during execution, and a full quality gate at session end.
+
+### Session Reviewer Agent
+
+The `session-reviewer` is a dedicated agent that verifies work quality. It runs between waves (especially before Impl-Polish and after Quality) and at session end. It checks:
+
+1. **Implementation correctness** — Changed files match task descriptions. No incomplete implementations, placeholder values, or hardcoded data. Error handling follows project patterns.
+
+2. **Test coverage** — Every changed source file has a corresponding test file. Tests cover the new behavior (not just boilerplate). Tests pass when run.
+
+3. **TypeScript health** — typecheck per quality-gates skill reports zero errors. This is non-negotiable.
+
+4. **Security basics (OWASP quick check):**
+   - No hardcoded secrets or API keys
+   - User input validated at boundaries (e.g., with Zod)
+   - No unjustified `any` types
+   - No `console.log` in production code (except `warn`/`error`)
+   - SQL uses parameterized queries
+   - Auth checks present in server actions
+
+5. **Issue tracking accuracy** — Claimed issues have the correct status labels. Acceptance criteria from issues are actually met.
+
+6. **Silent failure analysis** — Catch blocks that swallow errors, empty error handlers, and fallback returns that hide failures.
+
+7. **Test depth check** — Tests exercise changed behavior (not just boilerplate), edge cases are present, assertion quality is adequate, and mock boundaries are correct.
+
+8. **Type design spot-check** — String parameters that should be unions, overly broad `any` types, and unused generics.
+
+Each finding includes a **confidence score** (0-100). Only findings with confidence >= 80 appear in the main report. Findings scored 50-79 are listed in a separate "Possible Issues" section for manual review.
+
+### Review Output
+
+The reviewer produces a structured verdict:
+
+```
+## Quality Review — Impl-Core
+
+### Implementation: PASS
+### Tests: WARN — missing test for src/api/users.ts
+### TypeScript: PASS — 0 errors
+### Security: PASS
+### Issues: PASS
+
+### Verdict: PROCEED (address test gap in Quality wave)
+```
+
+Possible verdicts:
+- **PROCEED** — quality is acceptable, continue to next wave
+- **FIX REQUIRED** — specific items must be addressed before continuing
+
+### Session-End Quality Gate
+
+Before any code is committed, `/close` runs all checks:
+
+| Check | Requirement |
+|-------|------------|
+| TypeScript | 0 errors |
+| Tests | All passing |
+| Lint | No errors (warnings acceptable) |
+| Debug artifacts | No `console.log`, `debugger`, or `TODO: remove` in changed files |
+| Git status | All changes accounted for |
+
+If any check fails and cannot be quickly fixed, the orchestrator creates a `priority::high` issue for immediate follow-up rather than committing broken code.
+
+### Deterministic Scripts
+
+Session Orchestrator includes bash scripts for critical workflow paths. These provide deterministic, testable alternatives to agent-interpreted instructions:
+
+- `scripts/parse-config.mjs` — Parses `## Session Config` from a config host file, outputs validated JSON with all 40+ fields and defaults applied. Run: `node scripts/parse-config.mjs [path/to/CLAUDE.md|AGENTS.md]`
+- `scripts/run-quality-gate.mjs` — Runs quality gates with structured JSON output. Supports 4 variants: baseline, incremental, full-gate, per-file.
+- `scripts/validate-wave-scope.mjs` — Validates wave-scope.json before enforcement hooks consume it. Checks for path traversal, absolute paths, and required fields.
+
+Run `npm test` to execute the vitest suite.
+
+---
+
+## 10. Design-Code Alignment (Pencil Integration)
+
+If your project uses Pencil (`.pen`) design files, the orchestrator can automatically compare your implementation against the design after each implementation wave.
+
+### Setup
+
+Add the path to your `.pen` file in Session Config:
+
+```markdown
+- **pencil:** designs/app.pen
+```
+
+The path is relative to your project root. The orchestrator verifies the file exists during session start.
+
+### How it works
+
+After **Impl-Core** and **Impl-Polish** waves, the orchestrator:
+
+1. Opens the `.pen` file via Pencil MCP
+2. Finds design frames relevant to the current wave's UI work
+3. Screenshots those frames
+4. Reads the actual UI files changed in the wave
+5. Compares: layout structure, component hierarchy, visual elements (headings, buttons, inputs, cards), responsive behavior
+
+### Alignment Reports
+
+Each design review produces one of three verdicts:
+
+| Verdict | Meaning | Action |
+|---------|---------|--------|
+| **ALIGNED** | Implementation matches design | Proceed as planned |
+| **MINOR DRIFT** | Small differences (spacing, colors, minor layout) | Fix tasks added to next wave automatically |
+| **MAJOR MISMATCH** | Significant deviation from design | User informed, revised plan proposed |
+
+### Example output
+
+```
+## Wave 2 (Impl-Core) Complete ✓
+...
+- Design: MINOR DRIFT — card grid uses 3 columns instead of designed 2-column layout
+- Adaptations for Impl-Polish: Agent 2 assigned to fix card grid layout
+```
+
+### Without Pencil
+
+Pencil integration is entirely optional. If no `pencil` path is configured, design reviews are skipped with no impact on the rest of the session workflow.
+
+---
+
+## 11. Ecosystem Health
+
+For projects with deployed services or multiple related repositories, the orchestrator can check ecosystem health at session start.
+
+### Setup
+
+Enable ecosystem health and configure your endpoints in Session Config:
+
+```markdown
+- **ecosystem-health:** true
+- **health-endpoints:** [{name: "API", url: "https://api.example.com/health"}, {name: "Dashboard", url: "http://localhost:3000/api/health"}]
+- **cross-repos:** [api-service, shared-lib]
+```
+
+### What gets checked
+
+**Service health endpoints:**
+Each configured endpoint is queried with a simple HTTP check. If the endpoint returns JSON with a `status` field, that value is reported. Otherwise, the check reports OK or unreachable.
+
+**Cross-repo critical issues:**
+For each related repository, the orchestrator queries open issues with `priority::critical` or `priority::high` labels. This surfaces blocking problems in other parts of your ecosystem before you start working.
+
+**CI pipeline status:**
+The latest CI pipeline runs are checked for the current repository.
+
+### Health Report
+
+The report appears in the session overview:
+
+```
+## Ecosystem Health
+| Service   | Status      |
+|-----------|-------------|
+| API       | OK          |
+| Dashboard | unreachable |
+
+Critical issues: 2 across cross-repos
+CI: green
+```
+
+Any service that is down or any critical issue count above zero is flagged as requiring attention.
+
+### Graceful Degradation
+
+If `health-endpoints` is not configured, the service table is omitted. If `cross-repos` is not configured, the cross-project issue scan is omitted. The orchestrator does not fail — it simply skips the unconfigured checks.
+
+---
+
+## 12. Quality Discovery
+
+The `/discovery` command runs systematic quality probes to find issues that don't have VCS issues yet.
+
+### Usage
+
+```
+/discovery              # Scan all categories
+/discovery code         # Code quality only
+/discovery session      # Session gap analysis only
+/discovery code,session # Multiple categories
+```
+
+### Scope Options
+
+| Scope | Probes | Focus |
+|-------|--------|-------|
+| `all` | 23 probes | Everything (default) |
+| `code` | 8 probes | Hardcoded values, dead code, AI slop, type safety, tests, security |
+| `infra` | 4 probes | CI pipelines, env config, dependencies, deployments |
+| `ui` | 3 probes | Accessibility, responsive design, design drift |
+| `arch` | 3 probes | Circular deps, complexity hotspots, dependency security |
+| `session` | 5 probes | Gap analysis, hallucination check, stale issues, dependency chains, claude-md audit |
+
+### How It Works
+
+1. **Stack Detection** -- Detects your tech stack (JS/TS, Python, Docker, etc.) and activates relevant probes
+2. **Probe Execution** -- Runs probes in parallel as read-only subagents
+3. **Verification** -- Re-reads files to confirm findings, discards false positives
+4. **Interactive Triage** -- Critical/High findings reviewed individually; Medium/Low batched by category
+5. **Issue Creation** -- Approved findings become VCS issues with `type:discovery` label
+
+### Embedded Mode
+
+Discovery runs automatically during `/close` by default (`discovery-on-close` absent, `true`, or `auto`); set `discovery-on-close: false` in Session Config to skip it. In embedded mode, critical/high findings become issues; medium/low are listed in the session report.
+
+### Confidence Scoring
+
+Each verified finding receives a confidence score from 0 to 100 that reflects how trustworthy the detection is. The score starts at a baseline of 40 and adds points from three factors: **pattern specificity** (how specific the match pattern is — generic patterns score lower), **file context** (whether surrounding code reinforces the finding), and **historical signal** (whether the same issue has appeared in prior discovery runs). Each factor contributes 0, 10, or 20 points, so scores range from 40 to 100 in practice.
+
+Findings below the confidence threshold are **auto-deferred** — they skip interactive triage entirely and appear in a collapsed summary instead. The threshold is controlled by `discovery-confidence-threshold` in your Session Config (default: `60`). Raise it if you are seeing too many false positives in triage; lower it if you want more aggressive detection. Auto-deferred findings are not lost — you can review them anytime with `/discovery --include-deferred`.
+
+One exception: findings with **critical** severity always receive a minimum confidence of 70, regardless of how the three factors score. This ensures that critical issues — potential security holes, data-loss risks — are never silently deferred. They always appear in interactive triage.
+
+```yaml
+## Session Config
+discovery-confidence-threshold: 60   # default; raise to reduce noise
+```
+
+---
+
+## 13. Harness Audit
+
+The harness audit scores this repository against the session-orchestrator rubric — a structured set of checks that verify the repo is set up correctly and the orchestrator has what it needs to run reliably. Run it whenever you want a baseline health reading or after making structural changes to the project setup.
+
+### How to run
+
+```
+/harness-audit
+```
+
+Or directly from the shell:
+
+```bash
+node scripts/harness-audit.mjs
+```
+
+No flags. The script always audits the current working directory / repo root.
+
+### What it produces
+
+- **stdout** — a JSON record matching the audit schema (see below)
+- **stderr** — a concise human-readable summary
+- **`.orchestrator/metrics/audit.jsonl`** — the same record appended as a single JSONL line for historical tracking
+
+### The 9 categories
+
+| Category | What it checks |
+|----------|----------------|
+| Session Discipline | STATE.md lifecycle, session-type usage, turn-limit compliance |
+| Quality Gate Coverage | Test command configured, typecheck command configured, lint command configured |
+| Hook Integrity | All registered hook handlers point to existing files |
+| Persistence Health | sessions.jsonl present and parseable, learnings.jsonl consistent |
+| Plugin-Root Resolution | Plugin path resolves correctly; bootstrap.lock committed |
+| Config Hygiene | Session Config fields are valid types; no unknown fields; no embedded secrets |
+| Policy Freshness | blocked-commands.json present; rubric_version matches `2026-06` |
+| Large-Codebase Readiness | Layered instruction files, a navigable codebase map, LSP/language-server tooling, scoped test/lint commands, a version-controlled destructive-command deny-list, and a lean delegated root |
+| Skill-Health Surfacing | Skill-invocation telemetry hygiene, the skill-health scorer module wired correctly, and an advisory (never-scored) verdict tally — absence of adoption is a healthy state, not a defect |
+
+### Severity escalation
+
+| Score | Level | Action |
+|-------|-------|--------|
+| ≥ 7/10 | Info | No action required |
+| 5–7/10 | Medium finding | Review and address in next session |
+| < 5/10 | High finding | Surfaces automatically via `/discovery audit` |
+
+### Rubric version and bump policy
+
+The current rubric version is `2026-06`. It is embedded in every audit record as the `rubric_version` field. When session-orchestrator releases a minor version that changes the rubric, the version string is bumped via a conventional commit (`chore: bump rubric version to YYYY-MM`). Older records in `audit.jsonl` retain their original `rubric_version` and remain valid — use the field to filter when comparing across versions.
+
+### Related commands
+
+`/discovery audit` runs only the harness-audit probe within the discovery framework, without the full multi-category scan.
+
+---
+
+## 14. Session Persistence
+
+Session Orchestrator persists session state so you can resume after crashes, pauses, or context window exhaustion.
+
+### What it writes into your repository
+
+All of it plain text, all of it local: `.orchestrator/bootstrap.lock` (written by `/bootstrap`), `.orchestrator/session.lock` and `current-session.json` (which session owns this working copy), `.orchestrator/metrics/*.jsonl` (append-only session and learning records, shared by all four tools), `.orchestrator/steering/` (stable context loaded each session) and `STATE.md` (wave progress, in the tool's own folder: `.claude/`, `.codex/`, `.cursor/` or `.pi/`).
+
+### STATE.md
+
+Lives at `.claude/STATE.md` in your project. Contains YAML frontmatter (`session-type`, `branch`, `issues`, `started`, `status`, `current-wave`, `total-waves`) and a Markdown body tracking the Current Wave, Wave History, and any Deviations from the plan. Written by the wave-executor after each wave; read by session-start on the next `/session` invocation. <!-- path-check: example -->
+
+### Session Continuity
+
+When you run `/session`, the orchestrator checks for an existing STATE.md:
+
+- **`status: active`** -- Crashed or interrupted session detected. You are offered the choice to resume from the last completed wave or start fresh.
+- **`status: paused`** -- Intentional pause (e.g., you closed Claude Code mid-session). Resume picks up where you left off.
+- **`status: completed`** -- Normal end state. No resume offered; a new session starts cleanly.
+
+### Session Memory
+
+After each session, `/close` writes a memory file to `~/.claude/projects/<project>/memory/session-<date>.md` containing Outcomes, Learnings, and Next Session recommendations. On the next `/session`, the orchestrator reads the last 2-3 session memory files for context continuity across sessions.
+
+When memory files accumulate past the `memory-cleanup-threshold` (default: 5), the orchestrator recommends running `/memory-cleanup` to consolidate them.
+
+### Disabling Persistence
+
+Set `persistence: false` in your Session Config to disable STATE.md writing and session memory. Sessions will not be resumable and will not carry context forward.
+
+---
+
+## 15. Safety Features
+
+Configure host-specific leakage protection with the [owner privacy pattern guide](owner-privacy-patterns.md), including protected local policy files, vault-path migration and strict packed-release checks.
+
+### Scope Enforcement
+
+Before each wave, the wave-executor writes `.claude/wave-scope.json` defining the allowed file paths and blocked commands for that wave's agents. PreToolUse hooks validate Edit/Write operations against `allowedPaths` and Bash commands against `blockedCommands`.
+
+Enforcement levels (configured via `enforcement`):
+
+| Level | Behavior |
+|-------|----------|
+| `strict` | Out-of-scope operations are denied |
+| `warn` | Out-of-scope operations are allowed but logged with a warning |
+| `off` | No enforcement; agents have full access |
+
+### Prerequisites
+
+The enforcement hooks (`hooks/enforce-scope.mjs`, `hooks/enforce-commands.mjs`) run without `jq`. `jq` is required by `scripts/validate-plugin.mjs` and by shell snippets in `skills/wave-executor/` that call it, such as snippets that extract Session Config fields. Install `jq` when you run those tools or snippets:
+
+- **macOS**: `brew install jq`
+- **Ubuntu/Debian**: `sudo apt-get install jq`
+- **Alpine**: `apk add jq`
+
+### Circuit Breaker
+
+The orchestrator enforces turn limits per session type to prevent runaway execution:
+
+| Session Type | Default Max Turns |
+|-------------|-------------------|
+| housekeeping | 8 |
+| feature | 15 |
+| deep | 25 |
+
+Override with `max-turns` in Session Config, or set to `auto` for these defaults.
+
+The circuit breaker also detects execution spirals: a file edited 3+ times within a single agent's execution, repeated identical errors, or self-reverts. Recovery depends on the failure mode:
+
+- **FAILED** -- A fix task is created for the next wave
+- **PARTIAL** -- Completed work is carried forward; remaining tasks become carryover issues
+- **SPIRAL** -- Changes are reverted and the scope is narrowed before retrying
+
+### Worktree Isolation
+
+When `isolation` is set to `worktree`, each subagent gets its own git worktree. This prevents file conflicts between agents working in parallel within the same wave. When set to `none`, all agents work in the coordinator's working tree in-place.
+
+### Isolation Graduation (#194)
+
+`isolation: auto` (the default) is **not** a session-type switch — it is resolved per wave using the graduated default:
+
+| agentCount | sessionType | resolved |
+|---|---|---|
+| ≤ 2 | any | `none` |
+| 3–4 | housekeeping | `none` |
+| 3–4 | feature / deep | `worktree` |
+| ≥ 5 | any | `worktree` |
+
+The reason: worktrees are a tax, not a free lunch. Two full repo copies per wave, build artifacts duplicated, and merge-back risk when the coordinator commits inline. On small waves (1–2 agents on partitioned scopes) the tax is not worth paying — in-place dispatch is cleaner. On larger waves the isolation actually matters.
+
+**Overrides:**
+- Explicit `isolation: worktree` or `isolation: none` in Session Config disables the graduation entirely.
+- Session-plan may emit `collision-risk: high` on a wave spec to force `worktree` even at ≤2 agents — use it when agents will touch the same file.
+
+**Enforcement auto-promote:** when isolation resolves to `none`, `enforcement: warn` auto-promotes to `strict` for that wave. Worktrees provide filesystem-level isolation; in-place dispatch relies solely on the scope hook, so it must be hard. Explicit `enforcement: off` is respected.
+
+### Base-Ref Freshness (#195)
+
+Even with graduated isolation, worktree dispatch still carries a subtle risk: if the coordinator commits inline to `main` AFTER a worktree agent was created, the agent's merge-back silently overwrites those inline commits (the agent's base-ref is stale). This is not theoretical — it happened twice consecutively on 2026-04-20.
+
+The fix: wave-executor persists worktree meta at creation time (`.orchestrator/tmp/worktree-meta/<suffix>.json`) recording `baseSha`, `baseRef`, and `createdAt`. Before each merge-back, it checks whether `main` has advanced. Four outcomes:
+
+- **pass** — base matches current `main`. Merge-back proceeds normally.
+- **warn** — `main` advanced, but drift does not overlap the agent's scope. Log and proceed.
+- **block** — `main` advanced AND drift overlaps the agent's scope. Merge-back is refused; coordinator reconciles manually or rebases.
+- **no-meta** — meta missing/corrupted. Falls back to manual diff review.
+
+You do not configure this guard — it runs automatically for every `isolation: worktree` dispatch when persistence is enabled. The freshness events are logged to `.orchestrator/metrics/events.jsonl` as `event: freshness_check` for post-hoc analysis.
+
+---
+
+## 16. Session Metrics
+
+Session Orchestrator tracks metrics across sessions to provide historical trends and inform future planning.
+
+### What is tracked
+- **Per-wave**: duration (wall-clock), agent count, files changed, quality check result
+- **Per-session**: total duration, total waves, total agents, total files changed, agent summary (complete/partial/failed/spiral)
+
+### Storage
+Metrics are stored in `.orchestrator/metrics/sessions.jsonl` — one JSON line per session, append-only. This file is created automatically on first session close.
+
+### Historical Trends
+During session-start (Phase 7), the last 5 sessions are displayed as a trend table:
+
+| Session | Type | Duration | Waves | Agents | Files Changed |
+|---------|------|----------|-------|--------|---------------|
+
+If fewer than 2 sessions exist, the message "Not enough history for trends (need 2+)" is displayed.
+
+### Quality Gates Output
+Quality gates (Incremental and Full Gate variants) produce structured JSON output for metrics integration, including duration, check status, and error details.
+
+### Effectiveness Tracking
+
+After 5 or more completed sessions, session-start automatically computes effectiveness metrics from `sessions.jsonl` and surfaces them in the **Project Intelligence** section of the session overview. Three metrics are tracked:
+
+- **Completion rate trend** — averages `effectiveness.completion_rate` over the last 5 sessions. If the rate is below 0.6, the orchestrator suggests reducing scope. If above 0.9, it confirms that current sizing works well.
+- **Discovery probe value** — if the ratio of actioned findings to total findings stays below 0.1 across 3 or more sessions for a probe category, that category is flagged as low-value and may be excluded from future discovery runs.
+- **Carryover pattern** — if the ratio of carryover issues to planned issues exceeds 0.3 across 3 or more sessions, the orchestrator suggests smaller scope or switching to deep sessions to reduce persistent overflow.
+
+These metrics are only displayed once enough session history exists; projects with fewer than 5 sessions see the standard trend table instead.
+
+> **Requires:** `persistence: true` (default) in Session Config.
+
+---
+
+## 17. Cross-Session Learning
+
+The learning system captures patterns from completed sessions and surfaces them in future sessions as "Project Intelligence."
+
+### What is learned
+- **Fragile files**: files that needed 3+ iterations or caused cascading failures
+- **Effective sizing**: which agent counts worked for different complexity levels
+- **Recurring issues**: issue patterns that appear across waves (type errors, missing imports)
+- **Scope guidance**: how many issues fit comfortably in one session
+- **Deviation patterns**: plan adaptations that recur across sessions (scope changes, unexpected blockers)
+
+### Storage
+Learnings are stored in `.orchestrator/metrics/learnings.jsonl` — one JSON line per learning.
+
+### Confidence System
+Each learning has a confidence score (0.0 to 1.0):
+- New learnings start at **0.5**
+- Confirmed by a subsequent session: **+0.15**
+- Contradicted by a subsequent session: **-0.2**
+- Learnings at **0.0** are removed
+- Learnings expire after **90 days**
+- Only learnings with confidence **> 0.3** are surfaced
+
+### Lifecycle
+1. **Collection** (session-end Phase 3.5a): analyze completed session, extract learnings
+2. **Consumption** (session-start Phase 5.6 + session-plan Step 1): read and apply learnings
+3. **Pruning** (session-end Phase 3.6): remove expired and zero-confidence entries
+
+> **Requires:** `persistence: true` (default) in Session Config.
+
+### Managing Learnings with /evolve
+
+The `/evolve` command gives you manual control over the learning system.
+
+#### Analyze Mode (default)
+
+```
+/evolve
+/evolve analyze
+```
+
+Reads `sessions.jsonl`, extracts patterns (fragile files, sizing, scope, recurring issues, deviations), deduplicates against existing learnings, and presents candidates for your approval via interactive selection. Only confirmed learnings are saved.
+
+**When to use:** After 2-3 sessions to validate the tool, or when you suspect the learning system is missing patterns.
+
+#### Review Mode
+
+```
+/evolve review
+```
+
+Displays all active learnings in a formatted table grouped by type. You can:
+- **Boost** confidence (+0.15) for learnings you've validated
+- **Reduce** confidence (-0.2) for learnings that seem wrong
+- **Delete** specific learnings
+- **Extend** expiry (+90 days) for learnings you want to keep longer
+
+**When to use:** When Project Intelligence suggestions seem off, or to prune stale learnings.
+
+#### List Mode
+
+```
+/evolve list
+```
+
+Read-only display of all active learnings with confidence scores and expiry dates. Shows high-confidence (>0.7) and expiring-soon (<14 days) counts.
+
+**When to use:** Quick check of what the system has learned, without making changes.
+
+---
+
+## 18. Adaptive Wave Sizing
+
+Instead of always dispatching a wave's full agent-cap ceiling, the orchestrator scores session complexity and relaxes agent allocation downward when the briefed work does not need the full cap.
+
+### Complexity Scoring
+Three factors are scored (0-2 points each):
+
+| Factor | 0 points | 1 point | 2 points |
+|--------|----------|---------|----------|
+| Files to change | 1-5 | 6-15 | 16+ |
+| Cross-module scope | 1 directory | 2-3 directories | 4+ directories |
+| Issue count | 1 issue | 2-3 issues | 4+ issues |
+
+### Complexity Tiers
+- **Simple** (0-1 points): fewer agents per wave
+- **Moderate** (2-3 points): standard allocation
+- **Complex** (4-6 points): up to the wave's cap
+
+The tier score relaxes agent count **downward only** — a simple-tier session may plan fewer agents than the wave's `agentCap` where the briefed work does not fill it. It never raises the count above that cap; a moderate or complex tier does not scale it up. The cap itself comes from the resolved session shape (`waves[].agentCap`, see [`docs/session-config-reference.md`](session-config-reference.md#session-shapes) § Session Shapes) — it is not derived from the tier, and the `agents-per-wave` config value is the ceiling that cap was already built against.
+
+> **Note:** Housekeeping has no tier at all — it is a single coordinator-direct wave (0 dispatched agents) running the fixed maintenance loop, not a scored/scaled wave.
+
+---
+
+## 19. Cheat Sheet
+
+### Commands
+
+```
+/session feature       Start a feature session
+/session housekeeping  Start a cleanup/maintenance session
+/session deep          Start a deep work session (complex, many agents)
+/go                    Approve plan, begin wave execution
+/go <instructions>     Approve plan with additional guidance
+/close                 Verify all work, commit, push, clean up issues
+/discovery             Run quality probes across all categories
+/discovery code        Scan code quality only
+/discovery code,arch   Scan multiple categories
+/plan new              Plan a new project (PRD + repo setup + issues)
+/plan feature          Plan a feature (compact PRD + issues)
+/plan retro            Run a data-driven retrospective
+/evolve                Analyze sessions, extract learnings (default: analyze)
+/evolve analyze        Extract patterns from session history
+/evolve review         Interactively manage existing learnings
+/evolve list           Display active learnings
+```
+
+### Session Config (add to `CLAUDE.md` or `AGENTS.md`)
+
+```markdown
+## Session Config
+
+- **agents-per-wave:** 6
+- **waves:** 5
+- **vcs:** github
+- **gitlab-host:** gitlab.company.com
+- **mirror:** github
+- **pencil:** designs/app.pen
+- **cross-repos:** [other-repo]
+- **ssot-files:** [.claude/STATUS.md]
+- **ecosystem-health:** true
+- **health-endpoints:** [{name: "API", url: "https://api.example.com/health"}]
+- **special:** "Run migrations before testing"
+- **discovery-on-close:** true
+- **discovery-probes:** [code, arch]
+- **discovery-severity-threshold:** medium
+- **persistence:** true
+- **enforcement:** warn
+- **isolation:** auto
+- **max-turns:** auto
+```
+
+### Typical Session Flow
+
+```
+/plan feature             # (Optional) Define requirements → PRD + issues
+/session feature          # Research + recommendations → pick issues
+  (pick a direction)      # User chooses focus
+  (review wave plan)      # Orchestrator proposes role-based wave plan
+/go                       # Execute waves with parallel agents
+  (role-based waves execute) # Automatic, with inter-wave reviews
+/close                    # Verify, commit, push, summarize
+/plan retro               # (Optional) Retrospective → improvement issues
+```
+
+### Wave Quick Reference
+
+```
+Discovery       Validation & read-only audit
+Impl-Core       Primary implementation (core work)
+Impl-Polish     Fix, integrate, polish, edge cases
+Quality         Tests, TypeScript, lint, security
+Finalization    Documentation, issues, commits
+```
+
+---
+
+## 20. FAQ
+
+### Can I use this with GitHub?
+
+Yes. The orchestrator auto-detects your VCS platform from the git remote URL. If your remote points to `github.com`, it uses the `gh` CLI. You can also force it with `vcs: github` in Session Config. Both GitHub and GitLab are fully supported for issues, PRs/MRs, CI status, and milestones.
+
+### What if an agent fails during a wave?
+
+The wave executor does not ignore failures. If an agent produces broken code or reports errors, the orchestrator adds fix tasks to the next wave. If an agent times out, it is re-dispatched with a smaller scope. If there is a major blocker, the orchestrator informs you and proposes a revised plan for the remaining waves.
+
+### Can I change the plan mid-session?
+
+Yes. Between each wave, the orchestrator reviews results and can adapt the plan. If you need to change direction, you can communicate that and the remaining waves will be re-scoped. The orchestrator documents every deviation from the original plan so the session summary remains accurate.
+
+### How many agents run in parallel?
+
+This is controlled by the `agents-per-wave` setting in your Session Config, using the override form `6 (deep: 18)` to raise the ceiling for deep sessions specifically — see [`docs/session-config-reference.md`](session-config-reference.md#session-shapes) § Session Shapes for the full per-wave cap table. Note that a plain `deep` session's own raw wave caps top out at 10 (the Impl-Core wave) regardless of the override value configured; an override of 18 only actually binds under the `ultradeep` profile (`/session ultradeep`), whose Research+Code-Discovery wave is the one wave sized at 18. All agents within a single wave run in parallel; the orchestrator waits for all of them to complete before starting the next wave.
+
+### Do I need Pencil?
+
+No. Pencil design integration is entirely optional. If you do not configure a `pencil` path in Session Config, design-code alignment reviews are simply skipped. Everything else works the same.
+
+### What is the Soul system?
+
+The Soul is a personality layer that shapes how the orchestrator communicates and makes decisions. It defines the orchestrator as a seasoned engineering lead who drives outcomes — direct, opinionated, systems-thinking, pragmatic. It affects communication style (recommendations first, not analysis), decision-making priorities (user safety > productivity > code quality > ecosystem health > speed), and values (pragmatism over perfection, evidence over assumptions). You do not need to configure it; it is built into the plugin.
+
+### Does the orchestrator commit automatically?
+
+No. The orchestrator never commits code until you run `/close`. During wave execution, agents do not commit independently — the coordinator handles all commits at session end after running quality gates. This ensures only verified, clean code is committed.
+
+### What happens to unfinished work?
+
+During `/close`, any work that was planned but not completed is documented. The orchestrator creates carryover issues on your VCS platform with the title prefix `[Carryover]`, including context on what was done, what remains, and a mandatory Revisit-Trigger naming the condition that reopens the work. Nothing is silently dropped.
+
+### Can I use this across multiple repos?
+
+Yes. Configure `cross-repos` in your Session Config with related repositories: a bare name resolves to `~/Projects/<name>`, an entry starting with `/` or `~/` is used as a path, and a missing folder is skipped with a hint (full rule: [Session Config Reference](session-config-reference.md), `cross-repos` row). The orchestrator checks their git state and critical issues at session start, giving you ecosystem-wide awareness.
+
+### When should I use `/plan` vs creating issues manually?
+
+`/plan` provides structured requirement gathering with parallel research agents, auto-prioritization, and PRD documents for reference. Use it when you want a thorough requirements process. Skip it when you already know exactly what to build — just create issues manually and run `/session`.
+
+### What's the difference between `/plan new` and `/plan feature`?
+
+`/plan new` is for brand-new projects — it scaffolds a repository, creates a full PRD, and generates an Epic with sub-issues. `/plan feature` is for adding a feature to an existing project — it produces a compact PRD and feature issues. Use `/plan new` once per project, `/plan feature` once per feature.
+
+### Can I run `/plan` during an active session?
+
+No. `/plan` runs outside of sessions. The session scope is locked after `/session` + user alignment + `/go`. If new requirements emerge during a session, create them as issues for the next session or let `/close` generate carryover issues.
+
+---
+
+## 21. Troubleshooting
+
+### "glab: command not found" or "gh: command not found"
+
+The orchestrator needs the appropriate VCS CLI tool installed:
+
+- **GitLab:** Install `glab` — [https://gitlab.com/gitlab-org/cli](https://gitlab.com/gitlab-org/cli)
+- **GitHub:** Install `gh` — [https://cli.github.com](https://cli.github.com)
+
+After installing, authenticate:
+
+```bash
+glab auth login
+# or
+gh auth login
+```
+
+### "No issues found" when issues exist
+
+This usually means the CLI tool is not authenticated or is pointing at the wrong host.
+
+- Run `glab auth status` or `gh auth status` to verify authentication
+- For GitLab with a custom host, ensure `gitlab-host` is set in Session Config or that your `.env` / `.env.local` contains the correct `GITLAB_HOST`
+- Check that `git remote get-url origin` returns the expected URL
+
+### The disk of the session host fills up every day
+
+With one worktree per task and many parallel sessions, leftovers regrow faster than they are removed. A bigger disk does not fix that. See [`docs/recipes/disk-pressure-parallel-agents.md`](recipes/disk-pressure-parallel-agents.md) for how to measure it, where to fix the removal path, and how an attached SSD can carry the worktrees.
+
+### Plugin not loading
+
+For Codex, start with the public state view:
+
+```bash
+codex plugin list --available --json
+```
+
+Confirm that `session-orchestrator@kanevry` appears exactly once with `installed: true`, `enabled: true`, and the version committed in `.codex-plugin/plugin.json`. If it is only available, run `codex plugin add session-orchestrator@kanevry`. If it is missing or stale, run `codex plugin marketplace list --json`, remove the exact target with `codex plugin remove session-orchestrator@kanevry` when present, and rerun `node scripts/codex-install.mjs` from the clone. A healthy install still needs a fresh task plus operator review in `/hooks`; installation does not grant hook trust.
+
+The installer removes only the allowlisted legacy IDs `session-orchestrator@openai-curated` and `session-orchestrator@local`; those exact IDs can also be removed through `codex plugin remove`. For a conflicting `kanevry` source, use `codex plugin marketplace remove kanevry` and rerun the installer from the intended clone. Any other pre-public plugin/config/cache/hook-state residue is unsupported: do not modify private Codex files; file an issue with `codex --version` plus the public plugin and marketplace list output.
+
+For Claude Code, run these commands inside a Claude Code session, not in your shell:
+
+```text
+/plugin marketplace add /absolute/path/to/session-orchestrator
+/plugin install session-orchestrator@kanevry
+```
+
+### Node is missing from the hook PATH
+
+The harness executes hook commands via `/bin/sh -c` with its own PATH. That
+shell does not source `~/.zshrc`/`~/.bashrc`, so Node installed via Homebrew,
+nvm, volta, or asdf can be invisible to hooks even though `node` works in your
+terminal.
+
+All hook commands route through
+[`hooks/run-node.sh`](https://github.com/Kanevry/session-orchestrator/blob/main/hooks/run-node.sh),
+which resolves Node via `$SO_NODE_BIN` → PATH → well-known install dirs → nvm
+and also checks Windows locations under `ProgramFiles`/`PROGRAMFILES` (`nodejs`),
+`LOCALAPPDATA` (`Volta/bin`), and `NVM_SYMLINK` when `SO_NODE_SEARCH_DIRS` is unset.
+If Node is missing, PreToolUse guards for Bash, PowerShell, Edit, Write, and
+MultiEdit block the tool call and report the fix every time; other hooks are
+skipped with **one** warning per 6 hours.
+Install Node.js 24+, expose it on the harness PATH as an absolute directory
+(relative PATH entries are never searched), or set `SO_NODE_BIN`.
+The same absolute-only rule applies to `SO_NODE_BIN` and to the script's search
+lists (`SO_NODE_SEARCH_DIRS` or the built-in Unix install dirs, and nvm); a `~` or `~/…` PATH
+entry is expanded to your home directory instead of being skipped.
+
+Three limits apply:
+
+- On native Windows, Codex starts its hooks through the `commandWindows` entries
+  in `hooks/hooks-codex.json`. They call `node` directly and never reach
+  `run-node.sh`, so this block does not apply there.
+- Cursor starts the bridge through the `.cursor/hooks.json` written by
+  `cursor-install`, and that outer call does not pass `--fail-closed` yet.
+- Whether Codex treats the launcher's exit 2 as a block has not been measured
+  yet.
+
+Fixes, in order of preference:
+
+1. Launch the harness from a shell where `node` resolves.
+2. Export `SO_NODE_BIN=/abs/path/to/node`.
+3. Install Node 24+ to a standard location.
+
+### `/session` refuses to start
+
+It needs `.orchestrator/bootstrap.lock`. Run `/bootstrap` first, or
+`/bootstrap --retroactive` if the repo already has a `## Session Config` block.
+
+### "tsgo: command not found"
+
+The default typecheck command is `npm run typecheck`. If your project's `typecheck` script invokes `tsgo`, install it or change `typecheck-command` to the runner your project actually uses:
+
+```bash
+npm install -g @anthropic-ai/tsgo
+```
+
+### Agents timing out
+
+If agents consistently time out during wave execution:
+
+- Reduce `agents-per-wave` in Session Config (fewer parallel agents = less resource contention)
+- Switch from `deep` to `feature` session type if you do not need the extra agent count
+- Check that your machine has sufficient resources for parallel agent execution
+
+### Import-probe warnings and missing ESLint
+
+The post-edit import probe checks edited `.mjs`, `.js`, and `.cjs` files only when the path is listed in the project's `hooks/_lib/hook-import-set.json` and the hook is enabled. It reports likely hook breakage as a warning and always exits 0. (On Pi the probe runs but its warning is not shown; see the event table below.) Its two checks have different coverage:
+
+- **C1 — ESLint:** reports `no-undef` and fatal/parse errors. Install ESLint with the project's package manager and enable `no-undef` in the **project's ESLint configuration**; the probe does not enable that rule itself. Other lint rules remain the full lint command's responsibility.
+- **C2 — import:** loads allowlisted files under `scripts/lib/**` in a child process to detect errors during module loading. It does not import hook entrypoints or call exported functions. An undefined identifier reached only when a function runs can therefore escape C2 even when importing the module succeeds.
+
+ESLint lookup tries these paths in order: the project's `node_modules/.bin/eslint`, the project's `node_modules/eslint/bin/eslint.js`, then the same two paths under the plugin root. A consumer installation may have no plugin development dependencies, so the project's ESLint installation matters. `SO_IMPORT_PROBE_ESLINT` overrides this search with an explicit script path; use an absolute path to the ESLint entry script. An empty or nonexistent override disables C1 **without falling back** to either installation.
+
+When no ESLint is available, C1 is normally silent and only eligible C2 checks remain. For an edit that reaches the checks, `SO_IMPORT_PROBE_TRACE=1` writes `probe:eslint-unavailable` to stderr when ESLint cannot be located. This trace diagnoses unavailable ESLint; it does not diagnose every timeout or configuration failure. A timed-out ESLint or an unreadable/non-JSON report is skipped, so silence does not prove that C1 ran successfully.
+
+The shipped event wiring is:
+
+| Harness | Import-probe event |
+|---------|--------------------|
+| Claude Code | `PostToolUse` for edit/write tools |
+| Cursor | `postToolUse` and `afterFileEdit` |
+| Pi | `tool_result` for edit/write tools (wired and run, but the Pi extension does not forward hook output, so the warning is not shown; see [Pi setup](pi-setup.md#hook-coverage)) |
+| Codex | **Unwired:** the current Codex hook manifest has no import-probe handler |
+
+Codex does not currently run this probe automatically, and reinstalling the same bundle does not add that missing handler. Use the project's normal lint and tests for verification there. Implementation: [`hooks/post-edit-import-probe.mjs`](../hooks/post-edit-import-probe.mjs); event manifests: [Claude Code](../hooks/hooks.json), [Cursor](../hooks/hooks-cursor.json), [Pi](../hooks/hooks-pi.json), [Codex](../hooks/hooks-codex.json).
+
+### Design review skipped unexpectedly
+
+If you configured `pencil` but design reviews are not running:
+
+- Verify the `.pen` file exists at the configured path (relative to project root)
+- Ensure the Pencil MCP server is running and accessible
+- Check the wave progress output for messages like "Pencil review skipped — .pen file unavailable"
+
+### Session Config not being read
+
+The orchestrator looks for a `## Session Config` section in your project's config host file. Ensure:
+
+- The file is named exactly `CLAUDE.md` on Claude Code and Cursor or `AGENTS.md` on Codex and Pi, and is in the project root
+- The section heading is exactly `## Session Config`
+- Fields use the exact format: `- **field-name:** value`
+
+### Mirror push fails
+
+If `mirror: github` is configured but mirroring fails:
+
+- Verify a `github` remote exists: `git remote get-url github`
+- If not, add it: `git remote add github git@github.com:user/repo.git`
+- Ensure you have push access to the GitHub repository
+
+---
+
+## License
+
+Session Orchestrator is released under the MIT License. See the project repository for details: [https://github.com/Kanevry/session-orchestrator](https://github.com/Kanevry/session-orchestrator)

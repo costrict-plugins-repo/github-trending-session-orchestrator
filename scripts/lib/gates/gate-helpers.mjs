@@ -1,0 +1,1163 @@
+/**
+ * gate-helpers.mjs — Shared utility functions for quality-gate handlers.
+ *
+ * Pure ESM, Node stdlib only. Replaces gate-helpers.sh for .mjs gate scripts.
+ *
+ * Part of v3.2 shell-helper port migration (issue #218 / #317).
+ */
+
+import { readFileSync } from 'node:fs';
+
+import {
+  DEFAULT_GATE_TIMEOUT_MS,
+  buildCommandSignature,
+  spawnInGroup,
+} from '../process-group.mjs';
+import { detectStubCommand } from './echo-stub-detect.mjs';
+import { execFileSync } from '../native-command.mjs';
+
+const RUN_CHECK_MAX_BUFFER_BYTES = 64 * 1024 * 1024;
+
+/** Lines of captured output kept in the human-facing `output` tail. */
+const OUTPUT_TAIL_LINES = 5;
+
+/**
+ * Name of the per-invocation override for the gate wall-clock ceiling.
+ *
+ * Read at CALL time, never at module load, so a test (or a caller that sets it
+ * for one child) is not defeated by import order.
+ *
+ * Named ceiling (BV-004): this is an ENV var, and an env var is inherited by
+ * every descendant — the exact shape that made `SO_GATE_LEDGER_ROOT` reach
+ * every vitest worker on 2026-09-06 (`scripts/run-quality-gate.mjs`, the
+ * `--ledger-root` block). It is acceptable here only because the value is a
+ * CEILING every descendant should honour anyway. A future Session-Config
+ * wiring of `gate.timeout-path-b-ms` should prefer the explicit `timeoutMs`
+ * option below — which reaches exactly one call — over exporting this name.
+ */
+export const GATE_TIMEOUT_ENV = 'SO_GATE_TIMEOUT_MS';
+
+/**
+ * The wall-clock ceiling one gate command is allowed, in ms.
+ *
+ * Precedence: `process.env.SO_GATE_TIMEOUT_MS` when set to a finite positive
+ * number, else {@link DEFAULT_GATE_TIMEOUT_MS} (900_000 — the PRD's
+ * `gate.timeout-path-b-ms`, deliberately the same 15 min the synchronous
+ * path A already had, so both gate paths are allowed exactly as long).
+ *
+ * A non-numeric or non-positive value is IGNORED rather than honoured: a typo
+ * that parsed as 0 would disable the cap, which is the failure this whole
+ * change exists to remove.
+ *
+ * @returns {number} positive milliseconds
+ */
+export function resolveGateTimeoutMs() {
+  const raw = (process.env[GATE_TIMEOUT_ENV] || '').trim();
+  if (!raw) return DEFAULT_GATE_TIMEOUT_MS;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_GATE_TIMEOUT_MS;
+  return parsed;
+}
+
+/**
+ * Last {@link OUTPUT_TAIL_LINES} lines of a captured text, trimmed.
+ *
+ * @param {string} text
+ * @returns {string}
+ */
+function tailOf(text) {
+  return String(text ?? '').split('\n').slice(-OUTPUT_TAIL_LINES).join('\n').trim();
+}
+
+/**
+ * The one line a timed-out gate command MUST carry.
+ *
+ * A timeout is a FAILURE with a name, never a silent `fail`: without this line
+ * a killed command is indistinguishable in the envelope from a command that
+ * exited non-zero on its own, and the operator has nothing to act on. It names
+ * the ceiling that fired, the process GROUP that was signalled, the ladder that
+ * ran, and — the part an exit code can never carry — anything that SURVIVED
+ * SIGKILL (PRD B6: a sent signal proves nothing).
+ *
+ * @param {number} timeoutMs
+ * @param {{pgid: number, killSignals: string[], survivors: number[]|null, error?: string}} run
+ * @returns {string}
+ */
+function timeoutLine(timeoutMs, run) {
+  const ladder = (run.killSignals ?? []).join('\u2192') || 'no signal sent';
+  return `gate: TIMEOUT after ${timeoutMs} ms \u2014 process group ${run.pgid} ${ladder}, `
+    + (run.survivors === null
+      ? `Überlebende nicht messbar: ${run.error}`
+      : `survivors: [${(run.survivors ?? []).join(', ')}]`);
+}
+
+const LEFTOVER_GROUP_PREFIX = 'gate: reaped process group ';
+const LEFTOVER_GROUP_INFIX = ' left running after exit: ';
+const LEFTOVER_NO_SIGNAL = 'no signal sent';
+/**
+ * The line that names a process group still alive after a NORMAL exit and
+ * reaped by {@link spawnInGroup} (#1704, its `leftoverGroup` field). Reported,
+ * never a status change: pass/fail stays the command's own (HR-105).
+ *
+ * @param {{pgid: number, signals: string[], survivors: number[]}} leftover
+ * @returns {string}
+ */
+export function leftoverGroupLine(leftover) {
+  const ladder = (leftover.signals ?? []).join('→') || LEFTOVER_NO_SIGNAL;
+  const survivors = leftover.survivors ?? [];
+  return `${LEFTOVER_GROUP_PREFIX}${leftover.pgid}${LEFTOVER_GROUP_INFIX}${ladder}`
+    + (survivors.length > 0 ? `, survivors: [${survivors.join(', ')}]` : '');
+}
+/**
+ * Exactly the line {@link leftoverGroupLine} produces, anchored, built from the
+ * same constants so the two cannot drift. The timeout-only parser admits it
+ * after the FAIL blocks: it is the gate's own report, not a vitest error.
+ */
+const LEFTOVER_GROUP_LINE_RE = new RegExp(
+  `^${LEFTOVER_GROUP_PREFIX}\\d+${LEFTOVER_GROUP_INFIX}`
+  + `(?:${LEFTOVER_NO_SIGNAL}|SIG[A-Z0-9]+(?:→SIG[A-Z0-9]+)*)`
+  + String.raw`(?:, survivors: \[\d+(?:, \d+)*\])?$`,
+);
+
+/**
+ * The stdout envelope `scripts/run-quality-gate.mjs` publishes when the GATE
+ * SUB-SCRIPT itself was killed on the wall-clock ceiling.
+ *
+ * Lives here, beside the other envelope helpers, because the CLI that consumes
+ * it is a top-level script with no exports — a pure function there would be
+ * untestable without executing the CLI.
+ *
+ * Deliberately carries no `test`/`typecheck`/`lint` object: a killed gate
+ * measured nothing, and `suiteCountsFromGateStdout` must return `null` for it
+ * (absent is not zero). `error: 'gate-timeout'` is the machine-readable
+ * discriminator; the exit code is 124, the same value `spawnInGroup` reports
+ * and the same one coreutils `timeout(1)` uses.
+ *
+ * @param {object} args
+ * @param {string} args.variant  The `--variant` value the run was started with.
+ * @param {number} args.timeoutMs  Ceiling that fired.
+ * @param {{pgid: number, durationMs: number, killSignals: string[], survivors: number[]|null, error?: string}} args.run
+ *   The {@link spawnInGroup} result.
+ * @returns {{variant: string, error: 'gate-timeout', timeout_ms: number, duration_ms: number,
+ *   pgid: number, kill_signals: string[], survivors: number[]|null, cleanup_error?: string, ok?: boolean}}
+ */
+export function gateTimeoutEnvelope({ variant, timeoutMs, run }) {
+  return {
+    variant,
+    error: 'gate-timeout',
+    timeout_ms: timeoutMs,
+    duration_ms: run?.durationMs ?? 0,
+    pgid: run?.pgid ?? -1,
+    kill_signals: run?.killSignals ?? [],
+    survivors: run?.survivors === null ? null : (run?.survivors ?? []),
+    ...(run?.survivors === null ? { cleanup_error: run.error, ok: false } : {}),
+  };
+}
+
+/**
+ * The INNER kill ladder of one gate command, in the gate envelope's own
+ * snake_case shape (#1457 point 1).
+ *
+ * `runCheck` knows, per command, whether its per-command ceiling fired, which
+ * signals it sent and which pids survived the SIGKILL step. Until this helper
+ * that knowledge died inside the gate sub-script, so a command killed by the
+ * INNER ceiling reached `orchestrator.quality_gate.failed` as
+ * `timed_out: false`. Spread it into the command's envelope object.
+ *
+ * Absent is not zero: a result that spawned nothing (skip, stub) carries no
+ * `timedOut` boolean, and gets NO keys — never `false` / `[]`.
+ *
+ * @param {{timedOut?: boolean, killSignals?: string[], survivors?: number[]|null, error?: string}} result
+ *   A {@link runCheck} result.
+ * @returns {{timed_out: boolean, kill_signals: string[], survivors: number[]|null, error?: string,
+ *   leftover_group?: {pgid: number, signals: string[], survivors: number[]}}|{}}
+ *   `survivors` are the pids, same as {@link gateTimeoutEnvelope}.
+ */
+export function commandKillFields(result) {
+  if (typeof result?.timedOut !== 'boolean') return {};
+  return {
+    timed_out: result.timedOut,
+    kill_signals: Array.isArray(result.killSignals) ? [...result.killSignals] : [],
+    survivors: result.survivors === null ? null : (Array.isArray(result.survivors) ? [...result.survivors] : []),
+    ...(result.survivors === null ? { error: result.error, ok: false } : {}),
+    // #1704: additive, only when a group was reaped after a normal exit.
+    ...(result.leftoverGroup ? { leftover_group: {
+      pgid: result.leftoverGroup.pgid,
+      signals: [...(result.leftoverGroup.signals ?? [])],
+      survivors: [...(result.leftoverGroup.survivors ?? [])],
+    } } : {}),
+  };
+}
+
+/** Envelope keys, in execution order, that may carry {@link commandKillFields}. */
+const KILL_FIELD_COMMANDS = ['typecheck', 'test', 'lint'];
+
+/**
+ * Join the OUTER kill ladder (the gate sub-script as a whole) with the INNER
+ * per-command ladders its JSON envelope publishes (#1457 point 1), into the
+ * `timed_out` / `survivors` / `kill_signals` keys of
+ * `orchestrator.quality_gate.{passed,failed}`.
+ *
+ * - inner measured (the envelope parses and EVERY command object either carries
+ *   a boolean `timed_out` or provably spawned nothing — `status: 'skip'` or
+ *   listed in `stubbed`): `timed_out` = outer OR any inner; `kill_signals` =
+ *   outer followed by each command's, in execution order; `survivors` = outer
+ *   count plus every inner pid count. Any explicit null makes the joined
+ *   count null and retains the measurement error. A command whose group was
+ *   reaped after a normal exit adds `{command, pgid, signals, survivors}` to
+ *   `leftover_groups` (#1708); the key is absent when no command had one.
+ *   The joined `survivors` count stays the kill-ladder count and does NOT
+ *   include `leftover_groups[].survivors` (#1704 keeps the two apart).
+ *   The serial re-run's own ladder (`test.rerun`, #1673) joins as one more
+ *   command right after `test` (execution order in gate-full.mjs: typecheck,
+ *   test, re-run, lint), its reaped group as `command: 'test-rerun'` (#1708
+ *   N3). A re-run object without a boolean `timed_out` (a `rerun-error`)
+ *   adds nothing and never decides whether the inner side is measured.
+ * - outer `leftover_groups` (the sub-script's own group, reaped after a normal
+ *   exit): carried FIRST in BOTH branches — a reaped leftover is a
+ *   measurement — after dropping malformed entries; they never change
+ *   `timed_out`, `survivors` or `kill_signals`. The key is absent when the
+ *   final list is empty.
+ * - inner NOT measured (a variant whose envelope does not publish it, an
+ *   unparseable envelope, or the outer ceiling killed the sub-script before it
+ *   wrote one): the outer ladder alone when it fired — a kill is a kill — and
+ *   otherwise NO keys, because `false` / `0` / `[]` would claim that no
+ *   command was killed when nobody looked.
+ *
+ * Never throws.
+ *
+ * @param {object} args
+ * @param {{timed_out: boolean, survivors: number|null, error?: string, kill_signals: string[],
+ *   leftover_groups?: Array<{command: string, pgid: number, signals: string[], survivors: number[]}>}} args.outer
+ *   `gateKillFields()` of the sub-script's `spawnInGroup` result.
+ * @param {string} args.gateStdout  The sub-script's stdout envelope (`''` on an outer kill).
+ * @returns {{timed_out: boolean, survivors: number|null, error?: string, kill_signals: string[],
+ *   leftover_groups?: Array<{command: string, pgid: number, signals: string[], survivors: number[]}>}|{}}
+ */
+export function joinGateKillFields({ outer, gateStdout }) {
+  let parsed = null;
+  if (typeof gateStdout === 'string' && gateStdout.trim()) {
+    try {
+      parsed = JSON.parse(gateStdout);
+    } catch {
+      parsed = null;
+    }
+  }
+  const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+  const names = isObj(parsed) ? KILL_FIELD_COMMANDS.filter((name) => isObj(parsed[name])) : [];
+  const stubbed = isObj(parsed?.stubbed) ? parsed.stubbed : {};
+  // A command either published its ladder, or provably spawned nothing (skip /
+  // stub) — nothing killed is then a measurement too. Any OTHER command (a
+  // variant that ran it but does not publish the ladder) makes the inner side
+  // unknown as a whole.
+  const innerKnown = names.length > 0 && names.every((name) => typeof parsed[name].timed_out === 'boolean'
+    || parsed[name].status === 'skip'
+    || Boolean(stubbed[name]));
+
+  // The outer contract is checked here, not trusted: a malformed entry would
+  // publish a pgid nobody can look up.
+  const outerGroups = (Array.isArray(outer?.leftover_groups) ? outer.leftover_groups : [])
+    .filter((g) => isObj(g) && typeof g.command === 'string' && Number.isFinite(g.pgid)
+      && Array.isArray(g.signals) && Array.isArray(g.survivors))
+    .map((g) => ({ command: g.command, pgid: g.pgid, signals: [...g.signals], survivors: [...g.survivors] }));
+
+  if (!innerKnown) {
+    const { leftover_groups: _raw, ...outerLadder } = outer ?? {};
+    const fired = outer?.timed_out === true || outer?.survivors === null;
+    return {
+      ...(fired ? outerLadder : {}),
+      ...(outerGroups.length > 0 ? { leftover_groups: outerGroups } : {}),
+    };
+  }
+
+  // #1708 N3: the serial re-run ran right after `test`; only a ladder it
+  // actually published (boolean `timed_out`) joins.
+  const rerun = isObj(parsed.test?.rerun) && typeof parsed.test.rerun.timed_out === 'boolean' ? parsed.test.rerun : null;
+  const ladders = names.flatMap((name) => {
+    const own = { command: name, fields: parsed[name] };
+    return name === 'test' && rerun ? [own, { command: 'test-rerun', fields: rerun }] : [own];
+  });
+  const measured = ladders.map((l) => l.fields).filter((c) => typeof c.timed_out === 'boolean');
+
+  const unmeasurable = [outer, ...measured].filter((c) => c?.survivors === null);
+  // #1708 point 1: a group reaped after a NORMAL exit (#1704) reached the
+  // envelope via commandKillFields but was dropped here, so the event could
+  // not show how often it happens before one turns a gate red (HR-105).
+  const leftoverGroups = [
+    ...outerGroups,
+    ...ladders
+      .filter((l) => isObj(l.fields.leftover_group))
+      .map((l) => ({ command: l.command, ...l.fields.leftover_group })),
+  ];
+
+  return {
+    ...(leftoverGroups.length > 0 ? { leftover_groups: leftoverGroups } : {}),
+    timed_out: outer?.timed_out === true || measured.some((c) => c.timed_out),
+    survivors: unmeasurable.length > 0 ? null : (outer?.survivors ?? 0)
+      + measured.reduce((n, c) => n + (Array.isArray(c.survivors) ? c.survivors.length : 0), 0),
+    ...(unmeasurable.length > 0 ? { error: unmeasurable.map((c) => c.error).join('; '), ok: false } : {}),
+    kill_signals: [
+      ...(outer?.kill_signals ?? []),
+      ...measured.flatMap((c) => (Array.isArray(c.kill_signals) ? c.kill_signals : [])),
+    ],
+  };
+}
+
+/**
+ * Decide WHAT a finished gate sub-script run publishes — stdout, stderr,
+ * exit code and operator warnings — without performing any of the writes.
+ *
+ * ## Why this is a pure function and not four `process.*.write` calls
+ *
+ * The timeout branch in `scripts/run-quality-gate.mjs` was unreachable by any
+ * test: reaching it required a REAL gate sub-script to exceed
+ * `resolveGateTimeoutMs() + GATE_OUTER_TIMEOUT_RESERVE_MS` (15 min + 60 s, a
+ * hard constant with no injection seam), so the four decisions it makes —
+ * suppress the partial capture on stdout, re-publish it on stderr, emit ONE
+ * complete `gate-timeout` envelope, warn about survivors — were pinned by
+ * nothing. The CLI now decides here and only WRITES there, so each decision is
+ * testable against a synthetic {@link spawnInGroup} result.
+ *
+ * ## The one-document contract on stdout
+ *
+ * A killed child never wrote its envelope, so its capture is at best a partial
+ * JSON document. Publishing that hands every stdout consumer a parse error
+ * where a named failure belongs; publishing BOTH the partial text and an
+ * envelope breaks the "one JSON document" contract. Hence: capture → stderr,
+ * envelope → stdout, and `stdout` carries EXACTLY the envelope line.
+ *
+ * @param {object} args
+ * @param {{fullOutput?: string, exitCode?: number, timedOut?: boolean, pgid?: number,
+ *   durationMs?: number, killSignals?: string[], survivors?: number[]|null, error?: string}} args.result
+ *   The {@link spawnInGroup} result for the gate sub-script.
+ * @param {string} args.variant  The `--variant` value the run was started with.
+ * @param {number} args.timeoutMs  The OUTER ceiling that applied to the sub-script.
+ * @returns {{stdout: string, stderr: string, exitCode: number, warnings: string[]}}
+ *   `stdout`/`stderr` are written verbatim (empty string = write nothing);
+ *   `warnings` go through the caller's `warn()`; `exitCode` is the gate's own,
+ *   which `spawnInGroup` reports as 124 on the timeout path.
+ */
+export function publishGateOutcome({ result, variant, timeoutMs }) {
+  const capture = String(result?.fullOutput ?? '');
+  const exitCode = result?.exitCode ?? 0;
+
+  if (!result?.timedOut) {
+    return { stdout: capture, stderr: '', exitCode, warnings: [] };
+  }
+
+  const survivors = result.survivors === null ? null : (result.survivors ?? []);
+  return {
+    stdout: `${JSON.stringify(gateTimeoutEnvelope({ variant, timeoutMs, run: result }))}\n`,
+    stderr: capture.trim()
+      ? `\n\u2500\u2500\u2500\u2500 gate TIMED OUT \u2014 captured output before the kill \u2500\u2500\u2500\u2500\n${capture}\n\u2500\u2500\u2500\u2500 end \u2500\u2500\u2500\u2500\n`
+      : '',
+    exitCode,
+    warnings: survivors === null
+      ? [`Überlebende nicht messbar: ${result.error}`]
+      : survivors.length > 0
+      ? [`gate process group ${result.pgid} left survivors after SIGKILL: ${survivors.join(', ')}`]
+      : [],
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Internal pattern helpers
+// ---------------------------------------------------------------------------
+
+/** Test patterns that identify test/spec files. */
+const TEST_PATTERNS = [
+  /\.test\.[jt]sx?$/,
+  /\.test\.mjs$/,
+  /\.spec\.[jt]sx?$/,
+  /\.spec\.mjs$/,
+  /__tests__\//,
+];
+
+/**
+ * Returns true if the given file path matches a test-file pattern.
+ * @param {string} filePath
+ * @returns {boolean}
+ */
+function isTestFile(filePath) {
+  return TEST_PATTERNS.some((re) => re.test(filePath));
+}
+
+// ---------------------------------------------------------------------------
+// Exports
+// ---------------------------------------------------------------------------
+
+/**
+ * Execute a shell command as the LEADER OF ITS OWN PROCESS GROUP, under a
+ * wall-clock ceiling, and return a structured result.
+ *
+ * `output` is a bounded TAIL for humans. `fullOutput` is the complete captured
+ * text and is what every COUNT parse must read.
+ *
+ * Why both: the tail was 5 lines and was also the parser's input. Vitest prints
+ * its `Test Files` / `Tests` summary and THEN the per-failure detail, so on any
+ * real failure the summary sits hundreds of lines above the tail — measured
+ * 2026-08-22: line 174 of 936. `extractTestCounts` then found nothing and the
+ * gate reported `test: fail, total 0, passed 0, failed 0`, which reads as
+ * "the runner never produced results" and hides WHICH test failed. An hour was
+ * spent chasing that phantom before the real cause (one red test) was found.
+ *
+ * ## Why a process group, and why a timeout (Epic #1425 A3)
+ *
+ * This used to be `execSync(cmd, { maxBuffer })` — no timeout at all, and the
+ * shell as the only signalled process. On 2026-09-20 four `tsgo --noEmit`
+ * grandchildren of gate runs outlived their parents at PPID 1 with up to 8.0 GB
+ * RSS each and took the host to 13 % free memory. {@link spawnInGroup} spawns
+ * `detached`, so `process.kill(-pgid, …)` reaches every descendant, and it runs
+ * the SIGTERM→grace→SIGKILL ladder with a read-back verification.
+ *
+ * ## What changed for callers
+ *
+ * 1. It is ASYNC. Every call site must `await`.
+ * 2. `fullOutput` now interleaves stdout AND stderr on the PASS path too
+ *    (`execSync` discarded stderr when the command succeeded). A runner that
+ *    prints its summary to stderr is therefore no longer invisible to
+ *    {@link extractTestCounts}.
+ * 3. Three fields are added — `timedOut`, `killSignals`, `survivors` — and they
+ *    are present ONLY when a process actually ran. A skipped or stubbed command
+ *    spawned nothing, so it carries no `timedOut: false`: absent is not a
+ *    measured false, the same contract `counts` and `files` already keep.
+ *
+ * A timeout is a REPORTED failure: `status: 'fail'`, `exitCode: 124`, and a
+ * `gate: TIMEOUT after …` line appended to `output`/`fullOutput` naming the
+ * ceiling, the group, the signal ladder and any survivor. It is never a silent
+ * `fail`.
+ *
+ * @param {string} cmd - Shell command to run, or `"skip"` / empty to skip.
+ * @param {object} [opts] - Forwarded verbatim to {@link spawnInGroup}, and it
+ *   OVERRIDES the defaults below (`timeoutMs`, `maxOutputBytes`, `repoRoot`,
+ *   `commandSignature`). This is also the seam tests inject `spawnFn` /
+ *   `killFn` / `isAliveFn` through.
+ * @param {number|null} [opts.timeoutMs] - Wall-clock ceiling; defaults to
+ *   {@link resolveGateTimeoutMs} (`SO_GATE_TIMEOUT_MS` or 900_000). `null`
+ *   disables the clock — the byte cap still applies.
+ * @param {string} [opts.platform] - Host platform for missing-command
+ *   classification and for how `fileArgs` reach the command.
+ * @param {string[]} [opts.fileArgs] - File names appended after `--`. On POSIX
+ *   they travel as positional arguments (`/bin/sh -c '<cmd> -- "$@"' sh …`),
+ *   so the configured command keeps its shell semantics and no name is ever
+ *   parsed by the shell. On win32 they are appended to the cmd.exe line and
+ *   must each match {@link SHELL_SAFE_FILE_NAME} (filter with
+ *   {@link partitionTestFileArgs}); anything else throws a TypeError.
+ * @param {string} [opts.repoRoot] - Root whose gate-process ledger the spawn is
+ *   recorded in; defaults to `process.cwd()`, which is the tree under test.
+ * @returns {Promise<{ status: 'pass'|'fail'|'skip', output: string, fullOutput: string,
+ *   exitCode: number, timedOut?: boolean, killSignals?: string[], survivors?: number[]|null, error?: string,
+ *   leftoverGroup?: {pgid: number, signals: string[], survivors: number[]},
+ *   stubbed?: { kind: 'echo'|'noop' } }>}
+ */
+export async function runCheck(cmd, opts = {}) {
+  if (!cmd || cmd === 'skip') {
+    return { status: 'skip', output: '', fullOutput: '', exitCode: 0 };
+  }
+
+  const { fileArgs = [], ...spawnOpts } = opts;
+  const platform = opts.platform ?? process.platform;
+  // The command line as the shell would read it. On POSIX it is only the
+  // ledger signature (unchanged from when the names were joined into the
+  // string); the names themselves never pass through the shell.
+  const shown = fileArgs.length > 0 ? `${cmd} -- ${fileArgs.join(' ')}` : cmd;
+  let spawned = cmd;
+  if (fileArgs.length > 0) {
+    if (platform === 'win32') {
+      // NAMED CEILING (BV-004): cmd.exe re-parses its whole line, so Windows
+      // has no argument vector to put the names in; the allowlist IS the
+      // boundary there, and a name outside it does not run. Revisit with the
+      // Windows gate work (#1612) if a runner without cmd.exe becomes the path.
+      if (!fileArgs.every((f) => SHELL_SAFE_FILE_NAME.test(f))) {
+        throw new TypeError('runCheck: fileArgs on win32 must match SHELL_SAFE_FILE_NAME (use partitionTestFileArgs)');
+      }
+      spawned = shown;
+    } else {
+      spawned = ['/bin/sh', '-c', `${cmd} -- "$@"`, 'sh', ...fileArgs];
+    }
+  }
+
+  // A command with appended names was never a stub (`echo x -- f` is not one).
+  const stub = fileArgs.length > 0 ? { isStub: false } : detectStubCommand(cmd);
+  if (stub.isStub) {
+    return { status: 'pass', output: `(stubbed: ${stub.kind})`, fullOutput: `(stubbed: ${stub.kind})`, exitCode: 0, stubbed: { kind: stub.kind } };
+  }
+
+  const timeoutMs = opts.timeoutMs === undefined ? resolveGateTimeoutMs() : opts.timeoutMs;
+  const run = await spawnInGroup(spawned, {
+    maxOutputBytes: RUN_CHECK_MAX_BUFFER_BYTES,
+    repoRoot: process.cwd(),
+    commandSignature: buildCommandSignature(shown),
+    ...spawnOpts,
+    // #1675: the CLI gate path (`.husky/pre-push` → `npm run quality-gate` →
+    // gate-full → here) must bound Vitest's workers exactly like `runGate()` in
+    // scripts/lib/quality-gate.mjs; without it the pre-push gate ran 18 workers
+    // on an 18-core host and timed out under load (#1673). Applied AFTER the
+    // `opts` spread so a caller-supplied `env` keeps its keys but cannot drop
+    // the bound. typecheck/lint ignore the flag, so it is set unconditionally.
+    // NAMED CEILING (BV-004): the policy is duplicated in exactly two spawn
+    // sites (this one and `runGate`); revisit by extracting one shared helper
+    // if a third gate entrypoint appears or the bound needs a value other
+    // than the flag `vitest.config.mjs` reads.
+    env: { ...(spawnOpts.env ?? process.env), SO_BOUNDED_WORKERS: '1' },
+    timeoutMs,
+  });
+
+  // Reported in every returned shape below, so a consumer never has to ask a
+  // second question to learn whether the group is actually gone.
+  const groupFields = { killSignals: run.killSignals, survivors: run.survivors,
+    ...(run.survivors === null ? { error: run.error, ok: false } : {}),
+    ...(run.leftoverGroup ? { leftoverGroup: run.leftoverGroup } : {}) };
+  // #1704: a group reaped after a NORMAL exit is named in the output of the
+  // non-timeout shapes (a timeout run never carries one); status is unchanged.
+  const runFullOutput = run.leftoverGroup
+    ? `${run.fullOutput}\n${leftoverGroupLine(run.leftoverGroup)}\n`
+    : run.fullOutput;
+
+  if (run.timedOut) {
+    const fullOutput = `${run.fullOutput}\n${timeoutLine(timeoutMs, run)}\n`;
+    return {
+      status: 'fail',
+      output: tailOf(fullOutput),
+      fullOutput,
+      exitCode: run.exitCode,
+      timedOut: true,
+      ...groupFields,
+    };
+  }
+
+  // A missing configured command is a failure, never an implicit opt-out.
+  // cmd.exe sets ERRORLEVEL 9009 for an unknown command, but `cmd /d /s /c`
+  // (Node's shell on win32) exits 1 for it (measured 2026-10-14, #1612), so a
+  // missing command there is an ordinary `fail` without this hint; 9009
+  // only surfaces when a batch file propagates it with `exit /b`.
+  if (run.exitCode === 127 || ((opts.platform ?? process.platform) === 'win32' && run.exitCode === 9009)) {
+    const message = `command not found (exit ${run.exitCode}); correct the command or explicitly set it to skip in the Session Config.`;
+    const fullOutput = `${runFullOutput}\n${message}`.trim();
+    return { status: 'fail', output: tailOf(fullOutput), fullOutput, exitCode: run.exitCode, timedOut: false, ...groupFields };
+  }
+
+  return {
+    status: run.exitCode === 0 ? 'pass' : 'fail',
+    output: tailOf(runFullOutput),
+    fullOutput: runFullOutput,
+    exitCode: run.exitCode,
+    timedOut: false,
+    // #1673: an end by signal, which `exitCode` alone reports as 1.
+    exitSignal: run.exitSignal ?? null,
+    ...groupFields,
+  };
+}
+
+/**
+ * Parse a comma-separated string into an array of trimmed, non-empty entries.
+ *
+ * @param {string} csv
+ * @returns {string[]}
+ */
+export function csvToJsonArray(csv) {
+  if (!csv || typeof csv !== 'string') return [];
+  return csv
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+/**
+ * Return the list of files changed between `ref` and HEAD.
+ *
+ * git runs with an argument vector, never through a shell, so the ref and the
+ * reported names stay data. The ref must name a commit (`rev-parse --verify`);
+ * one that is empty, starts with `-`, carries a control character or does not
+ * resolve behaves like no ref at all and yields []. Names are read with `-z`,
+ * so a name with a space, a quote or a non-ASCII character arrives verbatim
+ * instead of in git's C-quoted form.
+ *
+ * @param {string} ref - Git ref (commit hash, branch, tag). Returns [] if empty.
+ * @returns {string[]}
+ */
+export function findChangedFiles(ref) {
+  if (!ref || typeof ref !== 'string') return [];
+  const commit = ref.trim();
+  // eslint-disable-next-line no-control-regex -- refusing control characters is the point
+  if (!commit || commit.startsWith('-') || /[\u0000-\u001f\u007f]/.test(commit)) return [];
+  try {
+    execFileSync('git', ['rev-parse', '--verify', '--quiet', '--end-of-options', `${commit}^{commit}`], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    const output = execFileSync('git', ['diff', '--name-only', '-z', commit, 'HEAD', '--'], {
+      encoding: 'utf8',
+    });
+    return output.split('\0').filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * File names that can stand unquoted on a shell command line: nothing a POSIX
+ * shell or cmd.exe expands, splits or reads as an option (the first character
+ * excludes `-`). Shared by every place that appends names to a command string —
+ * the Windows path of {@link runCheck} and gate-full's serial re-run.
+ */
+export const SHELL_SAFE_FILE_NAME = /^[\w.@+][\w./@+-]*$/;
+
+/**
+ * Split file names into those that may be handed to the test command on
+ * `platform` and those that may not. On POSIX {@link runCheck} passes the names
+ * as positional arguments, so every non-empty name is accepted. On win32 the
+ * command runs through cmd.exe, which has no argument vector: there only
+ * {@link SHELL_SAFE_FILE_NAME} names are accepted. Callers report `rejected`;
+ * a rejected name must never be dropped silently.
+ *
+ * @param {string[]} files
+ * @param {string} [platform]
+ * @returns {{ accepted: string[], rejected: string[] }}
+ */
+export function partitionTestFileArgs(files, platform = process.platform) {
+  const accepted = [];
+  const rejected = [];
+  for (const file of files) {
+    const ok = typeof file === 'string' && file !== '' && !file.includes('\0')
+      && (platform !== 'win32' || SHELL_SAFE_FILE_NAME.test(file));
+    (ok ? accepted : rejected).push(file);
+  }
+  return { accepted, rejected };
+}
+
+/**
+ * Return only the test/spec files from the set of changed files since `ref`.
+ *
+ * @param {string} ref - Git ref passed to {@link findChangedFiles}.
+ * @returns {string[]}
+ */
+export function findChangedTestFiles(ref) {
+  return findChangedFiles(ref).filter(isTestFile);
+}
+
+/**
+ * Count the number of regex matches of `pattern` in `output`.
+ *
+ * @param {string} output
+ * @param {string|RegExp} pattern
+ * @returns {number}
+ */
+export function extractCount(output, pattern) {
+  if (!output || !pattern) return 0;
+  const re = pattern instanceof RegExp ? pattern : new RegExp(pattern, 'gi');
+  const matches = output.match(re);
+  return matches ? matches.length : 0;
+}
+
+/**
+ * Matches a runner summary line that reports TEST-CASE counts.
+ *
+ * Deliberately anchored on `Tests` + a word boundary so it matches vitest's
+ * `      Tests  12904 passed | 11 skipped (12915)` and jest's
+ * `Tests:       1 failed, 4 passed, 5 total`, but NOT vitest's preceding
+ * `  Test Files  550 passed (550)` line ("Test" is not followed by "s").
+ */
+const TEST_SUMMARY_LINE = /^\s*Tests\b/;
+
+/**
+ * Matches vitest's FILE-level summary line (`Test Files  8 failed | 595 passed (603)`).
+ *
+ * Distinct from {@link TEST_SUMMARY_LINE} (the TEST-CASE line, `Tests  ...`): a
+ * suite that dies at import time is counted HERE, and the `Tests` line then
+ * carries no `N failed` segment at all (#1149) — vitest omits it whenever zero
+ * individual test cases ran. Last matching line wins (the final summary after
+ * any rerun), mirroring `TEST_SUMMARY_LINE`'s own convention.
+ */
+const TEST_FILES_SUMMARY_LINE = /^\s*Test Files\b/;
+
+/**
+ * Parse a `<N> passed` / `<N> failed` pair out of one summary line/scope.
+ * `total` is their sum (skipped excluded) — the same rule the top-level
+ * test-case triple in {@link extractTestCounts} publishes.
+ *
+ * @param {string} scope
+ * @returns {{ passed: number, failed: number, total: number }}
+ */
+function parseCountTriple(scope) {
+  const passMatch = scope.match(/(\d+)\s+passed/);
+  const failMatch = scope.match(/(\d+)\s+failed/);
+  const passed = passMatch ? parseInt(passMatch[1], 10) : 0;
+  const failed = failMatch ? parseInt(failMatch[1], 10) : 0;
+  return { passed, failed, total: passed + failed };
+}
+
+/**
+ * Parse test-runner output for pass/fail/total TEST-CASE counts, plus the
+ * vitest FILE-level triple when a `Test Files` summary line is present.
+ *
+ * ## Which line is parsed
+ *
+ * Real vitest prints TWO `<N> passed` summary lines, files first:
+ *
+ * ```
+ *  Test Files  550 passed (550)
+ *       Tests  12904 passed | 11 skipped (12915)
+ * ```
+ *
+ * A naive whole-output scan hits the FILE count (550) and publishes it as the
+ * test count — the number then rides `gate-full.mjs`'s `test.passed` into the
+ * `orchestrator.quality_gate.*` event stream looking authoritative. So: when a
+ * `Tests`-anchored summary line exists, ONLY that line is parsed for the
+ * test-case triple (the LAST one, which is the final summary after any
+ * rerun). Terse or non-vitest output with no such line falls back to scanning
+ * the whole string, which preserves the bare `"42 passed"` / `"10 passed, 5
+ * failed"` forms.
+ *
+ * The `Test Files` line is parsed the same way, into a SEPARATE nested `files`
+ * triple — never folded into `failed`/`total`. `total === passed + failed` is
+ * load-bearing for the test-case triple (`admitSuiteCounts`, and historically
+ * `failed = total - passed` in `run-quality-gate.mjs`); mixing file counts in
+ * would either break that invariant or invent phantom test-case failures. A
+ * suite that dies at import is invisible on the `Tests` line (vitest omits
+ * `N failed` there when zero test cases ran) and visible only on `Test
+ * Files` — #1149, measured as
+ * `{"test":{"status":"fail","total":14671,"passed":14671,"failed":0}}`, with
+ * no field anywhere naming the 8 files that actually died.
+ * `gate-full.mjs` derives a `suite_died` boolean from `files.failed` for
+ * exactly this shape.
+ *
+ * ## `files` is NULL when no `Test Files` line was seen — never a zero triple
+ *
+ * Only vitest prints that line. A non-vitest runner, a terse reporter, or a
+ * fail-fast crash produces output with no file-level summary at all, and the
+ * function used to publish `files_total/passed/failed: 0` there — an UNMEASURED
+ * zero, byte-identical in the envelope to a measured one, from which
+ * `gate-full.mjs` then derived `suite_died: false` as if it had checked. That is
+ * the same "absent is not zero" defect `admitSuiteCounts` exists to prevent one
+ * field over, so it uses the same channel: `null` means "no file-level
+ * measurement", and the caller OMITS the keys rather than zero-filling them.
+ * The test-case triple keeps its zeros — those are the caller's fallback, not a
+ * parse result, and `total: 0` is already the "no counts" signal
+ * `admitSuiteCounts` rejects.
+ *
+ * ## What `total` means — passed + failed, NOT vitest's parenthesised number
+ *
+ * `total` is `passed + failed` and deliberately EXCLUDES skipped/todo tests.
+ * This is load-bearing, not an oversight: `scripts/run-quality-gate.mjs`
+ * reconstructs the third number from the published envelope as
+ * `failed = total - passed`. Adopting vitest's parenthesised total (12915,
+ * which counts the 11 skipped) would make that derivation report 11 phantom
+ * FAILURES. `total` therefore answers "how many test cases produced a verdict",
+ * and `total - passed === failed` holds by construction for every consumer.
+ *
+ * Skipped is not returned: neither call site (`gate-full.mjs`,
+ * `quality-gate.mjs`) consumes it, and its only use would be to rebuild the
+ * parenthesised total — precisely the number the downstream derivation must not
+ * see. Add it together with a consumer, never ahead of one.
+ *
+ * @param {string} output - Captured test-runner stdout/stderr (or a tail of it).
+ * @returns {{ passed: number, failed: number, total: number, summary: boolean, files: {passed: number, failed: number, total: number}|null }}
+ *   Test-case `total === passed + failed`. `summary` is `true` when the triple
+ *   was read from a `Tests` summary line and `false` when it fell back to the
+ *   whole output, where any "N failed" in a log line counts. `files` is `null`
+ *   when the output carried no `Test Files` summary line; when present,
+ *   `files.total === files.passed + files.failed`.
+ */
+export function extractTestCounts(output) {
+  const EMPTY = { passed: 0, failed: 0, total: 0, summary: false, files: null };
+  if (!output) return EMPTY;
+
+  // Colored Vitest labels must match the same summaries as piped plain text.
+  output = output.replace(ANSI_ESCAPE, '');
+  const lines = output.split('\n');
+  const summaryLines = lines.filter((line) => TEST_SUMMARY_LINE.test(line));
+  const scope = summaryLines.length > 0 ? summaryLines[summaryLines.length - 1] : output;
+  const { passed, failed, total } = parseCountTriple(scope);
+
+  const fileSummaryLines = lines.filter((line) => TEST_FILES_SUMMARY_LINE.test(line));
+  const fileScope = fileSummaryLines.length > 0 ? fileSummaryLines[fileSummaryLines.length - 1] : '';
+  // No `Test Files` line → NOT MEASURED. See the docstring section above: a zero
+  // triple here would be indistinguishable from a real all-passed-zero-files run.
+  const files = fileScope ? parseCountTriple(fileScope) : null;
+
+  return { passed, failed, total, summary: summaryLines.length > 0, files };
+}
+
+/**
+ * ANSI SGR / CSI escapes vitest emits when it believes it writes to a TTY.
+ * `runCheck` captures through a pipe, where vitest disables colour — but a
+ * runner invoked through a pty wrapper, or with `FORCE_COLOR`, still colours
+ * its output and would defeat every anchored match below.
+ */
+// eslint-disable-next-line no-control-regex
+const ANSI_ESCAPE = /\u001b\[[0-9;]*[A-Za-z]/g;
+
+/** Path shape of a test/spec file, as printed by vitest/jest. */
+const TEST_FILE_PATH = String.raw`[^\s()]+\.(?:test|spec)\.[cm]?[jt]sx?`;
+
+/**
+ * `FAIL <path>` — printed once per failing FILE in the "Failed Tests" and
+ * "Failed Suites" sections. Two real shapes, both covered by this anchor
+ * (measured against vitest 4.1.5, 2026-09-06):
+ *
+ *   ` FAIL  dead.test.mjs [ dead.test.mjs ]`      ← suite died at import
+ *   ` FAIL  red.test.mjs > red > fails`           ← a test case failed
+ */
+const FAIL_LINE = new RegExp(String.raw`^\s*FAIL\s+(${TEST_FILE_PATH})(?:\s|$)`);
+
+/**
+ * `❯ <path> (N tests | M failed)` — the per-file line of the run summary.
+ *
+ * The `(… | … failed)` group is load-bearing, NOT decoration: vitest prefixes
+ * STACK FRAMES with the same `❯` and the frame carries the same file name
+ * (` ❯ red.test.mjs:3:33`). Requiring the parenthesised counts is what keeps a
+ * frame — and a PASSING file's summary line, ` ❯ green.test.mjs (2 tests)` —
+ * out of the result.
+ */
+const FILE_SUMMARY_FAIL_LINE = new RegExp(
+  String.raw`^\s*❯\s+(${TEST_FILE_PATH})\s+\(\d+\s+tests?[^)]*\|\s*\d+\s+failed`,
+);
+
+/**
+ * Name the test FILES a failing run blamed — the one thing the gate envelope
+ * never carried.
+ *
+ * Measured 2026-09-06: a husky pre-push run blocked `git push origin main` with
+ * `{"test":{"status":"fail","total":16417,"passed":16415,"failed":2,
+ * "files_total":662,"files_passed":661,"files_failed":1,…}}` — a COUNT and no
+ * name. `files_failed: 1` says a file died; reconstructing WHICH one cost a
+ * full manual re-materialisation of the tracked tree, even though the runner
+ * had printed the path in the very output this envelope was built from.
+ *
+ * Order is first-appearance and duplicates are dropped: vitest names the same
+ * file on its summary line AND once per failing case inside it, so a raw match
+ * list would repeat one path N times and read as N failing files.
+ *
+ * Absolute paths are relativised against `cwd` when it is a prefix — a gate
+ * report is read next to `git status`, so a repo-relative path is the useful
+ * form. A path outside `cwd` is left verbatim rather than turned into a `../..`
+ * chain that names nothing an operator can act on.
+ *
+ * @param {string} output - Captured test-runner stdout/stderr.
+ * @param {string} [cwd=process.cwd()] - Root to relativise absolute paths against.
+ * @returns {string[]} De-duplicated file paths, in first-appearance order.
+ */
+export function extractFailedTestFiles(output, cwd = process.cwd()) {
+  if (!output || typeof output !== 'string') return [];
+
+  const prefix = cwd.endsWith('/') ? cwd : `${cwd}/`;
+  const seen = new Set();
+
+  for (const rawLine of output.split('\n')) {
+    const line = rawLine.replace(ANSI_ESCAPE, '');
+    const match = FAIL_LINE.exec(line) ?? FILE_SUMMARY_FAIL_LINE.exec(line);
+    if (!match) continue;
+    const file = match[1].startsWith(prefix) ? match[1].slice(prefix.length) : match[1];
+    seen.add(file);
+  }
+
+  return [...seen];
+}
+
+/**
+ * vitest's own wording for a test or hook that ran past its timeout (vitest
+ * 4.1.11, `makeTimeoutError` in @vitest/runner): `Test timed out in 5000ms.`,
+ * with the `If this is a long-running …` hint after a newline, so it is the
+ * NEXT line ({@link TIMEOUT_BLOCK_LINE}). Anchored at the end: any further text
+ * on the error line is not a plain timeout.
+ */
+const TIMEOUT_ERROR_LINE = /^(?:Error:\s+)?(?:Test|Hook) timed out in \d+ms\.?$/;
+/**
+ * Node's wording for a child process that ran past its `timeout` option, as it
+ * reaches vitest thrown (#1673, measured vitest 4.1.12, 2026-10-28): both
+ * `spawnSync(…, {timeout})` + `throw result.error` and `execFileSync(…, {timeout})`
+ * print `Error: spawnSync <cmd> ETIMEDOUT`. Anchored at both ends with a
+ * non-blank command: other errnos (`ENOENT`), `Command failed: …` and any
+ * trailing text are not a plain timeout.
+ */
+const CHILD_TIMEOUT_ERROR_LINE = /^(?:Error:\s+)?spawnSync \S(?:.*\S)? ETIMEDOUT$/;
+/**
+ * `⎯⎯⎯[k/N]⎯` — closes every numbered error block. N is the run's error total
+ * counted BEFORE vitest merges identical errors (`printErrorsSummary`, vitest
+ * 4.1.11), so it equals the number of FAIL headers, not of blocks.
+ */
+const ERROR_BLOCK_COUNTER = /^\s*⎯+\[(\d+)\/(\d+)\]⎯*\s*$/;
+/**
+ * The only lines a timeout block may carry after its error line: vitest's
+ * hint, a stack frame (` ❯ …`) and the code frame (`      2| …`, `       | ^`).
+ * Anything else — `Caused by:`, a serialized error, a second error — makes the
+ * block something other than a plain timeout.
+ */
+const TIMEOUT_BLOCK_LINE = /^(?:If this is a long-running (?:test|hook),|\s*❯\s|\s+\d+\|(?: |$)|\s+\|\s*\^)/;
+/**
+ * Once the first FAIL block opened, the only lines vitest prints OUTSIDE a
+ * block are the section rules and the closing summary, each in its exact
+ * numeric shape (vitest 4.1.11, measured). Any other line there — a package
+ * manager's own error line included — is an error the block list does not hold
+ * (Codex review round 3, H1: prefix-only matches admitted `npm error
+ * AssertionError …` and `⎯⎯ AssertionError … ⎯⎯`).
+ */
+const AFTER_FAILURES_LINE = new RegExp(
+  [
+    String.raw`^\s*⎯+ Failed (?:Tests|Suites) \d+ ⎯+\s*$`,
+    String.raw`^\s*Test Files\s+\d+ (?:failed|passed)(?: \| \d+ (?:passed|skipped|todo))* \(\d+\)\s*$`,
+    String.raw`^\s*Tests\s+\d+ (?:failed|passed)(?: \| \d+ (?:passed|skipped|todo))* \(\d+\)\s*$`,
+    String.raw`^\s*Start at\s+\d{2}:\d{2}:\d{2}\s*$`,
+    String.raw`^\s*Duration\s+\d+(?:\.\d+)?m?s(?: \([^()]*\))?\s*$`,
+  ].join('|'),
+);
+/**
+ * Errors vitest reports OUTSIDE the numbered FAIL blocks: the `Unhandled
+ * Errors` section and its `Errors  N error(s)` summary line. Either one means a
+ * failure the block list does not hold (measured, vitest 4.1.11).
+ */
+const UNCOUNTED_ERRORS_LINE = /^(?:⎯+\s*Unhandled\b|\s*Errors\s+\d+\s+errors?\b)/;
+
+/**
+ * Which failing files failed ONLY by timeout — the set the full gate may run a
+ * second time, serially (#1673).
+ *
+ * Under host load the parallel suite loses tests to their timeout while the
+ * code is fine; four pre-push runs on m5 blocked with four different red sets
+ * (11, 11, 2, 7 tests), none touching the pushed diff. A timeout is the
+ * failure that load alone produces, in two shapes: vitest's own `Test|Hook
+ * timed out in Nms.` ({@link TIMEOUT_ERROR_LINE}) and a child-process timeout
+ * thrown into the test, `Error: spawnSync <cmd> ETIMEDOUT`
+ * ({@link CHILD_TIMEOUT_ERROR_LINE}; measured vitest 4.1.12, 2026-10-28:
+ * `spawnSync` and `execFileSync` both print that line, and the !283 push was
+ * blocked by exactly one of each). An assertion failure is NOT eligible, even
+ * one that load provoked or whose message mentions `ETIMEDOUT`: assertions are
+ * never re-run-eligible, because re-running one would let a genuine flake
+ * through the gate (Lead 32, 2026-10-20). Only the error LINE set is wider; a
+ * genuine hang still has to pass the serial re-run.
+ *
+ * Shape (measured, vitest 4.1.11): every error block starts with one or more
+ * `FAIL <file> …` headers, then the error line, and ends in `⎯[k/N]⎯`.
+ * Several headers share one block when vitest's `printTaskErrors` merges their
+ * errors: same `stack` AND same `diff`, same project, and (for tests) deep-equal
+ * annotations. A timeout's stack is the place the test or hook was DECLARED, so
+ * one `beforeEach` that times out for every test of a file, or the cases of one
+ * `it.each`, print as one block under several headers. Each header is one
+ * (task, error) pair, and N counts those pairs before the merge, so the
+ * completeness check compares N with the HEADERS read, not with the blocks.
+ *
+ * Fail-closed: `eligible` is true only when EVERY counted error was parsed and
+ * EVERY block is a timeout. A header count that differs from N (an unhandled
+ * error, an unknown layout), no counter at all, or one non-timeout block makes
+ * the whole run ineligible.
+ *
+ * @param {string} output - Captured test-runner stdout/stderr.
+ * @param {string} [cwd=process.cwd()] - Root to relativise absolute paths against.
+ * @returns {{ eligible: boolean, files: string[], reason: string }}
+ */
+export function extractTimeoutOnlyFailedFiles(output, cwd = process.cwd()) {
+  if (!output || typeof output !== 'string') return { eligible: false, files: [], reason: 'no-output' };
+
+  const prefix = cwd.endsWith('/') ? cwd : `${cwd}/`;
+  const files = new Set();
+  let pending = [];
+  let inBlock = false;
+  let sawFail = false;
+  let blocks = 0;
+  let errors = 0;
+  let declaredTotal = null;
+  let allTimeouts = true;
+
+  for (const rawLine of output.split('\n')) {
+    const line = rawLine.replace(ANSI_ESCAPE, '');
+    if (UNCOUNTED_ERRORS_LINE.test(line)) return { eligible: false, files: [], reason: 'uncounted-errors' };
+    const counter = ERROR_BLOCK_COUNTER.exec(line);
+    if (counter) {
+      declaredTotal = Number(counter[2]);
+      inBlock = false;
+      continue;
+    }
+    const header = FAIL_LINE.exec(line);
+    if (header) {
+      pending.push(header[1].startsWith(prefix) ? header[1].slice(prefix.length) : header[1]);
+      inBlock = false;
+      sawFail = true;
+      continue;
+    }
+    if (line.trim() === '') continue;
+    if (inBlock) {
+      if (!TIMEOUT_BLOCK_LINE.test(line)) allTimeouts = false;
+      continue;
+    }
+    if (pending.length === 0) {
+      if (sawFail && !AFTER_FAILURES_LINE.test(line) && !LEFTOVER_GROUP_LINE_RE.test(line)) return { eligible: false, files: [], reason: 'line-outside-blocks' };
+      continue;
+    }
+    blocks += 1;
+    errors += pending.length;
+    const errorLine = line.trim();
+    if (!TIMEOUT_ERROR_LINE.test(errorLine) && !CHILD_TIMEOUT_ERROR_LINE.test(errorLine)) allTimeouts = false;
+    for (const file of pending) files.add(file);
+    pending = [];
+    inBlock = true;
+  }
+
+  if (pending.length > 0) return { eligible: false, files: [], reason: 'header-without-error' };
+  if (declaredTotal === null || blocks === 0) return { eligible: false, files: [], reason: 'no-error-blocks' };
+  if (errors !== declaredTotal) return { eligible: false, files: [], reason: `parsed-${errors}-of-${declaredTotal}` };
+  if (!allTimeouts) return { eligible: false, files: [], reason: 'non-timeout-failure' };
+  return { eligible: true, files: [...files], reason: 'timeouts-only' };
+}
+
+/**
+ * Admit a suite-count triple, or refuse to claim a measurement.
+ *
+ * ## Why this exists (#967 item 2)
+ *
+ * Two functions used to write the `counts` field of the SAME
+ * `orchestrator.quality_gate.*` event under DIFFERENT admission policies:
+ * `suiteCountsFromGateStdout` (`scripts/run-quality-gate.mjs`) rejected
+ * inconsistent triples, while `suiteCountsFromOutput` (`scripts/lib/quality-gate.mjs`)
+ * admitted `passed > total` and a negative `passed`. A consumer therefore had to
+ * know two policies to read one field. This is the single shared policy; both
+ * callers keep only their own input adapter.
+ *
+ * ## Absent-not-null
+ *
+ * Returns `null` — NEVER a zero triple — for any unmeasured or inconsistent
+ * input. `{passed: 0, failed: 0, total: 0}` would be indistinguishable from a
+ * real all-skipped run and would publish a phantom measurement. Callers spread
+ * the result so the field is OMITTED rather than zero-filled:
+ *
+ * ```js
+ * const counts = admitSuiteCounts(raw);
+ * await emitEvent(name, { ...(counts ? { counts } : {}) });
+ * ```
+ *
+ * ## ONE channel for "the gate did not run" — a NULL `raw` (#969 MED-2)
+ *
+ * This function used to take a second `opts.measured` channel: `false` was an
+ * unconditional refusal, meant to carry the caller's positional evidence that no
+ * test gate ran. It was dead. Both adapters ALREADY convert that evidence to a
+ * null `raw` before the policy sees it (`suiteCountsFromOutput` returns
+ * `admitSuiteCounts(null)` for a null/empty output; the CLI's
+ * `suiteCountsFromGateStdout` returns `null` from its own envelope checks and
+ * never passed the opt at all), so no production path could ever reach here with
+ * a non-null triple AND `measured: false` — only test rows exercised the flag.
+ *
+ * Keeping both was the real cost: "the gate did not run" was expressible two
+ * ways and checked in two places, so a future caller could pass a real triple
+ * with `measured: false`, or a STALE triple with `measured: true`, and the two
+ * channels would disagree with the unverifiable boolean silently winning. A
+ * null `raw` is the channel that survives because the policy must reject
+ * non-objects anyway — it is structural, not an extra parameter, and it is
+ * expressible by every caller including the one that never opted in.
+ *
+ * ## What stays with the CALLER (deliberately not absorbed)
+ *
+ * This function sees a candidate triple and nothing else. It performs no I/O and
+ * reads no files. The following are per-caller INPUT ADAPTERS and must not
+ * migrate here: JSON-envelope parsing; the `test`-must-be-an-object check
+ * (every variant emits an object since #1457 pkt 12; only full-gate's carries
+ * counts, so the others fall through to this function's own finite-number
+ * refusal);
+ * `test.status ∈ {pass, fail}`; the `parsed.stubbed?.test` short-circuit; the
+ * raw-text tail parse ({@link extractTestCounts}); and the positional evidence
+ * that the test gate ran at all — which each caller expresses by handing over
+ * `null` rather than a triple.
+ *
+ * `failed` is accepted when the caller parsed one and DERIVED as `total - passed`
+ * when it did not, so both the parsed-`failed` path and the derived-`failed` path
+ * land on one consistency check (`passed + failed === total`).
+ *
+ * @param {{passed?: unknown, failed?: unknown, total?: unknown}|null|undefined} raw
+ *   `null`/`undefined` is the caller's evidence that there is no measurement to
+ *   admit (gate skipped, stub command, fail-fast before the test step, or no
+ *   parseable count in the output).
+ * @returns {{passed: number, failed: number, total: number}|null}
+ */
+export function admitSuiteCounts(raw) {
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null;
+
+  const { passed, total } = raw;
+  if (!Number.isFinite(passed) || !Number.isFinite(total)) return null;
+
+  const failed = Number.isFinite(raw.failed) ? raw.failed : total - passed;
+
+  if (total <= 0) return null;
+  if (passed < 0 || failed < 0) return null;
+  // Redundant given the sum check below while `failed >= 0`, but kept explicit:
+  // it is the check the looser of the two former policies was missing.
+  if (passed > total) return null;
+  if (passed + failed !== total) return null;
+
+  return { passed, failed, total };
+}
+
+/**
+ * Scan changed files (since `ref`) for debug artifacts: `console.log`, `debugger`, `TODO`, `FIXME`.
+ *
+ * @param {string} ref - Git ref. Returns [] if empty or no changed files.
+ * @returns {Array<{ file: string, line: number, snippet: string }>}
+ */
+export function collectDebugArtifacts(ref) {
+  if (!ref) return [];
+
+  const changedFiles = findChangedFiles(ref);
+  if (changedFiles.length === 0) return [];
+
+  const DEBUG_PATTERN = /console\.log|debugger|TODO|FIXME/;
+  const artifacts = [];
+
+  for (const filePath of changedFiles) {
+    let contents;
+    try {
+      contents = readFileSync(filePath, 'utf8');
+    } catch {
+      // File may have been deleted; skip silently.
+      continue;
+    }
+
+    const lines = contents.split('\n');
+    for (let i = 0; i < lines.length; i++) {
+      if (DEBUG_PATTERN.test(lines[i])) {
+        artifacts.push({
+          file: filePath,
+          line: i + 1,
+          snippet: lines[i].trim(),
+        });
+        if (artifacts.length >= 50) return artifacts;
+      }
+    }
+  }
+
+  return artifacts;
+}
+
+/**
+ * Return lines from `output` that match `pattern`, each wrapped in an object.
+ *
+ * @param {string} output
+ * @param {string|RegExp} pattern
+ * @returns {Array<{ line: string }>}
+ */
+export function extractErrorLinesJson(output, pattern) {
+  if (!output || !pattern) return [];
+  const re = pattern instanceof RegExp ? pattern : new RegExp(pattern, 'i');
+  return output
+    .split('\n')
+    .filter((l) => re.test(l))
+    .slice(0, 20)
+    .map((line) => ({ line }));
+}
+
+/**
+ * Resolve the test-file list from either an explicit CSV or changed files since `startRef`.
+ *
+ * If `filesCsv` is non-empty, splits on commas and returns entries that match
+ * test-file patterns. Otherwise delegates to {@link findChangedTestFiles}.
+ *
+ * @param {string} filesCsv  - Comma-separated list of explicit test files (may be empty).
+ * @param {string} startRef  - Git ref used when `filesCsv` is absent.
+ * @returns {string[]}
+ */
+export function resolveTestFiles(filesCsv, startRef) {
+  if (filesCsv && filesCsv.trim()) {
+    return csvToJsonArray(filesCsv).filter(isTestFile);
+  }
+  if (startRef && startRef.trim()) {
+    return findChangedTestFiles(startRef);
+  }
+  return [];
+}

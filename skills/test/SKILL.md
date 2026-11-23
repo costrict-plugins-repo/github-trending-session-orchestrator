@@ -1,0 +1,109 @@
+---
+name: test
+description: Agentic end-to-end test orchestrator — drive web/macOS flows, evaluate UX rubric, reconcile issues
+user-invocable: true
+argument-hint: "[scope|profile-name] [--target-kind live|production-build|dev-server] [--target-url <url>] [--since <git-ref>] [--full]"
+model: inherit
+---
+# Test
+
+Run agentic end-to-end tests against the current project or a named target. The user invoked `/test` with arguments: **$ARGUMENTS**
+
+This skill resolves a test target and profile, dispatches the appropriate driver (Playwright for web, Peekaboo for macOS), invokes the `ux-evaluator` agent against the captured artifacts, and reconciles findings with the open issue tracker. All logic lives in `skills/test-runner/SKILL.md` — this file is the user-facing entry point only.
+
+## Invocation
+
+`$ARGUMENTS` carries the recognised flags (`--target`, `--target-kind`, `--target-url`, `--profile`, `--dry-run`, `--since`, `--full`) and an optional bare scope token. Parse it per § Argument Validation, resolve per § Argument Precedence Resolution, and only then hand the eight-argument § Handoff Contract to `skills/test-runner/SKILL.md`, which owns all further resolution, driver dispatch, evaluation, and issue reconciliation.
+
+Example: `/test --profile smoke --target-kind live --target-url https://example.com` requests a live run at that URL; `LIVE RUN` is granted only when per-page visited-URL evidence confirms it was driven. Missing evidence or a different visited origin yields the dev-server header and a report explaining the mismatch.
+
+## Argument Validation
+
+Parse `$ARGUMENTS` before doing anything else.
+
+Recognized flags and positional arguments:
+
+- `--target <name>` — explicit target name (e.g. `your-target-app`, `your-mobile-app`). Sets `explicit_target = true`.
+- `--target-kind live|production-build|dev-server` — requested run kind; pass as `target_kind`. Capture evidence grants the final kind and header. Only these three values are recognized. An unrecognized value (or a missing value) resolves to `dev-server unknown`; do not consume a following flag as its value. With no flag, preserve an explicit operator statement for this run; otherwise use `dev-server`.
+- `--target-url <url>` — requested navigation URL; pass as `target_url`. Takes precedence over a URL in the request or Playwright config. A missing value is `unknown`; do not consume a following flag as its value. The test-runner applies its localhost/preview and unknown safety rules before dispatch, then verifies actual visited URLs before granting the report label; the flag alone does not configure Playwright's base URL.
+- `--profile <name>` — explicit profile name (e.g. `smoke`, `full`, `a11y`, `onboarding`). Sets `explicit_profile = true`.
+- `--dry-run` — resolve target and profile, print the dispatch plan, but do NOT invoke any driver or create any issues. Sets `dry_run = true`.
+- `--since <git-ref>` — restrict test execution to files changed since the given git ref. Sets `since_ref = <git-ref>`.
+- `--full` — explicit full-repo scan. Sets `full_scan = true`.
+- `[scope]` — any unrecognized positional token is treated as a profile name (same as `--profile <scope>`).
+
+**Conflict check:** If BOTH `--since` and `--full` are present, stop immediately and report:
+
+```
+Error: Cannot use --since with --full. Provide one, not both.
+```
+
+Do NOT proceed with test execution when this conflict is present.
+
+If `$ARGUMENTS` contains an unrecognized flag (i.e. starts with `--` but is not one of the above), inform the user:
+
+```
+Unknown flag '<flag>'. Recognized flags: --target <name>, --target-kind live|production-build|dev-server, --target-url <url>, --profile <name>, --dry-run, --since <git-ref>, --full.
+```
+
+Then continue with the remaining valid arguments.
+
+## Argument Precedence Resolution
+
+Resolve `target` and `profile` using the following precedence (highest → lowest). Stop at the first rule that produces a value for each variable.
+
+1. **Explicit flags** — `--target <name>` sets `target`; `--profile <name>` sets `profile`. Highest priority. Both may be provided together.
+2. **Profile from policy, target explicit** — if only `--target <name>` is provided (no `--profile`), pass `target` to the test-runner skill; the skill resolves the profile from `.orchestrator/policy/test-profiles.json` or its default.
+3. **Target from policy, profile explicit** — if only `--profile <name>` is provided (no `--target`), pass `profile` to the test-runner skill; the skill resolves the target via convention-based detection.
+4. **Positional token as profile** — if a bare positional argument (no `--` prefix) is present in `$ARGUMENTS`, treat it as `profile`. The test-runner skill resolves the target via convention.
+5. **Session Config default** — if the Session Config block contains `test-runner.default-profile`, use that value for `profile`. Target is still resolved by the skill via convention.
+6. **Interactive AUQ** — if no target or profile could be resolved from steps 1–5, proceed to the Profile Selection section below before invoking the skill.
+
+## Profile Selection
+
+**Only execute this section when steps 1–5 above produced neither `target` nor `profile`.**
+
+Present the user with a structured choice via `AskUserQuestion`:
+
+```
+AskUserQuestion({
+  questions: [{
+    question: "Which test profile should be run?",
+    header: "Profil",
+    options: [
+      { label: "smoke (Recommended)", description: "Quick sanity pass — key flows, axe critical/serious, console errors. The fastest of the four; run it first." },
+      { label: "full", description: "All checks at full depth — slower, used before release." },
+      { label: "a11y", description: "Accessibility-focused pass — axe-core exhaustive scan." },
+      { label: "onboarding", description: "Onboarding step-count + Liquid Glass conformance checks." }
+    ],
+    multiSelect: false
+  }]
+})
+```
+
+Set the user's selection as `profile`. The test-runner skill will resolve the target from convention.
+
+## Invoke Test-Runner Skill
+
+**Invoke the test-runner skill.** Follow its instructions precisely.
+
+Read `skills/test-runner/SKILL.md` and execute all phases in order. Do NOT skip Phase 0 (bootstrap gate). Do NOT inline driver artifact content into the coordinator context — all artifacts go to disk under the run directory.
+
+Pass the following handoff contract to the skill entry point.
+
+## Handoff Contract
+
+The eight named arguments below are the canonical contract between this skill and `skills/test-runner/SKILL.md`. The skill reads them from context; do NOT reconstruct them inside the skill.
+
+| Argument | Type | Value |
+|---|---|---|
+| `target` | `string \| undefined` | Resolved target name, or `undefined` if not yet known (skill resolves via convention) |
+| `target_kind` | `string \| undefined` | Requested recognized `--target-kind` value (subject to capture evidence); `undefined` if absent. Invalid/missing flag value forces `dev-server` with `target_url = "unknown"` |
+| `target_url` | `string \| undefined` | URL from `--target-url`, or `undefined` if absent; `unknown` for a missing value or invalid target kind |
+| `profile` | `string \| undefined` | Resolved profile name, or `undefined` if not yet known (skill applies `test-runner.default-profile` or `smoke`) |
+| `dry_run` | `boolean` | `true` if `--dry-run` was passed; `false` otherwise |
+| `explicit_target` | `boolean` | `true` if `--target` was present in `$ARGUMENTS`; `false` otherwise |
+| `explicit_profile` | `boolean` | `true` if `--profile` was present in `$ARGUMENTS`; `false` otherwise |
+| `since_ref` | `string \| undefined` | Git ref from `--since <git-ref>`, or `undefined` if not provided |
+
+The skill is the single source of truth for all further resolution, driver dispatch, evaluation, and issue reconciliation. Do NOT re-implement profile logic, driver selection, or issue triage here.

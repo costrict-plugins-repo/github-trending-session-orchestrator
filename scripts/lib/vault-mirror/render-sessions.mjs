@@ -1,0 +1,799 @@
+/**
+ * render-sessions.mjs — Session markdown generators for vault-mirror (Issue #283 split).
+ *
+ * Exports: detectSessionSchema, normalizeSessionEntry, generateSessionNote, generateSessionNoteV2, generateSessionNoteV3,
+ *          sessionSourceRecord (#1503)
+ *
+ * #732: all three generators accept `options.repoNs` (the leak-guarded /
+ * pseudonym-mapped namespace segment from resolveRepoNamespace(), threaded
+ * through by process.mjs::processSession) and emit it as a `source-repo:`
+ * frontmatter line — mirroring render-learnings.mjs's `source-repo` field.
+ * Prior to #732, session notes emitted a raw `repo:` field sourced directly
+ * from deriveRepo() (bypassing the leak-guard entirely, even though the write
+ * PATH already used resolveRepoNamespace()). Historical notes on disk may still
+ * carry the legacy `repo:` key — the vault frontmatter Zod schema tolerates it
+ * via `.passthrough()`, and it is NOT rewritten retroactively by this change.
+ */
+
+import { toDate, buildTag, slugifyIdSafe, noteIdFor, yamlNoteId } from './utils.mjs';
+import { stableHostname } from '../host-identity.mjs';
+import { sourceRecordValue, sourceRecordLine } from './render-learnings.mjs';
+import { sessionNarrativeText } from './retention.mjs';
+
+const GENERATOR_MARKER = 'session-orchestrator-vault-mirror@1';
+
+/**
+ * Placeholders for an ABSENT optional field (session-reviewer M1).
+ *
+ * These are the tokens the v2/v3 generators already use — `'?'` inside a wave
+ * table cell (generateSessionNoteV2's wave rows), `'n/a'` in a prose bullet
+ * (both v2 and v3). The v1 generator predates both guards and interpolated the
+ * same optional fields raw, so any record lacking one wrote the literal string
+ * `undefined` into a vault note a human reads.
+ *
+ * ── ABSENT IS NOT ZERO ─────────────────────────────────────────────────────
+ *
+ * Every use site must apply these with `??`, NEVER `||`. A wave that genuinely
+ * changed 0 files, or dispatched 0 agents, has a MEASURED zero and must render
+ * `0`; only a field the producer never wrote is unknown. `||` collapses that
+ * distinction (`0 || '?'` → `'?'`, asserting "unknown" about a real
+ * measurement); `??` preserves it (`0 ?? '?'` → `0`).
+ */
+const MISSING_CELL = '?';
+const MISSING_VALUE = 'n/a';
+
+/**
+ * Render the `**Duration:**` bullet value for all three generators (#969 LOW-1).
+ *
+ * All three sites used to read `Math.round((duration_seconds ?? 0) / 60)`, three
+ * lines that violated the banner directly above them: neither `duration_minutes`
+ * nor `duration_seconds` is in ANY of the `RENDERABLE_SESSION_FIELDS_*` lists,
+ * so absence is reachable, and a record lacking both rendered `Duration: 0m` —
+ * a claimed MEASURED zero, contradicted on the same line by its own
+ * `started_at → completed_at` span, and sitting beside correctly-rendered `n/a`s.
+ * "0m" reads as a verified fact; that is the more damaging direction.
+ *
+ * The whole chain is `??`, never `||`, so a genuinely measured zero survives:
+ * `duration_minutes: 0` renders `0m`, and so does `duration_seconds: 0`
+ * (`Math.round(0 / 60)` is `0`, and `0 ?? x` is `0`). Only a field the producer
+ * never wrote becomes `MISSING_VALUE`. The suffix is applied HERE rather than at
+ * the call sites, because `${MISSING_VALUE}m` would render `n/am`.
+ *
+ * @param {unknown} durationSeconds — v1/v2/v3 `duration_seconds`.
+ * @param {unknown} [durationMinutes] — v3 `duration_minutes`; WINS when both are
+ *   present, preserving v3's original precedence.
+ * @returns {string} e.g. `'42m'`, `'0m'`, or `'n/a'`.
+ */
+function renderDuration(durationSeconds, durationMinutes) {
+  const fromSeconds =
+    durationSeconds === undefined || durationSeconds === null
+      ? undefined
+      : Math.round(durationSeconds / 60);
+  const minutes = durationMinutes ?? fromSeconds;
+  return minutes === undefined || minutes === null ? MISSING_VALUE : `${minutes}m`;
+}
+
+/**
+ * Coerce ONE wave-object count field to a renderable number (#1074).
+ *
+ * ── WHY A TYPE GUARD AND NOT A BARE `??` CHAIN ─────────────────────────────
+ *
+ * The wave-object count fields are POLYMORPHIC across producer generations.
+ * Census over the live ledger (253 records / 599 wave objects, 2026-08-19):
+ *
+ *   agent_count        number 359
+ *   agents             number 210, **ARRAY 14**   ← array-of-agent-descriptors
+ *   agents_dispatched  number  20
+ *   dispatched         number   5
+ *   files_changed      number 366, **ARRAY  1**   ← array-of-file-paths
+ *   files              number   5
+ *
+ * A naive `w.agent_count ?? w.agents` therefore interpolates an array of
+ * objects into a Markdown table cell — `[object Object],[object Object],…` for
+ * the 4 waves of `main-2026-04-27-2231`. That is STRICTLY WORSE than the `?` it
+ * replaces: `?` reads as "unknown", `[object Object]` reads as content. The
+ * array-of-paths half of the same defect is already in production —
+ * `main-2026-05-26-housekeeping-1` renders its whole file list into the Files
+ * cell today, via the plain `w.files_changed` read that predates this helper.
+ *
+ * An array IS a measurement (its length is the count), so it is converted, not
+ * dropped. Any OTHER shape returns `undefined` so the caller's `??` chain keeps
+ * walking to the next alias and ultimately to `MISSING_CELL` — an unrecognised
+ * shape must degrade to "unknown", never to a coerced string. `NaN` is out of
+ * reach here by construction: JSON cannot encode it, and every caller feeds
+ * this JSONL-parsed values.
+ *
+ * ABSENT IS NOT ZERO applies unchanged (see the banner above `MISSING_CELL`):
+ * this returns `0` for a measured `0` and `0` for an empty array, and only
+ * `undefined` for a field the producer never wrote. Callers MUST chain with
+ * `??`, never `||` — `agents_dispatched: 0` occurs 20× in the live ledger.
+ *
+ * @param {unknown} value — one raw wave-object field.
+ * @returns {number|undefined} the count, or `undefined` to continue the chain.
+ */
+function waveCount(value) {
+  if (typeof value === 'number') return value;
+  if (Array.isArray(value)) return value.length;
+  return undefined;
+}
+
+/**
+ * ── RENDERABLE AND SCHEMA-VALID (#1575) ───────────────────────────────────
+ *
+ * The generators retain route-specific required-field lists. V1 requires the
+ * canonical REQUIRED_FIELDS; legacy V2/V3 derive aggregates from other shapes
+ * and cannot be emitted by the canonical writer. Effectiveness is optional
+ * and nullable in every route, matching the writer. Unknown metrics render
+ * n/a; a measured zero remains zero. Malformed non-object metrics still fail.
+ * Required fields use VALUE presence; the validator separately checks types.
+ */
+
+/** V1 uses the canonical required-field set without requiring optional metrics. */
+export const RENDERABLE_SESSION_FIELDS_V1 = Object.freeze([
+  'session_id',
+  'session_type',
+  'started_at',
+  'completed_at',
+  'total_waves',
+  'total_agents',
+  'total_files_changed',
+  'agent_summary',
+  'waves',
+]);
+
+/**
+ * v2 — legacy S69+ producer shape. Requires FEWER fields than `REQUIRED_FIELDS`
+ * (no `total_waves`/`total_agents`/`total_files_changed`/`agent_summary`)
+ * because it DERIVES every one of them from the wave array, and carries the
+ * file count as top-level `files_changed` — the alias `SESSION_KEY_ALIASES`
+ * maps to `total_files_changed` on read.
+ *
+ * That shortfall is an EARNED carve-out from the superset rule, not an
+ * oversight: `detectSessionSchema` routes to v2 only when
+ * `total_agents === undefined`, and `validateSession` rejects exactly that
+ * (missing key, or present-but-not-a-number). No record can satisfy both. The
+ * test asserts the disjointness rather than trusting this comment.
+ */
+export const RENDERABLE_SESSION_FIELDS_V2 = Object.freeze([
+  'session_id',
+  'session_type',
+  'started_at',
+  'completed_at',
+  'waves',
+  'files_changed',
+]);
+
+/**
+ * v3 — coordinator-direct shape with SCALAR `waves`. Same earned carve-out as
+ * v2, from a sharper contradiction: `_validateWaves` throws unless
+ * `Array.isArray(entry.waves)`, `generateSessionNoteV3` throws unless
+ * `typeof entry.waves === 'number'`. A value cannot be both, so no record can
+ * satisfy both contracts — v3 is unreachable from the sanctioned writer by
+ * construction, and measurement agrees (0/205).
+ */
+export const RENDERABLE_SESSION_FIELDS_V3 = Object.freeze([
+  'session_id',
+  'session_type',
+  'started_at',
+  'completed_at',
+  'waves',
+]);
+
+/** Optional metrics share the writer's object-or-null contract in all routes. */
+function sessionEffectiveness(entry) {
+  const value = entry.effectiveness;
+  if (value === undefined || value === null) return {};
+  if (typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error(`vault-mirror: session entry missing nested field 'effectiveness' (session_id=${entry.session_id})`);
+  }
+  return value;
+}
+
+/**
+ * Session-ledger status → vault-frontmatter status mapping (#909).
+ *
+ * ── WHY A MAPPING AND NOT A PASS-THROUGH ───────────────────────────────────
+ *
+ * The two value ranges are DISJOINT:
+ *
+ *   `sessions.jsonl` `status` — `completed` | `abandoned`, or absent/null on
+ *     every pre-#724 record (SESSION_STATUS, scripts/lib/session-schema/validator.mjs).
+ *   vault frontmatter `status` — `draft` | `active` | `verified` | `archived` |
+ *     `production` | `mvp` | `idea` (vaultNoteStatusSchema, skills/vault-sync/validator.mjs).
+ *
+ * Neither `completed` nor `abandoned` is a legal vault status. Emitting
+ * `session.status` verbatim would therefore write an off-schema frontmatter
+ * value and hard-fail `vault-sync`, which runs as a session-end Phase 1 gate.
+ *
+ * ── WHAT THIS REPLACES ─────────────────────────────────────────────────────
+ *
+ * All three generators previously hard-coded `status: verified` (frontmatter
+ * line + `status/verified` tag) and never read `session.status` at all — so
+ * every mirrored session claimed "verified" regardless of how it ended. A false
+ * `verified` in a knowledge store is worse than a missing note: it is a claim
+ * downstream readers cannot distinguish from a true one.
+ *
+ * ── THE MAPPING ────────────────────────────────────────────────────────────
+ *
+ *   completed    → verified   (closed through the full /close flow incl. gates)
+ *   abandoned    → draft      (phantom stub synthesized by the SessionEnd
+ *                              backfill from events.jsonl; incomplete fields,
+ *                              never gate-verified — `draft` is the honest
+ *                              "unfinished" value)
+ *   absent/null  → verified   (pre-#724 records predate the field; per
+ *                              filters.mjs's fail-open contract these are
+ *                              genuine sessions, and this keeps the 200+
+ *                              already-mirrored notes byte-identical → no
+ *                              re-write churn on the next mirror run)
+ *   anything else→ draft      (fail-safe: the ledger enum is additive-optional
+ *                              and has grown once already; an unmapped future
+ *                              value must never be able to emit an off-schema
+ *                              vault status, and must never silently claim
+ *                              `verified`)
+ */
+const VAULT_STATUS_BY_SESSION_STATUS = Object.freeze({
+  completed: 'verified',
+  abandoned: 'draft',
+});
+
+/** Vault status for a record that carries no `status` field (pre-#724). */
+const VAULT_STATUS_WHEN_ABSENT = 'verified';
+
+/** Vault status for a ledger value outside the known enum (fail-safe). */
+const VAULT_STATUS_FALLBACK = 'draft';
+
+/**
+ * Resolve the vault-frontmatter `status` for a session record.
+ *
+ * Guaranteed to return a member of vaultNoteStatusSchema for ANY input —
+ * including `null`, a non-object, or a hostile string such as `'constructor'`
+ * (hence `Object.hasOwn` rather than a bare property read, which would return
+ * an inherited `Object.prototype` member).
+ *
+ * @param {unknown} entry — a parsed sessions.jsonl record
+ * @returns {'verified'|'draft'}
+ */
+export function vaultStatusForSession(entry) {
+  if (entry === null || typeof entry !== 'object') return VAULT_STATUS_WHEN_ABSENT;
+  const raw = entry.status;
+  if (raw === null || raw === undefined || raw === '') return VAULT_STATUS_WHEN_ABSENT;
+  return Object.hasOwn(VAULT_STATUS_BY_SESSION_STATUS, raw)
+    ? VAULT_STATUS_BY_SESSION_STATUS[raw]
+    : VAULT_STATUS_FALLBACK;
+}
+
+/**
+ * Recorded identity only: never infer the writer's machine for historical notes.
+ * Hardware class is a fallback, and cannot distinguish equally equipped hosts.
+ */
+function sessionHostLine(entry) {
+  const recorded = [entry?.host_id, entry?.host, entry?.host_class]
+    .find((value) => typeof value === 'string' && value.trim() !== '');
+  if (recorded === undefined) return '';
+  return `host: ${JSON.stringify(stableHostname(recorded))}\n`;
+}
+
+/**
+ * Frontmatter line emitter — skips emission when value is null/undefined/empty
+ * to avoid template-literal coercion bugs (e.g. `platform: undefined` → "undefined").
+ * Returns the formatted line with trailing newline, or empty string to skip.
+ */
+function fmLine(key, value) {
+  if (value === null || value === undefined || value === '') return '';
+  return `${key}: ${value}\n`;
+}
+
+/**
+ * The `source-record` of a session note (#1503): the physical session the note
+ * was rendered from — `raw_session_id` (the harness's session uuid) when the
+ * record carries one, else `started_at`. `session_id` itself cannot serve: it is
+ * the FILENAME, and semantic ids such as `main-2026-10-02-session-1` recur across
+ * repos by construction, which is exactly the collision this field exists to
+ * detect. All three generators require `started_at`, so every renderable record
+ * has a key.
+ *
+ * Named ceiling: a record whose key changes between runs — a later backfill
+ * adding `raw_session_id` to a record first mirrored under its `started_at` —
+ * reads as a different record, and process.mjs then refuses the rewrite
+ * (`skipped-foreign-owner`, visible on stdout). Revisit if that is ever observed
+ * on a same-repo record.
+ *
+ * @param {object} entry - normalized session entry.
+ * @returns {string|null}
+ */
+export function sessionSourceRecord(entry) {
+  return sourceRecordValue(entry?.raw_session_id) ?? sourceRecordValue(entry?.started_at);
+}
+
+/**
+ * Session JSONL has three producer schemas in production:
+ *   v1 (legacy):  total_waves, total_agents, total_files_changed, agent_summary, waves[{agent_count, files_changed, quality}]
+ *   v2 (S69+):    files_changed (top-level), waves[{agents, agents_done, agents_partial, agents_failed, dispatch, duration_s}]
+ *   v3 (2026-05+): coordinator-direct records — `waves` is a SCALAR count and
+ *                  `agents_dispatched` is a scalar; no per-wave array breakdown.
+ *                  Added for #491, when such records fell through to v1
+ *                  validation and were rejected as `skipped-invalid`.
+ * v1 and v2 both carry `waves` as an ARRAY, so a numeric `waves` is the
+ * unambiguous v3 discriminator.
+ *
+ * #964 — CORRECTION. This comment previously claimed v3 was "the shape
+ * session-end actually emits". It is not, and cannot be: `validateSession`
+ * requires `Array.isArray(waves)`, so a scalar-`waves` record is refused by
+ * `scripts/emit-session.mjs` before it can be written. Census over the live
+ * ledger at HEAD 730ee9d — 205 parseable records, post-`normalizeSessionEntry`:
+ * **v1 205, v2 0, v3 0**. Both v2 and v3 are read-path tolerances for foreign /
+ * legacy producer shapes, not targets of the sanctioned writer. v3's live
+ * reachability is therefore zero; see the follow-up note in the #964 report
+ * before treating it as dead code — deletion is a separate decision, and the
+ * `normalizeSessionEntry` alias path can still synthesize a scalar `waves`.
+ *
+ * #1074 — THE v2 BRANCH WAS DEAD AT BIRTH, AND THE NUMBER IS PINNED. Re-measured
+ * 2026-08-19 over 253 records: **v1 253, v2 0, v3 0**, both raw and
+ * post-`normalizeSessionEntry`. This is not a coincidence of the current data —
+ * the v2 clause is UNSATISFIABLE by construction: it requires
+ * `total_agents === undefined`, while `total_agents` is in `REQUIRED_FIELDS`
+ * (scripts/lib/session-schema/constants.mjs) and enforced by
+ * `validateSession`, so every record the writer accepts carries it (measured:
+ * 253/253 define it). Commit 9cb6d9c added the branch 4h23m BEFORE the first
+ * record using the `agents` alias was written, and no historical tracked ledger
+ * state would have routed one either.
+ *
+ * The consequence is the reason `generateSessionNote`'s wave table no longer
+ * consults this function for its alias handling at all: version detection is
+ * the WRONG AXIS for per-wave producer-key drift, because the alias varies per
+ * wave object and no session-level field — `schema_version` included — predicts
+ * it. See the census in the `waveRows` comment there. This function still
+ * routes the three GENERATORS and is unchanged; do not "repair" the wave table
+ * by re-anchoring it here.
+ *
+ * The generators are intentionally NOT deleted (operator decision, deferred
+ * once already in #964). Pinning the number here is the point: the next reader
+ * inherits the measurement instead of re-running it.
+ */
+export function detectSessionSchema(entry) {
+  if (!entry) return 'v1';
+  if (typeof entry.waves === 'number') return 'v3';
+  return entry.total_agents === undefined && entry.files_changed !== undefined ? 'v2' : 'v1';
+}
+
+/**
+ * Map known producer alias fields onto the canonical session shapes (#635).
+ *
+ * Several session-end variants emitted alias fields the validators reject:
+ * `ended_at` (for completed_at), `mode` (for session_type), and wave counts
+ * only as `total_waves`/`waves_completed` with no `waves` field at all. Such
+ * records fell through to v1 validation and were skipped-invalid. This pure
+ * function fills MISSING canonical fields from their aliases so the entry
+ * routes to the v3 (scalar-waves) renderer. Canonical v1/v2/v3 entries pass
+ * through untouched (`waves` is only filled when absent — an existing array
+ * or number is never modified).
+ *
+ * Returns a new object; never mutates the input.
+ */
+export function normalizeSessionEntry(entry) {
+  if (!entry || typeof entry !== 'object') return entry;
+  const e = { ...entry };
+
+  if (e.completed_at === null || e.completed_at === undefined) {
+    if (e.ended_at !== null && e.ended_at !== undefined) e.completed_at = e.ended_at;
+  }
+  if (e.session_type === null || e.session_type === undefined) {
+    if (typeof e.mode === 'string' && e.mode.length > 0) e.session_type = e.mode;
+  }
+  if (e.waves === null || e.waves === undefined) {
+    if (typeof e.total_waves === 'number') e.waves = e.total_waves;
+    else if (typeof e.waves_completed === 'number') e.waves = e.waves_completed;
+    else e.waves = 0; // coordinator-direct record with no wave breakdown
+  }
+
+  return e;
+}
+
+/**
+ * One `- **Outcome:** …` bullet (with its leading newline) for a record's
+ * session-level `outcome` (#1824), or `''` when the record names none.
+ * Whitespace runs collapse so free text cannot break the bullet list.
+ *
+ * @param {unknown} outcome
+ * @returns {string}
+ */
+function sessionOutcomeBullet(outcome) {
+  if (outcome === null || typeof outcome !== 'object' || typeof outcome.statement !== 'string') return '';
+  const oneLine = (v) => String(v ?? MISSING_VALUE).replace(/\s+/g, ' ').trim();
+  return `\n- **Outcome:** ${oneLine(outcome.statement)}, observable via ${oneLine(outcome.observable)} (${oneLine(outcome.observed ?? 'not-measured')})`;
+}
+
+export function generateSessionNote(entry, options = {}) {
+  for (const field of RENDERABLE_SESSION_FIELDS_V1) {
+    if (entry[field] === null || entry[field] === undefined) {
+      throw new Error(`vault-mirror: session entry missing required field '${field}' (session_id=${entry.session_id ?? '<no session_id>'})`);
+    }
+  }
+
+  const {
+    session_id,
+    session_type,
+    platform,
+    started_at,
+    completed_at,
+    duration_seconds,
+    total_waves,
+    total_agents,
+    total_files_changed,
+    agent_summary,
+    waves,
+  } = entry;
+
+  const effectiveness = sessionEffectiveness(entry);
+  if (typeof agent_summary !== 'object' || agent_summary === null) {
+    throw new Error(`vault-mirror: session entry missing nested field 'agent_summary' (session_id=${session_id})`);
+  }
+  if (!Array.isArray(waves)) {
+    throw new Error(`vault-mirror: session entry missing nested field 'waves' (session_id=${session_id})`);
+  }
+
+  const created = toDate(started_at);
+  const updated = toDate(completed_at);
+  const durationLabel = renderDuration(duration_seconds);
+  // #1513 review H2: v1 printed no free text at all; same block as v2/v3.
+  const v1Narrative = sessionNarrativeText(entry);
+  const v1NotesBlock = v1Narrative ? `\n## Notes\n\n${v1Narrative}\n` : '';
+  // #M1: every `effectiveness` sub-field is OPTIONAL (validator.mjs
+  // `_validateOptionalFields` shape-checks the object, never its members), so a
+  // raw interpolation writes the literal string `undefined` into a note a human
+  // reads. `??` (never `||`) is load-bearing: a measured `0` must survive as `0`,
+  // only a genuinely absent value becomes the placeholder. The alias reads are
+  // ordered v1-field-first so a record that rendered a value before renders the
+  // exact same value now — this change can only ever replace `undefined`/`NaN`.
+  const { planned_issues, carryover, completion_rate } = effectiveness;
+  const completed = effectiveness.completed ?? effectiveness.completed_issues ?? MISSING_VALUE;
+  const emergent = effectiveness.emergent ?? effectiveness.unplanned_finds ?? MISSING_VALUE;
+  const ratePercent =
+    typeof completion_rate === 'number' ? Math.round(completion_rate * 100) + '%' : MISSING_VALUE;
+  const { complete, partial, failed, spiral } = agent_summary;
+
+  const titleValue = `Session ${created} — ${session_type}`;
+  // Always quote session title — it contains em-dash
+  const title = `"${titleValue}"`;
+
+  // #602: session_type is interpolated raw upstream; slugify each tag segment
+  // and cap the combined tag at 64 chars so the frontmatter passes the vault
+  // tagPathRegex. The `id` is likewise slugified to a kebab slug below —
+  // entry.session_id may carry an ISO-timestamp uppercase `T`/`:`/`.`/`Z`.
+  const noteId = noteIdFor(options.repoNs, slugifyIdSafe(session_id) ?? session_id);
+  // #909: the real ledger status, mapped into the vault enum — never hard-coded.
+  const vaultStatus = vaultStatusForSession(entry);
+  const tags = `[${buildTag(['session', session_type])}, ${buildTag(['status', vaultStatus])}]`;
+
+  // Build wave table rows.
+  //
+  // #M1: only `wave` and `role` are schema-REQUIRED per wave (validator.mjs
+  // `_validateWaves`); `agent_count`, `files_changed` and `quality` are never
+  // validated, so all three are optional and were rendering as the literal
+  // string `undefined`. Guarded with the same `?? '?'` the v2 generator's wave
+  // rows already used — `??` so a measured `0` still renders `0`.
+  //
+  // ── #1074: PER-WAVE ALIASES, NOT PER-SESSION VERSION DETECTION ────────────
+  //
+  // #M1 stopped the cells reading `undefined`, but left them reading `?` for
+  // every record whose producer used a different key — and that is most of the
+  // ledger. Census over 253 records / 599 wave objects (2026-08-19):
+  //
+  //   Agents  `?` 240 cells in 55 records  (recoverable: agents 214, agents_dispatched 20, dispatched 5)
+  //   Files   `?` 232 cells in 52 records  (recoverable: files 5)
+  //   Quality `?` 386 cells in 88 records  (recoverable: quality_check 168, status 72, result 35, outcome 5)
+  //
+  // The version-detection route cannot fix this. `detectSessionSchema` keys on
+  // SESSION-level fields, but the alias in use varies PER WAVE OBJECT and no
+  // session-level field predicts it — not even `schema_version` (under
+  // `schema_version: 1` the ledger carries agent_count 75, agents 33, none 30,
+  // agents_dispatched 4, both 2, dispatched 1). The axis is empirically
+  // refuted, so the repair is a per-wave alias chain instead.
+  //
+  // v1-canonical names come FIRST in every chain, so a cell that rendered a
+  // value before renders the identical value now: this can only ever replace a
+  // `?`. Verified over all 599 wave objects — repaired 239 agents / 5 files /
+  // 280 quality, with ZERO existing agents or quality values changed. The one
+  // deliberate change is the Files cell of `main-2026-05-26-housekeeping-1`,
+  // which stops printing a raw file-path list and prints `3` (see `waveCount`).
+  //
+  // The Quality chain needs no `waveCount`: all five of its aliases are 100%
+  // strings across the ledger (quality 213, quality_check 168, status 72,
+  // result 35, outcome 5 — zero objects or arrays), so there is no
+  // `[object Object]` hazard to guard. Should a producer ever emit a structured
+  // quality verdict, the fixture-coverage test in render-sessions.test.mjs is
+  // what surfaces it — this comment is the ceiling, that test is the trigger.
+  //
+  // A wave with no count under ANY alias keeps rendering `?`, and must: the
+  // coord-direct wave of `main-2026-05-26-housekeeping-1` dispatched no agents
+  // and recorded no number, so its Agents cell is genuinely unknown. A chain
+  // that "repaired" that one too would be inventing a measurement.
+  const waveRows = waves
+    .map((w) => {
+      // #1276: lifecycle-only records omit every older count alias. Started
+      // measures participation; completed/planned-only counts retain their
+      // labels so a plan or a completion count never claims dispatch coverage.
+      // The `agents_*` triple is the same lifecycle measurement under the
+      // de-underscored producer spelling: `metrics-collection.md` documents
+      // `agent_count_{planned,started,completed}`, but the live ledger carries
+      // one session (`main-2026-09-18-session-1`, 5 waves, measured 2026-09-18
+      // over `.orchestrator/metrics/sessions.jsonl`) whose waves emit only
+      // `agents_planned` / `agents_started` / `agents_completed` — every one of
+      // its 15 counts rendered `?` beside a real number, exactly the #1074 bug
+      // class. Each alias sits at the precedence of its documented twin, so no
+      // cell that already rendered a value can change.
+      const completedAgents = waveCount(w.agent_count_completed) ?? waveCount(w.agents_completed);
+      const plannedAgents = waveCount(w.agent_count_planned) ?? waveCount(w.agents_planned);
+      const agentsCell =
+        waveCount(w.agent_count) ??
+        waveCount(w.agents) ??
+        waveCount(w.agents_dispatched) ??
+        waveCount(w.dispatched) ??
+        waveCount(w.agent_count_started) ??
+        waveCount(w.agents_started) ??
+        (completedAgents === undefined ? undefined : `${completedAgents} completed`) ??
+        (plannedAgents === undefined ? MISSING_CELL : `${plannedAgents} planned`);
+      const filesCell = waveCount(w.files_changed) ?? waveCount(w.files) ?? MISSING_CELL;
+      const qualityCell =
+        w.quality ?? w.quality_check ?? w.status ?? w.result ?? w.outcome ?? MISSING_CELL;
+      return `| ${w.wave} | ${w.role} | ${agentsCell} | ${filesCell} | ${qualityCell} |`;
+    })
+    .join('\n');
+
+  // Skip-emit guard: avoid `platform: undefined` literal coercion (issue #343).
+  const platformBullet = (platform === null || platform === undefined || platform === '')
+    ? ''
+    : ` · **Platform:** ${platform}`;
+
+  // #732: emit `source-repo` (the leak-guarded/pseudonym-mapped namespace from
+  // resolveRepoNamespace(), threaded through by process.mjs) instead of the
+  // legacy raw `repo` field — mirrors render-learnings.mjs's source-repo line.
+  const { repoNs } = options;
+
+  // #1824: the session-level `outcome` (top-level record key) — NOT the
+  // wave-level `w.outcome` the wave table falls back to for its Quality cell.
+  // Optional: absent renders no line, never a placeholder. Only the canonical
+  // (v1) writer can produce it, so the legacy v2/v3 generators do not read it.
+  const outcomeBullet = sessionOutcomeBullet(entry.outcome);
+
+  return `---
+id: ${yamlNoteId(noteId)}
+type: session
+title: ${title}
+status: ${vaultStatus}
+created: ${created}
+updated: ${updated}
+tags: ${tags}
+${sessionHostLine(entry)}${fmLine('source-repo', repoNs)}${sourceRecordLine(sessionSourceRecord(entry))}_generator: ${GENERATOR_MARKER}
+---
+
+# Session ${session_id}
+
+- **Type:** ${session_type}${platformBullet}
+- **Duration:** ${durationLabel} (${started_at} → ${completed_at})
+- **Waves:** ${total_waves} · **Agents:** ${total_agents} · **Files changed:** ${total_files_changed}
+- **Effectiveness:** planned=${planned_issues ?? MISSING_VALUE}, completed=${completed}, carryover=${carryover ?? MISSING_VALUE}, emergent=${emergent}, rate=${ratePercent}${outcomeBullet}
+
+## Wave breakdown
+
+| Wave | Role | Agents | Files | Quality |
+|------|------|--------|-------|---------|
+${waveRows}
+
+## Agent summary
+
+- Complete: ${complete} · Partial: ${partial} · Failed: ${failed} · Spiral: ${spiral}
+${v1NotesBlock}`;
+}
+
+export function generateSessionNoteV2(entry, options = {}) {
+  for (const field of RENDERABLE_SESSION_FIELDS_V2) {
+    if (entry[field] === null || entry[field] === undefined) {
+      throw new Error(`vault-mirror: session entry missing required field '${field}' (session_id=${entry.session_id ?? '<no session_id>'})`);
+    }
+  }
+  if (!Array.isArray(entry.waves)) {
+    throw new Error(`vault-mirror: session entry 'waves' must be an array (session_id=${entry.session_id})`);
+  }
+  const effectiveness = sessionEffectiveness(entry);
+
+  const { session_id, session_type, started_at, completed_at, duration_seconds, branch, planned_issues, waves, files_changed, issues_closed, issues_created } = entry;
+
+  const created = toDate(started_at);
+  const updated = toDate(completed_at);
+  const durationLabel = renderDuration(duration_seconds);
+
+  // Derive v1-equivalent aggregates from v2 wave structure
+  const totalWaves = waves.length;
+  const totalAgents = waves.reduce((acc, w) => acc + (w.agents ?? 0), 0);
+  const complete = waves.reduce((acc, w) => acc + (w.agents_done ?? 0), 0);
+  const partial = waves.reduce((acc, w) => acc + (w.agents_partial ?? 0), 0);
+  const failed = waves.reduce((acc, w) => acc + (w.agents_failed ?? 0), 0);
+
+  const completionRate = effectiveness.completion_rate;
+  const ratePercent = typeof completionRate === 'number' ? Math.round(completionRate * 100) + '%' : 'n/a';
+  const carryover = effectiveness.carryover ?? 'n/a';
+
+  const titleValue = `Session ${created} — ${session_type}`;
+  const title = `"${titleValue}"`;
+
+  // #602: session_type is interpolated raw upstream; slugify each tag segment
+  // and cap the combined tag at 64 chars so the frontmatter passes the vault
+  // tagPathRegex. The `id` is likewise slugified to a kebab slug below —
+  // entry.session_id may carry an ISO-timestamp uppercase `T`/`:`/`.`/`Z`.
+  const noteId = noteIdFor(options.repoNs, slugifyIdSafe(session_id) ?? session_id);
+  // #909: the real ledger status, mapped into the vault enum — never hard-coded.
+  const vaultStatus = vaultStatusForSession(entry);
+  const tags = `[${buildTag(['session', session_type])}, ${buildTag(['status', vaultStatus])}]`;
+
+  const waveRows = waves
+    .map((w) => `| ${w.wave} | ${w.role} | ${w.agents ?? '?'} | ${w.dispatch ?? '?'} | ${w.duration_s ?? '?'}s | ${w.agents_done ?? 0}/${w.agents_partial ?? 0}/${w.agents_failed ?? 0} |`)
+    .join('\n');
+
+  const closedList = Array.isArray(issues_closed) && issues_closed.length ? issues_closed.join(', ') : '—';
+  const createdList = Array.isArray(issues_created) && issues_created.length ? issues_created.join(', ') : '—';
+  const branchLine = branch ? ` · **Branch:** ${branch}` : '';
+  // #1513 review H2: notes + narrative + summary, the fields the gate counts.
+  const narrativeText = sessionNarrativeText(entry);
+  const notesBlock = narrativeText ? `\n## Notes\n\n${narrativeText}\n` : '';
+
+  // #732: emit `source-repo` (leak-guarded/pseudonym-mapped) instead of the
+  // legacy raw `repo` field — see generateSessionNote for the full rationale.
+  const { repoNs } = options;
+
+  return `---
+id: ${yamlNoteId(noteId)}
+type: session
+title: ${title}
+status: ${vaultStatus}
+created: ${created}
+updated: ${updated}
+tags: ${tags}
+${sessionHostLine(entry)}${fmLine('source-repo', repoNs)}${sourceRecordLine(sessionSourceRecord(entry))}_generator: ${GENERATOR_MARKER}
+---
+
+# Session ${session_id}
+
+- **Type:** ${session_type}${branchLine}
+- **Duration:** ${durationLabel} (${started_at} → ${completed_at})
+- **Waves:** ${totalWaves} · **Agents:** ${totalAgents} · **Files changed:** ${files_changed}
+- **Effectiveness:** planned=${planned_issues ?? 'n/a'}, carryover=${carryover}, rate=${ratePercent}
+- **Issues closed:** ${closedList}
+- **Issues created:** ${createdList}
+
+## Wave breakdown
+
+| Wave | Role | Agents | Dispatch | Duration | done/partial/failed |
+|------|------|--------|----------|----------|---------------------|
+${waveRows}
+
+## Agent summary
+
+- Complete: ${complete} · Partial: ${partial} · Failed: ${failed}
+${notesBlock}`;
+}
+
+/**
+ * v3 generator — coordinator-direct session records (#491).
+ *
+ * These records carry `waves` as a scalar count and `agents_dispatched` as a
+ * scalar (no per-wave array), plus rich top-level metadata (issues_closed,
+ * follow_ups_filed, commits, tests_total_*). They are what session-end actually
+ * writes to sessions.jsonl. The v1/v2 generators require `waves` to be an array
+ * and reject this shape, so it gets its own renderer.
+ */
+export function generateSessionNoteV3(entry, options = {}) {
+  for (const field of RENDERABLE_SESSION_FIELDS_V3) {
+    if (entry[field] === null || entry[field] === undefined) {
+      throw new Error(`vault-mirror: session entry missing required field '${field}' (session_id=${entry.session_id ?? '<no session_id>'})`);
+    }
+  }
+  if (typeof entry.waves !== 'number') {
+    throw new Error(`vault-mirror: session entry 'waves' must be a number (session_id=${entry.session_id})`);
+  }
+  const effectiveness = sessionEffectiveness(entry);
+
+  const {
+    session_id, session_type, platform, branch, started_at, completed_at,
+    duration_minutes, duration_seconds, waves, agents_dispatched, agent_summary,
+    planned_issues, commits, issues_closed, issues_created,
+    follow_ups_filed, tests_total_pre, tests_total_post, tests_added,
+  } = entry;
+
+  const created = toDate(started_at);
+  const updated = toDate(completed_at);
+  const durationLabel = renderDuration(duration_seconds, duration_minutes);
+
+  // #968 — ABSENT IS NOT ZERO. Two sites here defaulted an absent value to `0`,
+  // claiming a measured zero the producer never wrote: `emergent` (`?? 0`) and
+  // the `agent_summary` destructuring defaults (`= 0`, over an `as` that itself
+  // falls back to `{}`). That was inconsistent with v3's OWN treatment of the
+  // neighbouring fields — `carryover` used `?? 'n/a'` one line above `emergent`'s
+  // `?? 0` — and it is the more damaging direction: "0 agents failed" reads as a
+  // verified fact, "n/a" reads as unknown. `??` (never `||`) is load-bearing at
+  // every site: a MEASURED 0 must still render `0`.
+  const completionRate = effectiveness.completion_rate;
+  const ratePercent =
+    typeof completionRate === 'number' ? Math.round(completionRate * 100) + '%' : MISSING_VALUE;
+  const completed = effectiveness.completed_issues ?? effectiveness.completed ?? MISSING_VALUE;
+  const carryover = effectiveness.carryover ?? MISSING_VALUE;
+  const emergent = effectiveness.unplanned_finds ?? effectiveness.emergent ?? MISSING_VALUE;
+
+  const agentsValue = typeof agents_dispatched === 'number' ? agents_dispatched : MISSING_VALUE;
+  const as = agent_summary && typeof agent_summary === 'object' ? agent_summary : {};
+  const complete = as.complete ?? MISSING_VALUE;
+  const partial = as.partial ?? MISSING_VALUE;
+  const failed = as.failed ?? MISSING_VALUE;
+  const spiral = as.spiral ?? MISSING_VALUE;
+
+  // A qualified cross-repo reference (`group/repo#n`, #1603) already carries
+  // its own `#`; only a bare number gets the prefix.
+  const fmtIssues = (list) =>
+    Array.isArray(list) && list.length
+      ? list.map((i) => (typeof i === 'number' ? `#${i}` : String(i))).join(', ')
+      : '—';
+  const closedList = fmtIssues(issues_closed);
+  const createdList = fmtIssues(issues_created);
+  const followList = fmtIssues(follow_ups_filed);
+  // #969 LOW-1: an ABSENT `commits` is "not recorded", an EMPTY one is
+  // "recorded, and there were none". `commits` is not in
+  // RENDERABLE_SESSION_FIELDS_V3, so absence is reachable — and the old `: 0`
+  // published the second answer to the first question. A present-but-empty
+  // array keeps rendering `0`: that IS a measured zero, exactly the value the
+  // ABSENT-IS-NOT-ZERO banner says must survive.
+  const commitCount = Array.isArray(commits) ? commits.length : MISSING_VALUE;
+  const testsDelta =
+    typeof tests_total_pre === 'number' && typeof tests_total_post === 'number'
+      ? `${tests_total_pre} → ${tests_total_post}`
+      : typeof tests_added === 'number'
+        ? `+${tests_added}`
+        : '—';
+
+  const titleValue = `Session ${created} — ${session_type}`;
+  const title = `"${titleValue}"`;
+  // #602: session_type is interpolated raw upstream; slugify each tag segment
+  // and cap the combined tag at 64 chars so the frontmatter passes the vault
+  // tagPathRegex. The `id` is likewise slugified to a kebab slug below —
+  // entry.session_id may carry an ISO-timestamp uppercase `T`/`:`/`.`/`Z`.
+  const noteId = noteIdFor(options.repoNs, slugifyIdSafe(session_id) ?? session_id);
+  // #909: the real ledger status, mapped into the vault enum — never hard-coded.
+  const vaultStatus = vaultStatusForSession(entry);
+  const tags = `[${buildTag(['session', session_type])}, ${buildTag(['status', vaultStatus])}]`;
+
+  const platformBullet = platform === null || platform === undefined || platform === '' ? '' : ` · **Platform:** ${platform}`;
+  const branchLine = branch ? ` · **Branch:** ${branch}` : '';
+  // #1513 review H2: notes + narrative + summary, the fields the gate counts.
+  const narrativeText = sessionNarrativeText(entry);
+  const notesBlock = narrativeText ? `\n## Notes\n\n${narrativeText}\n` : '';
+
+  // #732: emit `source-repo` (leak-guarded/pseudonym-mapped) instead of the
+  // legacy raw `repo` field — see generateSessionNote for the full rationale.
+  const { repoNs } = options;
+
+  return `---
+id: ${yamlNoteId(noteId)}
+type: session
+title: ${title}
+status: ${vaultStatus}
+created: ${created}
+updated: ${updated}
+tags: ${tags}
+${sessionHostLine(entry)}${fmLine('source-repo', repoNs)}${sourceRecordLine(sessionSourceRecord(entry))}_generator: ${GENERATOR_MARKER}
+---
+
+# Session ${session_id}
+
+- **Type:** ${session_type}${branchLine}${platformBullet}
+- **Duration:** ${durationLabel} (${started_at} → ${completed_at})
+- **Waves:** ${waves} · **Agents:** ${agentsValue} · **Commits:** ${commitCount}
+- **Effectiveness:** planned=${planned_issues ?? MISSING_VALUE}, completed=${completed}, carryover=${carryover}, emergent=${emergent}, rate=${ratePercent}
+- **Tests:** ${testsDelta}
+- **Issues closed:** ${closedList}
+- **Issues created:** ${createdList}
+- **Follow-ups filed:** ${followList}
+
+## Agent summary
+
+- Complete: ${complete} · Partial: ${partial} · Failed: ${failed} · Spiral: ${spiral}
+${notesBlock}`;
+}

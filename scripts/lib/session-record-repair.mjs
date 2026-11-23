@@ -1,0 +1,1065 @@
+/**
+ * session-record-repair.mjs — in-place repair of schema-invalid session ledger
+ * records (GitLab #1004).
+ *
+ * `.orchestrator/metrics/sessions.jsonl` accumulated records that fail the
+ * repo's OWN `validateSession()` because they were appended by the coordinator
+ * from a Markdown template instead of through `scripts/emit-session.mjs` (see
+ * `scripts/lib/sessions-integrity-banner.mjs` for the visibility half of the
+ * same defect). Measured at HEAD 1be450a on 2026-08-05: 33 of 216 records fail
+ * `validateSession`, and 5 of those are additionally DROPPED by vault-mirror —
+ * those sessions have no vault note at all.
+ *
+ * ── WHY REWRITE-IN-PLACE, NOT APPEND+TOMBSTONE ───────────────────────────────
+ * Downstream readers count LINES, not session_ids: `memory-banner`'s
+ * `sessionsEver = countJsonlLines(...)` and the integrity banner both iterate
+ * lines. Appending a corrected copy of every broken record would inflate the
+ * session count by 33 and make every historical metric wrong in a NEW way.
+ * So each defective line is replaced positionally, line order is preserved,
+ * and the file is swapped atomically (tmp + rename).
+ *
+ * ── WHAT THIS MODULE WILL NOT DO ─────────────────────────────────────────────
+ *  - It never SYNTHESIZES history. A missing `waves` becomes `[]`, never a
+ *    plausible-looking list of wave objects — `_validateWaves` passes an empty
+ *    array vacuously, and inventing wave entries would fabricate a record of
+ *    work that may never have happened.
+ *  - It never INFERS `completed_at` from a neighbouring record. The ledger is
+ *    NOT chronologically ordered (live lines 86-89 interleave two sessions), so
+ *    "the next record's start" is not this record's end. A missing
+ *    `completed_at` becomes `started_at` verbatim: duration 0, transparently
+ *    unknown, and flagged in `_backfill_incomplete_fields`.
+ *  - It never DEDUPES. `main-2026-05-11-deep-1` legitimately occupies three
+ *    lines (two overlapping close attempts plus a differently-shaped third).
+ *    Collapsing them would silently delete two sessions' worth of line count.
+ *  - It never re-serializes a record that ALREADY passes validation — a passing
+ *    line is emitted byte-for-byte, so the diff contains only real repairs and
+ *    no key-order churn.
+ *
+ * ── PROVENANCE ───────────────────────────────────────────────────────────────
+ * Every repaired record carries `_repair_source` (`REPAIR_SOURCE`) +
+ * `_backfill_incomplete_fields`; `_backfill_source` is set to `REPAIR_SOURCE`
+ * only when the record had no origin of its own. An existing origin
+ * (`state-md-completed`, `events-jsonl`, `abandoned`) is KEPT, because
+ * `sessions-canonical.mjs`'s stub guard reads it: overwriting it promoted a
+ * repaired zero-work stub to a real record that shadowed the real one (#1443
+ * F2). `_backfill_*` is schema-accepted by `_validateOptionalFields`, and
+ * `validateSession` ignores undeclared keys (as it does the `_<field>_raw`
+ * sidecars), so no schema bump is needed. The incomplete-fields list is the
+ * EXACT set of fields this record had defaulted, which is what lets a
+ * downstream consumer tell a measured zero apart from a repaired-to-zero.
+ *
+ * It also never DISCARDS what it replaces: any field whose present value is
+ * overwritten by a default is first copied to a `_<field>_raw` sidecar
+ * (`preserveRaw`, same convention and same non-clobber guard as
+ * `session-schema/normalizer.mjs`'s `_express_path_detail`). Without it the
+ * repair was itself a data-loss event — 7 of 40 records in the
+ * `projects-baseline` ledger (S119, 2026-09-10) lost narrative `agent_summary`
+ * strings and `total_files_changed` path lists to `{...0}` / `0`.
+ *
+ * Plain Node ESM. Named exports. DI-friendly via `deps`.
+ *
+ * Cross-references:
+ *  - `scripts/lib/session-schema/validator.mjs` — `validateSession` (the gate).
+ *  - `scripts/lib/session-schema/serializer.mjs` — `serializeSessionLineChecked` (round-trip proof).
+ *  - `scripts/lib/sessions-integrity-banner.mjs` — `checkSessionsIntegrity`.
+ *  - `scripts/repair-invalid-sessions.mjs` — the CLI driver.
+ */
+
+import fs from 'node:fs';
+import path from 'node:path';
+
+import { atomicWriteWithBackup, envelopeToError, renameSyncWithRetry } from './io.mjs';
+import { validateSession as defaultValidateSession } from './session-schema/validator.mjs';
+import { serializeSessionLineChecked as defaultSerialize } from './session-schema.mjs';
+import { checkSessionsIntegrity as defaultCheckIntegrity } from './sessions-integrity-banner.mjs';
+import { resolveEventsLedgerRoot } from './platform.mjs';
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/**
+ * Value written to `_repair_source` on every record this module repairs, and to
+ * `_backfill_source` only on a record that had no origin there (#1443 F2).
+ */
+export const REPAIR_SOURCE = 'repair-invalid-sessions/1004';
+
+/** Ledger path (relative to repoRoot) that `checkSessionsIntegrity` inspects. */
+export const CANONICAL_LEDGER_REL = path.join('.orchestrator', 'metrics', 'sessions.jsonl');
+
+/** The four counters `_validateAgentSummary` requires on `agent_summary`. */
+const AGENT_SUMMARY_FIELDS = Object.freeze(['complete', 'partial', 'failed', 'spiral']);
+
+/**
+ * Stable ordering for `_backfill_incomplete_fields`. Deterministic output is
+ * load-bearing for the idempotency guarantee: run 2 must produce a
+ * byte-identical file, which a Set's insertion order would not guarantee across
+ * differently-shaped inputs.
+ */
+const INCOMPLETE_FIELD_ORDER = Object.freeze([
+  'completed_at',
+  'total_waves',
+  'waves',
+  'waves[].wave',
+  'agent_summary',
+  'agent_summary.complete',
+  'agent_summary.partial',
+  'agent_summary.failed',
+  'agent_summary.spiral',
+  'total_agents',
+  'total_files_changed',
+  'outcome',
+]);
+// `timestamp_precision` (#1442) and `timestamp_offset` (#1525) deliberately add
+// NOTHING to the list above: a truncated or UTC-converted timestamp is still a
+// measurement (exact to the millisecond), not a default. Listing it would make
+// consumers discard a real value — `sessions-staleness-banner.mjs` returns null
+// for any timestamp named in `_backfill_incomplete_fields`,
+// `session-close-backfill.mjs` keys on `includes('started_at')`. The original
+// spelling survives in the `_<field>_raw` sidecar instead. Two classes because
+// the losses differ: `precision` drops sub-ms digits, `offset` drops nothing
+// but the zone spelling (the instant is kept exactly).
+
+/**
+ * Timestamp fields `validateSession` holds to `ISO_8601_UTC_MS_RE`
+ * (`session-schema/validator.mjs`, not exported): exactly three fractional
+ * digits or none.
+ */
+const MS_PRECISION_FIELDS = Object.freeze(['started_at', 'completed_at', 'lease_acquired_at']);
+
+/**
+ * Strict ISO-8601 timestamp the repair may normalize (#1525): seconds required,
+ * fraction optional and of any length, zone exactly `Z` or `±HH:MM`. Anything
+ * looser (`+0000`, `+00`, lowercase `z`, no zone) stays unrepaired, so the
+ * lenient `Date.parse` never gets to decide what a value meant.
+ * Groups: 1 wall-clock date-time to the second, 2 fraction digits, 3 zone,
+ * 4 offset sign, 5 offset hours, 6 offset minutes.
+ */
+const ISO_REPAIRABLE_RE =
+  /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d+))?(Z|([+-])(\d{2}):(\d{2}))$/;
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function isPlainObject(v) {
+  return v !== null && typeof v === 'object' && !Array.isArray(v);
+}
+
+/** Non-negative finite number — the shape every count field must satisfy. */
+function isCount(v) {
+  return typeof v === 'number' && Number.isFinite(v) && v >= 0;
+}
+
+/**
+ * Normalize a timestamp to the validator's UTC-millisecond shape (#1442, #1525).
+ *
+ * - `precision`: a fraction of other than 0 or 3 digits. Sub-millisecond
+ *   digits are TRUNCATED, never rounded: `.9999Z` must not roll into the next
+ *   second, and truncation is monotone, so `completed_at >= started_at`
+ *   survives on every pair it held on. Shorter fractions are zero-padded.
+ * - `offset`: any zone spelled other than `Z`. Converting `±HH:MM` to UTC keeps
+ *   the instant exactly (offsets are whole minutes), so it is lossless and
+ *   commutes with the truncation above.
+ *
+ * @param {unknown} value
+ * @returns {null | {invalid: true} | {value: string, precision: boolean, offset: boolean}}
+ *   null when there is nothing to normalize (not a string, not the strict
+ *   shape, or already canonical); `{invalid: true}` when the shape matches but
+ *   the calendar/clock components or the offset are out of range.
+ */
+function normalizeTimestamp(value) {
+  if (typeof value !== 'string') return null;
+  const m = ISO_REPAIRABLE_RE.exec(value);
+  if (!m) return null;
+  const [, wall, fraction = '', zone, sign, offH, offM] = m;
+  const precision = fraction.length !== 0 && fraction.length !== 3;
+  const offset = zone !== 'Z';
+  if (!precision && !offset) return null; // already what the validator accepts
+  const wallCanonical = `${wall}.${fraction.slice(0, 3).padEnd(3, '0')}Z`;
+  const wallMs = Date.parse(wallCanonical);
+  // Date.parse rolls over e.g. April 31, non-leap February 29 and 24:00.
+  // Equality with the original calendar components refuses those repairs.
+  if (!Number.isFinite(wallMs) || new Date(wallMs).toISOString() !== wallCanonical) {
+    return { invalid: true };
+  }
+  let offsetMin = 0;
+  if (offset) {
+    if (Number(offH) > 23 || Number(offM) > 59) return { invalid: true };
+    offsetMin = (sign === '-' ? -1 : 1) * (Number(offH) * 60 + Number(offM));
+  }
+  const utc = new Date(wallMs - offsetMin * 60_000);
+  if (!Number.isFinite(utc.getTime())) return { invalid: true };
+  return { value: utc.toISOString(), precision, offset };
+}
+
+function orderIncompleteFields(fields) {
+  const rank = (f) => {
+    const i = INCOMPLETE_FIELD_ORDER.indexOf(f);
+    return i === -1 ? INCOMPLETE_FIELD_ORDER.length : i;
+  };
+  return [...fields].sort((a, b) => rank(a) - rank(b) || (a < b ? -1 : a > b ? 1 : 0));
+}
+
+/**
+ * Preserve the pre-repair value of `key` under a `_<key>_raw` sidecar BEFORE a
+ * default overwrites it.
+ *
+ * Convention lifted from `session-schema/normalizer.mjs`
+ * (`_express_path_detail`, `if (!('_express_path_detail' in next))`) — but its
+ * non-clobber guard is keyed on WHO WROTE the sidecar, not on its mere presence.
+ * That distinction is the fix for a measured data-loss bug (2026-09-11): the
+ * presence guard read `out`, and `out = { ...record }` carries the INPUT's key
+ * space, so a record arriving with its own `_agent_summary_raw` kept that
+ * unverifiable value and dropped the real `agent_summary` the repair was about
+ * to overwrite:
+ *
+ *   in:  agent_summary: 'ECHTE NARRATIVE ZUSAMMENFASSUNG',
+ *        _agent_summary_raw: 'ANGREIFER-WERT'
+ *   out: _agent_summary_raw = 'ANGREIFER-WERT'   ← the real value was gone
+ *
+ * That is the mirror image of the promise this module's docblock makes, in the
+ * one case where the promise matters. So: `rescued` — a per-`repairRecord()`-call
+ * Set of sidecar keys THIS pass has written — replaces `sidecar in out`. A value
+ * that is provably real RIGHT NOW always outranks a sidecar of unknown origin.
+ *
+ * The multi-pass concern the old comment named is not what kept the sidecar
+ * safe, and was measured unreachable: after run 1 the field holds a VALID
+ * default, so run 2 records no defect for it and never calls preserveRaw at all
+ * (measured: `repairRecord(repairRecord(x).record).changed === false`, defects
+ * `[]`, sidecar intact). Within ONE pass the Set still gives first-write-wins,
+ * which is what the two branches per field (waves, agent_summary) rely on.
+ *
+ * NAMED CEILING (BV-004): if a record is RE-CORRUPTED with a different real
+ * value for the same key BETWEEN two repair runs, run 2's original wins and run
+ * 1's rescue is dropped. Reaching it requires corruption after a repair; the
+ * alternative — trusting an input-supplied sidecar over a value that is
+ * demonstrably real — is the bug above. Revisit if a ledger is ever repaired
+ * in a loop that can re-break the same key.
+ *
+ * Motivation is measured, not hypothetical: 7 of 40 repaired records in the
+ * `projects-baseline` ledger (S119, 2026-09-10) carried narrative strings in
+ * `agent_summary` and path lists in `total_files_changed`; both were replaced
+ * by `{...0}` / `0` and had to be restored by hand. This module's own docblock
+ * promises "nothing is invented" — discarding an unreadable original is the
+ * mirror-image violation of that promise.
+ *
+ * `undefined` and `null` are NOT preserved: an absent field has nothing to
+ * lose (the defect classes are named `*_absent` / `*_missing` for exactly that
+ * reason), and `JSON.stringify` drops an `undefined` sidecar anyway.
+ *
+ * The sidecars are schema-safe: `validateSession` has no unknown-key rejection
+ * (see `validator.mjs` — every `_validate*` helper checks named fields only),
+ * and `serializeSessionLineChecked` round-trips extra keys untouched.
+ *
+ * @param {Record<string, any>} out — the mutable repaired copy
+ * @param {string} key — the field about to be defaulted
+ * @param {any} rawValue — its ORIGINAL value (read from the untouched input)
+ * @param {Set<string>} rescued — sidecar keys already written by THIS call
+ */
+function preserveRaw(out, key, rawValue, rescued) {
+  if (rawValue === undefined || rawValue === null) return;
+  const sidecar = `_${key}_raw`;
+  if (rescued.has(sidecar)) return;
+  out[sidecar] = rawValue;
+  rescued.add(sidecar);
+}
+
+/**
+ * True when `flags` lists `completed_at` as incomplete although `rec.completed_at`
+ * IS a measured end: the record's own valid, monotonic `ended_at` (verbatim or
+ * its millisecond copy). Records repaired before #1699 item 12 carry exactly
+ * this stale flag (#1705).
+ *
+ * The ONE predicate behind both the heal in {@link repairRecord} and the
+ * routing of an otherwise schema-valid line in {@link repairLine} — two copies
+ * would drift, and a routing that is wider than the heal re-serializes a line
+ * for nothing, one that is narrower leaves the heal unreachable.
+ *
+ * @param {unknown} flags — the record's `_backfill_incomplete_fields`
+ * @param {object} rec — the record whose timestamps are judged
+ * @returns {boolean}
+ */
+function hasStaleCompletedAtFlag(flags, rec) {
+  if (!Array.isArray(flags) || !flags.includes('completed_at')) return false;
+  if (typeof rec.completed_at !== 'string' || typeof rec.ended_at !== 'string' ||
+      typeof rec.started_at !== 'string') return false;
+  const endedNorm = normalizeTimestamp(rec.ended_at);
+  const endedMs = Date.parse(rec.ended_at);
+  const startedMs = Date.parse(rec.started_at);
+  const endedValid = Number.isFinite(endedMs) && !(endedNorm !== null && 'invalid' in endedNorm);
+  const isCopy = rec.completed_at === rec.ended_at ||
+    (endedNorm !== null && rec.completed_at === endedNorm.value);
+  return endedValid && Number.isFinite(startedMs) && endedMs >= startedMs && isCopy;
+}
+
+/** Compact ISO stamp for backup filenames: `20260805T091500Z`. */
+export function backupStamp(date = new Date()) {
+  return date.toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z');
+}
+
+// ---------------------------------------------------------------------------
+// Record repair
+// ---------------------------------------------------------------------------
+
+/**
+ * Repair every defect class present on ONE session record.
+ *
+ * Applies ALL rules, not just the first — `validateSession` throws on its first
+ * violation, so a first-error-only repair would need N passes for an N-defect
+ * record (live line 85 carries six). The input is never mutated.
+ *
+ * Defaults chosen so that the repaired value is either derivable from the
+ * record itself or transparently zero/empty; nothing is invented. See the
+ * module docblock for the three things this deliberately refuses to do.
+ *
+ * @param {object} record — a parsed sessions.jsonl record
+ * @returns {{record: object, defects: string[], incompleteFields: string[], changed: boolean}}
+ */
+export function repairRecord(record) {
+  if (!isPlainObject(record)) {
+    return { record, defects: [], incompleteFields: [], changed: false };
+  }
+
+  const out = { ...record };
+  const defects = [];
+  const incomplete = new Set();
+  // Sidecar keys written by THIS pass — the provenance the non-clobber guard
+  // needs. `out`'s own key space cannot serve: it is the INPUT's. See preserveRaw.
+  const rescued = new Set();
+
+  // -- waves ----------------------------------------------------------------
+  // A NUMBER here is not garbage: it IS the wave count, written by an older
+  // template that put the count where the array belongs. Capture it before
+  // discarding, or the `total_waves` repair below loses real data.
+  let wavesNumber = null;
+  if (!Array.isArray(out.waves)) {
+    if (isCount(out.waves)) {
+      wavesNumber = out.waves;
+      defects.push('waves_number');
+    } else if (out.waves === undefined || out.waves === null) {
+      defects.push('waves_absent');
+    } else {
+      defects.push('waves_not_array');
+    }
+    preserveRaw(out, 'waves', record.waves, rescued);
+    out.waves = [];
+    incomplete.add('waves');
+  }
+
+  // -- waves[i].wave --------------------------------------------------------
+  // `_validateWaves` requires `wave >= 1` on every entry. Older shapes either
+  // omit it (the number lived in `wave_number`) or start at 0 (a coordinator-
+  // direct "wave 0"). Renumber the WHOLE array sequentially — patching only the
+  // offending entries would produce duplicate wave numbers on the 0-based shape.
+  // Bail out when any entry is not an object: that is a shape this module has
+  // no defensible default for, so the record falls through to the error bucket
+  // rather than being silently mangled.
+  if (out.waves.length > 0 && out.waves.every(isPlainObject)) {
+    const needsRenumber = out.waves.some((w) => !isCount(w.wave) || w.wave < 1);
+    if (needsRenumber) {
+      // The ORIGINAL ordinals are not recoverable from the renumbered output
+      // (the input may mix valid, absent and 0-based `wave` values), so the
+      // pre-renumber array is preserved whole — same sidecar as the
+      // not-an-array branch above, which cannot have fired on this path.
+      preserveRaw(out, 'waves', record.waves, rescued);
+      out.waves = out.waves.map((w, i) => ({ ...w, wave: i + 1 }));
+      defects.push('wave_index_invalid');
+      incomplete.add('waves[].wave');
+    }
+  }
+
+  // -- total_waves ----------------------------------------------------------
+  if (!isCount(out.total_waves)) {
+    preserveRaw(out, 'total_waves', record.total_waves, rescued);
+    defects.push('total_waves_missing');
+    // A numeric `waves` IS the wave count (see above): measured, not
+    // defaulted, so NOT listed — the same rule as the `agents_total` /
+    // `files_changed` aliases below (#1699 item 12). Only the fallback to the
+    // (possibly just-defaulted) array length is an unverified default.
+    if (wavesNumber !== null) {
+      out.total_waves = wavesNumber;
+    } else {
+      out.total_waves = out.waves.length;
+      incomplete.add('total_waves');
+    }
+  }
+
+  // -- agent_summary --------------------------------------------------------
+  if (!isPlainObject(out.agent_summary)) {
+    preserveRaw(out, 'agent_summary', record.agent_summary, rescued);
+    out.agent_summary = { complete: 0, partial: 0, failed: 0, spiral: 0 };
+    defects.push('agent_summary_absent');
+    incomplete.add('agent_summary');
+  } else {
+    const missing = AGENT_SUMMARY_FIELDS.filter((f) => !isCount(out.agent_summary[f]));
+    if (missing.length > 0) {
+      // Preserve the WHOLE original summary object rather than one sidecar per
+      // defaulted counter: it carries every original field value at once and
+      // keeps the sidecar namespace flat (`_agent_summary.spiral_raw` would be
+      // a second, uglier convention for the same job).
+      preserveRaw(out, 'agent_summary', record.agent_summary, rescued);
+      out.agent_summary = { ...out.agent_summary };
+      for (const f of missing) {
+        out.agent_summary[f] = 0;
+        incomplete.add(`agent_summary.${f}`);
+      }
+      defects.push(
+        missing.length === 1 && missing[0] === 'spiral'
+          ? 'agent_summary_spiral_missing'
+          : 'agent_summary_field_missing'
+      );
+    }
+  }
+
+  // -- total_agents ---------------------------------------------------------
+  if (!isCount(out.total_agents)) {
+    preserveRaw(out, 'total_agents', record.total_agents, rescued);
+    // Only the record's own evidence counts: an agent_summary PRESENT in the
+    // original sums to the real agent count (live line 71 sums to 30 where
+    // waves.length is 5 — W2/A4 review finding); else the legacy alias
+    // `agents_total` carries the same fact under an older name (#1698). Never
+    // waves.length: a wave is not an agent (a record with `agents_total: 19`
+    // and five waves was repaired to 5). No evidence → transparently 0.
+    const summarySum = isPlainObject(record.agent_summary)
+      ? AGENT_SUMMARY_FIELDS.reduce(
+          (n, f) => n + (isCount(record.agent_summary[f]) ? record.agent_summary[f] : 0),
+          0
+        )
+      : 0;
+    defects.push('total_agents_missing');
+    if (summarySum > 0) {
+      // A sum over counters that may themselves be partial: an inference, so
+      // it stays listed as incomplete (unchanged since W2/A4).
+      out.total_agents = summarySum;
+      incomplete.add('total_agents');
+      // A measured `agents_total` that disagrees with the sum is a conflict
+      // between two of the record's own sources; the sum still wins, but the
+      // record must say so (#1699 item 10). Same forensics tag shape as
+      // `_completed_at_conflict` (session-schema/aliases.mjs); the alias key
+      // stays on the record, so both values remain readable.
+      if (isCount(record.agents_total) && record.agents_total !== summarySum) {
+        out._total_agents_conflict = true;
+        defects.push('total_agents_conflict');
+      }
+    } else if (isCount(record.agents_total)) {
+      // The same fact under its old name: measured, not defaulted — so NOT
+      // listed as incomplete (the list is the set of defaulted fields, see the
+      // module docblock). The alias key itself stays on the record untouched,
+      // like legacy `ended_at` below.
+      out.total_agents = record.agents_total;
+    } else {
+      out.total_agents = 0;
+      incomplete.add('total_agents');
+    }
+  }
+
+  // -- total_files_changed --------------------------------------------------
+  if (!isCount(out.total_files_changed)) {
+    preserveRaw(out, 'total_files_changed', record.total_files_changed, rescued);
+    defects.push('total_files_changed_missing');
+    // Legacy alias `files_changed` is the same count under an older name
+    // (#1698: records with `files_changed: 44` were repaired to 0). A non-count
+    // alias (e.g. a path list) is no proof → 0, flagged as defaulted.
+    if (isCount(record.files_changed)) {
+      out.total_files_changed = record.files_changed;
+    } else {
+      out.total_files_changed = 0;
+      incomplete.add('total_files_changed');
+    }
+  }
+
+  // -- outcome (#2020) --------------------------------------------------------
+  // Legacy records (April 2026) wrote `outcome` as a free-text STRING; the
+  // schema (#1824) accepts only null or {statement, observable, source,
+  // observed}. A string carries no observable and no source, and inventing
+  // either would fabricate a claim — so the field becomes `null` ("no outcome
+  // named") and the string survives verbatim in `_outcome_raw`. Only strings:
+  // a half-filled OBJECT is a different shape with no defensible default and
+  // stays in the error bucket.
+  if (typeof out.outcome === 'string') {
+    preserveRaw(out, 'outcome', record.outcome, rescued);
+    out.outcome = null;
+    defects.push('outcome_string');
+    incomplete.add('outcome');
+  }
+
+  // -- timestamp precision (#1442) -------------------------------------------
+  // Runs BEFORE the completed_at default below, because that default copies
+  // `started_at` — a microsecond `started_at` would otherwise be copied into
+  // `completed_at` and spread the defect instead of fixing it.
+  let precisionCut = false;
+  let offsetNormalized = false;
+  for (const key of MS_PRECISION_FIELDS) {
+    const norm = normalizeTimestamp(out[key]);
+    if (norm === null || 'invalid' in norm) continue;
+    preserveRaw(out, key, record[key], rescued);
+    out[key] = norm.value;
+    precisionCut ||= norm.precision;
+    offsetNormalized ||= norm.offset;
+  }
+
+  // -- completed_at ---------------------------------------------------------
+  // Legacy `ended_at` is the same fact under its old name (emit-session.mjs
+  // aliasLegacyEndedAt precedent) — prefer it when parseable and monotonic,
+  // so the repaired record cannot disagree with its own ended_at (live line
+  // 85 — W2/A4 review finding). Else `started_at` verbatim → duration 0,
+  // i.e. "unknown", and flagged as such. NEVER the next record's timestamp:
+  // the ledger is not chronologically ordered (see the module docblock).
+  if (typeof out.completed_at !== 'string' && typeof out.started_at === 'string') {
+    preserveRaw(out, 'completed_at', record.completed_at, rescued);
+    let measuredEnd = false;
+    const endedMs = typeof out.ended_at === 'string' ? Date.parse(out.ended_at) : NaN;
+    const startedMs = Date.parse(out.started_at);
+    const endedNorm = normalizeTimestamp(out.ended_at);
+    if (typeof out.ended_at === 'string' &&
+        (!Number.isFinite(endedMs) || (endedNorm !== null && 'invalid' in endedNorm))) {
+      // Preserve an invalid legacy measurement for the final schema gate to
+      // reject; do not turn it into a valid default or a rolled-over date.
+      out.completed_at = out.ended_at;
+    } else if (Number.isFinite(endedMs) && Number.isFinite(startedMs) && endedMs >= startedMs) {
+      // The COPY is cut to milliseconds; `ended_at` itself is not a validated
+      // field and keeps its original bytes, so nothing needs a sidecar here.
+      if (endedNorm !== null) {
+        precisionCut ||= endedNorm.precision;
+        offsetNormalized ||= endedNorm.offset;
+      }
+      out.completed_at = endedNorm?.value ?? out.ended_at;
+      // The same measurement under its legacy name (aliasLegacyEndedAt flags
+      // nothing either): NOT listed, or `sessions-staleness-banner.mjs` would
+      // discard a real end time as an anchor (#1699 item 12).
+      measuredEnd = true;
+    } else {
+      out.completed_at = out.started_at;
+    }
+    defects.push('completed_at_missing');
+    if (!measuredEnd) incomplete.add('completed_at');
+  }
+
+  // -- stale completed_at flag (#1705) ----------------------------------------
+  // Records repaired before #1699 item 12 copied a valid, monotonic `ended_at`
+  // into `completed_at` AND listed it as incomplete. The branch above only runs
+  // when `completed_at` is missing, so those records never healed and the
+  // staleness banner kept discarding a real end time. Same predicate as the
+  // `measuredEnd` branch: `completed_at` IS that ended_at (verbatim or its
+  // millisecond copy), parseable, not before `started_at`.
+  // Measured 2026-10-21: 0 ledger records carry the sibling `total_waves`
+  // flag beside a numeric `waves`, so that path needs no heal.
+  const priorFlags = Array.isArray(record._backfill_incomplete_fields)
+    ? record._backfill_incomplete_fields
+    : [];
+  let healedFlags = null;
+  if (hasStaleCompletedAtFlag(priorFlags, out)) {
+    // The flag list is the record's own provenance; keep the prior list
+    // exactly once in its sidecar before rewriting it (process-contracts.md).
+    preserveRaw(out, 'backfill_incomplete_fields', record._backfill_incomplete_fields, rescued);
+    healedFlags = priorFlags.filter((f) => f !== 'completed_at');
+    defects.push('completed_at_flag_stale');
+  }
+  if (precisionCut) defects.push('timestamp_precision');
+  if (offsetNormalized) defects.push('timestamp_offset');
+
+  if (defects.length === 0) {
+    return { record, defects: [], incompleteFields: [], changed: false };
+  }
+
+  // -- provenance (additive, already schema-accepted) ------------------------
+  const prior = (healedFlags ?? priorFlags).filter((f) => typeof f === 'string');
+  const merged = orderIncompleteFields(incomplete);
+  // The repair is recorded in its own field; `_backfill_source` keeps the
+  // record's ORIGIN. Overwriting a synthesised origin ('state-md-completed',
+  // 'events-jsonl', 'abandoned') made a repaired zero-work stub read as a real
+  // record, and it shadowed the real one for its id (#1443 F2).
+  out._repair_source = REPAIR_SOURCE;
+  if (typeof record._backfill_source !== 'string' || record._backfill_source.length === 0) {
+    out._backfill_source = REPAIR_SOURCE;
+  }
+  out._backfill_incomplete_fields = [...new Set([...prior, ...merged])];
+
+  return { record: out, defects, incompleteFields: merged, changed: true };
+}
+
+// ---------------------------------------------------------------------------
+// Ledger repair
+// ---------------------------------------------------------------------------
+
+/**
+ * Repair one ledger line. Pure — decides the OUTPUT line for one INPUT line.
+ *
+ * Outcomes:
+ *  - `blank`        — whitespace-only/empty segment, emitted unchanged.
+ *  - `unparseable`  — `JSON.parse` threw; emitted unchanged. File corruption is
+ *                     a different problem and the integrity banner skips these
+ *                     too; silently "fixing" bytes we cannot read is worse.
+ *  - `valid`        — passed `validateSession`; emitted BYTE-FOR-BYTE. The ONE
+ *                     exception is below.
+ *  - `repaired`     — defects fixed, gated, re-serialized. `healedValid` is
+ *                     true when the line was ALREADY schema-valid and only
+ *                     carried a stale `completed_at` flag (#1705, see
+ *                     `hasStaleCompletedAtFlag`): such a line is routed through
+ *                     `repairRecord` too, otherwise that heal is unreachable from
+ *                     the ledger path. Callers counting INVALID lines must not
+ *                     count these. Should the healed record fail the gate, the
+ *                     line stays `valid` and byte-identical — it was valid before.
+ *  - `error`        — still invalid after repair; ORIGINAL emitted unchanged.
+ *
+ * @param {string} line
+ * @param {{validateSession?: Function, serialize?: Function}} [deps]
+ * @returns {{line: string, status: string, sessionId: string|null, defects: string[], incompleteFields: string[], error: string|null, record: object|null, healedValid: boolean}}
+ */
+export function repairLine(line, deps = {}) {
+  const { validateSession = defaultValidateSession, serialize = defaultSerialize } = deps;
+  const base = { line, status: 'valid', sessionId: null, defects: [], incompleteFields: [], error: null, record: null, healedValid: false };
+
+  if (line.trim().length === 0) return { ...base, status: 'blank' };
+
+  let record;
+  try {
+    record = JSON.parse(line);
+  } catch (err) {
+    return { ...base, status: 'unparseable', error: err?.message ?? String(err) };
+  }
+  if (!isPlainObject(record)) {
+    return { ...base, status: 'unparseable', error: 'line is not a JSON object' };
+  }
+
+  const sessionId = typeof record.session_id === 'string' ? record.session_id : null;
+
+  let validBefore = false;
+  try {
+    validateSession(record);
+    validBefore = true;
+  } catch {
+    /* fall through to repair */
+  }
+  // Already valid — emit the ORIGINAL bytes. Re-serializing a passing record
+  // would rewrite key order for no benefit and bury the real repairs in noise.
+  // Sole exception: the stale completed_at flag no schema check sees (#1705).
+  if (validBefore && !hasStaleCompletedAtFlag(record._backfill_incomplete_fields, record)) {
+    return { ...base, status: 'valid', sessionId, record };
+  }
+
+  const { record: repaired, defects, incompleteFields, changed } = repairRecord(record);
+  if (validBefore && !changed) return { ...base, status: 'valid', sessionId, record };
+  try {
+    // GATE ONLY — the return value is deliberately discarded. `validateSession`
+    // stamps `schema_version: 2` on its output, and live line 152 has no
+    // `schema_version` key at all; serializing its return would invent a version
+    // claim for a record that never made one. Serialize the repaired INPUT.
+    validateSession(repaired);
+    const serialized = serialize(repaired);
+    return {
+      line: serialized.endsWith('\n') ? serialized.slice(0, -1) : serialized,
+      status: 'repaired',
+      sessionId,
+      defects,
+      incompleteFields,
+      error: null,
+      record: repaired,
+      healedValid: validBefore,
+    };
+  } catch (err) {
+    if (validBefore) return { ...base, status: 'valid', sessionId, record };
+    return {
+      ...base,
+      status: 'error',
+      sessionId,
+      defects,
+      error: err?.message ?? String(err),
+    };
+  }
+}
+
+/**
+ * Compute the repaired ledger text plus a summary, WITHOUT touching disk.
+ *
+ * Splitting on `\n` and rejoining preserves the trailing-newline shape and any
+ * blank segments exactly, so a file with no repairs round-trips byte-identically.
+ *
+ * @param {string} raw — full ledger contents
+ * @param {object} [deps]
+ * @returns {{text: string, summary: object, lines: object[]}}
+ */
+export function repairText(raw, deps = {}) {
+  const parts = raw.split('\n');
+  const results = parts.map((p) => repairLine(p, deps));
+  const text = results.map((r) => r.line).join('\n');
+
+  const defectsByClass = {};
+  const errors = [];
+  const idCounts = new Map();
+  let total = 0;
+  let unparseable = 0;
+  let invalidBefore = 0;
+  let repaired = 0;
+  // Schema-valid lines whose stale completed_at flag was healed (#1705). They
+  // count under `repaired` (the line IS rewritten) but never as invalid.
+  let healedValid = 0;
+
+  for (let i = 0; i < results.length; i++) {
+    const r = results[i];
+    if (r.status === 'blank') continue;
+    total += 1;
+    if (r.sessionId) idCounts.set(r.sessionId, (idCounts.get(r.sessionId) ?? 0) + 1);
+    if (r.status === 'unparseable') {
+      unparseable += 1;
+      continue;
+    }
+    if (r.status === 'valid') continue;
+    if (r.healedValid) {
+      healedValid += 1;
+      repaired += 1;
+      for (const d of r.defects) defectsByClass[d] = (defectsByClass[d] ?? 0) + 1;
+      continue;
+    }
+    invalidBefore += 1;
+    for (const d of r.defects) defectsByClass[d] = (defectsByClass[d] ?? 0) + 1;
+    if (r.status === 'repaired') {
+      repaired += 1;
+    } else {
+      errors.push({ line: i + 1, session_id: r.sessionId, error: r.error });
+    }
+  }
+
+  const duplicates = [...idCounts.entries()]
+    .filter(([, n]) => n > 1)
+    .map(([session_id, count]) => ({ session_id, count }))
+    .sort((a, b) => (a.session_id < b.session_id ? -1 : 1));
+
+  return {
+    text,
+    lines: results,
+    summary: {
+      total,
+      unparseable,
+      invalid_before: invalidBefore,
+      repaired,
+      // Subset of `repaired`: lines that were already schema-valid (#1705).
+      healed_valid: healedValid,
+      // Projected: every line that was invalid and did NOT get repaired.
+      invalid_after: invalidBefore - (repaired - healedValid),
+      // Lines with no defensible repair (`repairLine` status `error`). They are
+      // emitted byte-identically and are EXPECTED to stay invalid after a
+      // write — `verifyWritten` tolerates exactly these line numbers (#1442).
+      // Same population as `errors`, which carries the per-line detail.
+      unrepairable: errors.length,
+      duplicate_ids_observed: duplicates,
+      defects_by_class: defectsByClass,
+      errors,
+    },
+  };
+}
+
+/**
+ * Re-read a written ledger and prove it is actually clean.
+ *
+ * Two independent probes, because they measure different populations (see the
+ * integrity banner's docblock): `validateSession` is the write-path schema,
+ * `checkSessionsIntegrity` additionally exercises the REAL vault-mirror render
+ * path — a record can pass the first and still be dropped by the second.
+ *
+ * The integrity probe reads `<ledger root of repoRoot>/.orchestrator/metrics/sessions.jsonl`
+ * (the main checkout's for a linked worktree, #1592) by construction, so it is only meaningful when `file` IS that path; against
+ * any other target it is reported as skipped rather than quietly measuring the
+ * wrong file.
+ *
+ * ── WHAT "OK" MEANS (#1442) ──────────────────────────────────────────────────
+ * Not "zero invalid lines". A ledger that carries lines this module has no
+ * defensible repair for could never pass that bar, so one unrepairable record
+ * rolled back every repair beside it (all-or-nothing). `ok` now means NO
+ * WORSENING and ALL REPAIRABLE VALID:
+ *   - every invalid line in the written file is one of `expected.unrepairableLines`
+ *     (so every repaired AND every already-valid line validates), and
+ *   - `invalid_after <= expected.invalidBefore`, and
+ *   - the integrity probe flags no line it did not already flag in
+ *     `expected.integrityBefore` (compared by line number — the repair never
+ *     adds or removes lines, so positions are stable across the write).
+ * With no `expected`, the defaults reproduce the old strict bar: no invalid
+ * line tolerated, and a clean pre-write integrity baseline.
+ *
+ * NAMED CEILING (BV-004): integrity is compared per line, not per reason — a
+ * line flagged before AND after for a DIFFERENT reason is not "worse". The
+ * per-line `validateSession` pass above still catches it for the schema half.
+ *
+ * @param {object} args
+ * @param {object} [args.expected]
+ * @param {number[]} [args.expected.unrepairableLines] 1-based lines allowed to stay invalid
+ * @param {number}   [args.expected.invalidBefore]      invalid count before the write
+ * @param {object|null} [args.expected.integrityBefore] pre-write `checkIntegrity` banner (null = clean)
+ * @returns {{ok: boolean, invalid_after: number, invalid_lines: object[], unexpected_invalid: object[], integrity: string|object, integrity_worsened: boolean}}
+ */
+export function verifyWritten({ file, repoRoot, deps = {}, expected = {} }) {
+  const {
+    readFileSync = fs.readFileSync,
+    validateSession = defaultValidateSession,
+    checkIntegrity = defaultCheckIntegrity,
+  } = deps;
+
+  const raw = readFileSync(file, 'utf8');
+  const invalidLines = [];
+  const parts = raw.split('\n');
+  for (let i = 0; i < parts.length; i++) {
+    if (parts[i].trim().length === 0) continue;
+    let record;
+    try {
+      record = JSON.parse(parts[i]);
+    } catch {
+      continue; // unparseable lines are passed through by design
+    }
+    if (!isPlainObject(record)) continue;
+    try {
+      validateSession(record);
+    } catch (err) {
+      invalidLines.push({
+        line: i + 1,
+        session_id: typeof record.session_id === 'string' ? record.session_id : null,
+        error: err?.message ?? String(err),
+      });
+    }
+  }
+
+  const { unrepairableLines = [], invalidBefore = 0, integrityBefore = null } = expected;
+  const tolerated = new Set(unrepairableLines);
+  const unexpectedInvalid = invalidLines.filter((l) => !tolerated.has(l.line));
+
+  let integrity = 'skipped-not-canonical-path';
+  let worsened = false;
+  if (isCanonicalLedger(file, repoRoot)) {
+    const banner = checkIntegrity({ repoRoot });
+    integrity = banner === null ? 'clean' : banner;
+    worsened = integrityWorsened(integrityBefore, banner);
+  }
+
+  const ok = unexpectedInvalid.length === 0 && invalidLines.length <= invalidBefore && !worsened;
+  return {
+    ok,
+    invalid_after: invalidLines.length,
+    invalid_lines: invalidLines,
+    unexpected_invalid: unexpectedInvalid,
+    integrity,
+    integrity_worsened: worsened,
+  };
+}
+
+/**
+ * True when `file` IS the ledger `checkIntegrity` reads for `repoRoot` —
+ * resolved through the same main-checkout mapping (#1592), so a stale
+ * worktree-local ledger is never judged by the main ledger's integrity.
+ */
+function isCanonicalLedger(file, repoRoot) {
+  if (typeof repoRoot !== 'string' || repoRoot.length === 0) return false;
+  return path.resolve(file) === path.resolve(path.join(resolveEventsLedgerRoot(repoRoot), CANONICAL_LEDGER_REL));
+}
+
+/**
+ * Did the integrity probe flag a line after the write that it did not flag
+ * before? Fail-safe on an unreadable banner shape: a non-null banner without
+ * its `schemaInvalid` / `mirrorSkipped` arrays counts as worse.
+ */
+function integrityWorsened(before, after) {
+  if (after === null || after === undefined) return false;
+  for (const key of ['schemaInvalid', 'mirrorSkipped']) {
+    const now = after && Array.isArray(after[key]) ? after[key] : null;
+    if (now === null) return true;
+    const prior = before && Array.isArray(before[key]) ? before[key] : [];
+    const priorLines = new Set(prior.map((e) => e?.line));
+    if (now.some((e) => !priorLines.has(e?.line))) return true;
+  }
+  return false;
+}
+
+/**
+ * Repair a sessions ledger end-to-end.
+ *
+ * Dry-run (the default) reads and computes only — no backup, no tmp file, no
+ * write. Apply copies the original to `<file>.bak-<stamp>` FIRST, writes
+ * `<file>.tmp-<pid>` in the same directory and renames it over the target
+ * (atomic within a filesystem), then re-verifies the written file. A failed
+ * verification restores the backup byte-identically (plus any line appended
+ * after the rename, #1670) and reports `ok: false` —
+ * the caller maps that to exit 3. Lines with no defensible repair are kept
+ * byte-identical and counted in `summary.unrepairable`; they are NOT a
+ * verification failure (see `verifyWritten` § WHAT "OK" MEANS) — the caller
+ * maps an ok run with an unrepairable remainder to exit 4.
+ *
+ * Never throws for a defective RECORD (those land in `summary.errors`); a
+ * genuine I/O failure DOES throw and is the caller's exit-2 case — as does a
+ * ledger that changed between read and rename (`err.code === 'ELEDGERCHANGED'`,
+ * #1665): the tmp is removed and the original, with its new line, stays as-is.
+ *
+ * @param {object} args
+ * @param {string}  args.file                 ledger path
+ * @param {string}  [args.repoRoot]           enables the integrity post-probe
+ * @param {boolean} [args.apply=false]        write (default: dry-run)
+ * @param {boolean} [args.backup=true]        take a `.bak-<stamp>` under --apply
+ * @param {Date}    [args.now]                backup-stamp seam
+ * @param {object}  [args.deps]               DI: fs fns, validateSession, serialize, checkIntegrity
+ * @returns {object} summary
+ */
+export function repairLedger({ file, repoRoot = null, apply = false, backup = true, now = new Date(), deps = {} }) {
+  const {
+    readFileSync = fs.readFileSync,
+    writeFileSync = fs.writeFileSync,
+    renameSync = fs.renameSync,
+    copyFileSync = fs.copyFileSync,
+    unlinkSync = fs.unlinkSync,
+    appendFileSync = fs.appendFileSync,
+  } = deps;
+
+  const { checkIntegrity = defaultCheckIntegrity } = deps;
+
+  const raw = readFileSync(file, 'utf8');
+  const { text, summary: base } = repairText(raw, deps);
+
+  const summary = {
+    mode: apply ? 'apply' : 'dry-run',
+    file,
+    ...base,
+    backup_path: null,
+    post_verify: null,
+    ok: true,
+    restored: false,
+  };
+
+  if (!apply) return summary;
+
+  // -- integrity baseline (#1442) --------------------------------------------
+  // Measured on the ORIGINAL bytes, before anything is written, so the
+  // post-write probe can be judged "not worse" instead of "perfectly clean" —
+  // unrepairable lines keep the banner non-null on both sides by construction.
+  const integrityBefore = isCanonicalLedger(file, repoRoot) ? checkIntegrity({ repoRoot }) : null;
+
+  // -- backup FIRST (unconditional unless explicitly opted out) --------------
+  let backupPath = null;
+  if (backup) {
+    backupPath = `${file}.bak-${backupStamp(now)}`;
+    copyFileSync(file, backupPath);
+    summary.backup_path = backupPath;
+  }
+
+  // -- atomic swap ----------------------------------------------------------
+  // The helper unlinks its tmp on failure; the backup above keeps its own
+  // `.bak-<compact stamp>` schema, so the helper takes none. The injected fs
+  // seams (`deps`) are threaded through so a test fake still sees the write.
+  //
+  // Lost-update guard (#1665): appenders (`emit-session.mjs` → `appendJsonl`)
+  // take NO lock — they rely on O_APPEND — so a repair-side lock would exclude
+  // nobody. Instead the ledger is re-read right before the rename and the swap
+  // is refused when its bytes differ from what was repaired: an append between
+  // read and rename would otherwise be overwritten silently. Throwing inside the
+  // rename seam makes the helper unlink its tmp and leave the target untouched;
+  // the caller re-raises it (CLI exit 2) and a re-run picks up the new line.
+  // CEILING: the window between this check and the rename itself stays open
+  // (microseconds). Revisit trigger: if appenders ever take a shared lock,
+  // replace this check with that lock held across read→rename.
+  // The exact bytes renamed into place — the restore below carries over only
+  // what lies BEYOND them (#1670).
+  let renamedBytes = null;
+  const guardedRename = (from, to) => {
+    if (readFileSync(file, 'utf8') !== raw) {
+      const err = new Error(
+        `${file} changed during the repair (concurrent append?) — nothing was replaced; re-run the repair`
+      );
+      err.code = 'ELEDGERCHANGED';
+      throw err;
+    }
+    renamedBytes = readFileSync(from);
+    renameSync(from, to); // direct-rename:ok renameSync seam of atomicWriteWithBackup, which wraps this call in its win32 retry
+  };
+  const res = atomicWriteWithBackup(file, text, {
+    tmpPrefix: `.${path.basename(file)}.tmp`,
+    fs: { writeFileSync, renameSync: guardedRename, unlinkSync },
+  });
+  if (!res.ok) throw envelopeToError(res);
+
+  // -- post-verification ----------------------------------------------------
+  const verdict = verifyWritten({
+    file,
+    repoRoot,
+    deps,
+    expected: {
+      unrepairableLines: base.errors.map((e) => e.line),
+      invalidBefore: base.invalid_before,
+      integrityBefore,
+    },
+  });
+  summary.post_verify = verdict;
+  summary.invalid_after = verdict.invalid_after;
+
+  if (!verdict.ok) {
+    // Restore byte-identically — ONLY for a repaired (or previously valid) line
+    // that fails verification, or an integrity probe that got worse. An
+    // unrepairable remainder alone is not a failure (#1442): those lines were
+    // emitted byte-identically and keep the ledger exactly as broken as it was.
+    // The backup is preferred (it is the on-disk artefact an operator can
+    // inspect); `raw` is the in-memory fallback for `--no-backup`, and both are
+    // the same bytes. Lines appended AFTER the rename are carried over (#1670).
+    summary.restore_appended_bytes = restoreOriginal({
+      file, backupPath, raw, renamed: renamedBytes,
+      fs: { readFileSync, writeFileSync, renameSync, copyFileSync, unlinkSync, appendFileSync },
+    });
+    summary.ok = false;
+    summary.restored = true;
+  }
+
+  return summary;
+}
+
+/** How often the restore re-reads a ledger that keeps moving before it gives up. */
+const RESTORE_ATTEMPTS = 3;
+
+/**
+ * Put the original bytes back after a failed post-verification WITHOUT losing a
+ * line another process appended after the repair's rename (#1670).
+ *
+ * Appenders take no lock (O_APPEND, see the lost-update guard in
+ * {@link repairLedger}), so between the rename and this restore a session
+ * record can land at the end of the repaired file. A plain copy of the backup
+ * over the target dropped it. The restore therefore re-reads the target: the
+ * bytes beyond the renamed content are appended to the original, and the result
+ * is swapped in through a tmp file + rename that is refused when the target
+ * moved again since that read (bounded retry). When the target no longer starts
+ * with the renamed bytes, someone rewrote it — restoring would destroy that
+ * write, so nothing is touched and ELEDGERCHANGED is raised (the backup stays).
+ *
+ * CEILING: as in the repair swap, the window between the last re-read and the
+ * rename itself stays open (microseconds). Revisit trigger: appenders taking a
+ * shared lock — hold it across read→rename instead.
+ *
+ * @returns {number} bytes carried over from concurrent appends
+ */
+function restoreOriginal({ file, backupPath, raw, renamed, fs: io }) {
+  const tmp = path.join(path.dirname(file), `.${path.basename(file)}.restore-${process.pid}`);
+  for (let attempt = 0; attempt < RESTORE_ATTEMPTS; attempt++) {
+    const current = io.readFileSync(file);
+    if (current.length < renamed.length || !current.subarray(0, renamed.length).equals(renamed)) {
+      const err = new Error(
+        `${file} was rewritten after the repair's rename — post-verification failed, but restoring ` +
+          `would overwrite that write; nothing was restored. Original bytes: ${backupPath ?? '(no backup taken)'}`
+      );
+      err.code = 'ELEDGERCHANGED';
+      throw err;
+    }
+    const tail = current.subarray(renamed.length);
+    try {
+      if (backupPath) io.copyFileSync(backupPath, tmp);
+      else io.writeFileSync(tmp, raw, 'utf8');
+      if (tail.length > 0) io.appendFileSync(tmp, tail);
+      if (!io.readFileSync(file).equals(current)) {
+        io.unlinkSync(tmp);
+        continue;
+      }
+      renameSyncWithRetry(tmp, file, { fs: { renameSync: io.renameSync } });
+      return tail.length;
+    } catch (err) {
+      try { io.unlinkSync(tmp); } catch { /* already gone */ }
+      throw err;
+    }
+  }
+  const err = new Error(
+    `${file} kept changing during the restore (concurrent appends?) — post-verification failed and ` +
+      `nothing was restored. Original bytes: ${backupPath ?? '(no backup taken)'}`
+  );
+  err.code = 'ELEDGERCHANGED';
+  throw err;
+}

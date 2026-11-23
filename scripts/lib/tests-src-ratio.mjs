@@ -1,0 +1,679 @@
+#!/usr/bin/env node
+/**
+ * tests-src-ratio.mjs — THE canonical tests:src LOC measurement for TV-003
+ * (`.claude/rules/test-value.md` § TV-003 Budget Corridor).
+ *
+ * ## Why this file exists
+ *
+ * TV-003 named a ceiling but no recipe, so the recipe lived in prose — and prose
+ * re-derives differently for every person who measures. On 2026-07-30 SIX numbers
+ * for the one metric were in simultaneous circulation (1.7142 / 1.7360 / 1.74 /
+ * 1.7779 / 1.8032 / 1.8084), differing only in which files each measurer chose to
+ * count. A threshold steered by six numbers is steered blind. This module is the
+ * single answer: the recipe is code, the number is reproducible at a SHA, and the
+ * rule text points here instead of describing a seventh calculation.
+ *
+ * ## The recipe (a PARTITION, not two independent globs)
+ *
+ * Every tracked code file lands in EXACTLY ONE bucket — that property is the
+ * whole design. Two independently-authored globs are how the six numbers arose:
+ * each hand-picked src list (`scripts+hooks` vs `+skills` vs `everything`) both
+ * dropped files silently and invited the next measurer to pick differently.
+ * Here `src` is defined by NEGATION, so a new top-level directory joins the
+ * denominator the moment it is committed, with no rule edit and no re-derivation.
+ *
+ *   universe     `git ls-files`, filtered to CODE_EXTENSIONS, minus declaration
+ *                files (`*.d.ts`, `*.d.mts`, `*.d.cts` — types, not executable code)
+ *   numerator    tracked code under a top-level `tests/`, plus co-located tests
+ *                anywhere: basename `*.test.<ext>` / `*.spec.<ext>`, or any file
+ *                under a `__tests__/` directory; Python/Swift also use nested
+ *                `tests/` / `Tests/` and `test_*.py` / `*_test.py` / `*Tests.swift`
+ *   denominator  every OTHER tracked code file
+ *   reported     tracked shell (EXCLUDED_SHELL_EXTENSIONS) — in NEITHER bucket,
+ *                its volume shipped as `excludedScope.shell` (#1488, variant B)
+ *
+ * ## The four questions, answered in code rather than left open
+ *
+ *   Do `skills/**.mjs` count as src?      YES — shipped product code, and no
+ *                                         hand-picked list decides it; negation does.
+ *   Do `.md` files count?                 NO — neither side. Documentation volume
+ *                                         is a different budget (instruction-budget);
+ *                                         mixing them makes the ratio movable by
+ *                                         writing prose, which catches no bug.
+ *   Only git-tracked?                     YES — reproducible at a SHA, and it is
+ *                                         what keeps node_modules/, coverage/ and
+ *                                         untracked scratch out without an ignore list.
+ *   Do `tests/fixtures/` count as test LOC? YES when they are code (any of
+ *                                         CODE_EXTENSIONS). A code fixture is maintained
+ *                                         code that exists only to serve the suite —
+ *                                         that is test-corpus cost. Non-code
+ *                                         fixtures (`.json`, `.jsonl`, `.md`) are
+ *                                         excluded by the same extension filter
+ *                                         that governs the denominator.
+ *   Blank lines and comments?             COUNTED — see countPhysicalLines().
+ *
+ * ## What this is NOT
+ *
+ * Not a ratchet, and deliberately so. TV-003 is a CORRIDOR: exceeding the ceiling
+ * switches the consolidation rule on, it does not break the build. `--check` is a
+ * machine-readable answer to "is the consolidation wave required?", which is the
+ * only job TV-003 gives the ratio ("the ratio is merely the trigger that switches
+ * it on"). Wiring it as a blocking CI gate would manufacture standing deletion
+ * pressure with no nameable target per file — the precise thing TV-001 and TV-002
+ * forbid, and the documented reason the predecessor ceiling of 1.20 was abandoned.
+ *
+ * Usage:
+ *   tests-src-ratio.mjs [<repo-root>] [--json] [--check] [--ceiling <n>] [--stdin]
+ *
+ *   <repo-root>    defaults to process.cwd()
+ *   --json         emit a single JSON object on stdout, nothing else
+ *   --check        exit 1 when the ratio exceeds the ceiling (consolidation
+ *                  wave required); exit 3 when the ratio is not measurable
+ *                  (`reason: 'no-tests-found'`, #1451); exit 0 when inside
+ *                  the corridor
+ *   --ceiling <n>  override the TV-003 ceiling (default 1.60)
+ *   --stdin        take newline-separated paths from stdin instead of
+ *                  enumerating via `git ls-files` (test seam / staged-only mode)
+ *
+ * Exit codes:
+ *   0 — measurement completed (and, under --check, ratio is within the corridor)
+ *   1 — --check only: ratio exceeds the ceiling
+ *   2 — tool error (missing/unreadable root, bad argv)
+ *   3 — --check only: ratio not measurable — 0 test files counted while test-like
+ *       files ARE tracked (`reason: 'no-tests-found'`, e.g. a Ruby repo whose
+ *       `tests/test_*.rb` sit outside CODE_EXTENSIONS). Fail-closed since #1451:
+ *       before, such a repo read `ratio 0, withinCorridor true` — "not found"
+ *       reported as "in corridor". TypeScript tests count since the 2026-10-01
+ *       owner decision on #1451; Python/Swift count since #2021.
+ */
+
+import { readFileSync, existsSync, statSync } from 'node:fs';
+import { join, isAbsolute, relative, resolve } from 'node:path';
+
+import { writeStdoutLineSync } from './io.mjs';
+import { isMainModule } from './is-main-module.mjs';
+import { hookProgram } from './program-lookup.mjs';
+import { execFileSync } from './native-command.mjs';
+
+// ---------------------------------------------------------------------------
+// The definition — the part that must never be re-derived by hand
+// ---------------------------------------------------------------------------
+
+/**
+ * Extensions that count as CODE on both sides of the ratio. Anything else is in
+ * neither bucket: `.md` is documentation, `.json`/`.jsonl`/`.yml` are data.
+ * Applied symmetrically to numerator and denominator by construction — a file
+ * type can never inflate one side while being invisible to the other.
+ */
+export const CODE_EXTENSIONS = Object.freeze([
+  '.mjs',
+  '.js',
+  '.cjs',
+  '.jsx',
+  '.ts',
+  '.tsx',
+  '.mts',
+  '.cts',
+  '.py',
+  '.swift',
+]);
+
+/**
+ * TypeScript declaration files end in a CODE_EXTENSION but carry only types —
+ * no executable line a test could exercise. Excluded from BOTH sides, so a
+ * generated `.d.ts` can never move the ratio.
+ */
+export const DECLARATION_SUFFIXES = Object.freeze(['.d.ts', '.d.mts', '.d.cts']);
+
+/** Top-level path prefix that makes a tracked code file part of the TEST corpus. */
+export const TEST_PREFIX = 'tests/';
+
+/**
+ * Shell extensions the ratio deliberately does NOT count (#1488, owner decision
+ * 2026-10-02, variant B): they stay out of numerator and denominator, but their
+ * volume is MEASURED and reported under `excludedScope.shell`, so "this repo has
+ * no shell" and "this repo has 2.5k unmeasured shell lines" stop looking alike.
+ * Detection is by extension only — an extensionless shebang script (`.husky/*`)
+ * is not seen; sniffing shebangs would mean reading every extensionless tracked
+ * file inside a synchronous session-start probe.
+ */
+export const EXCLUDED_SHELL_EXTENSIONS = Object.freeze(['.sh', '.bash', '.bats']);
+
+/**
+ * Co-located test files, wherever they sit: a `*.test.<ext>` / `*.spec.<ext>`
+ * basename (the vitest/jest default include shape) or a `__tests__/` segment.
+ */
+const COLOCATED_TEST_RE = /\.(test|spec)\.[^./]+$|(^|\/)__tests__\//;
+
+/**
+ * The one test-corpus rule, shared by the counted code buckets and the reported
+ * shell scope so the two can never split a path differently.
+ * @param {string} p normalised repo-relative path
+ */
+function isTestCorpusPath(p) {
+  // #2021: recognise Python/Swift conventions without changing the JS/TS recipe.
+  const stackTest = /(^|\/)(test_[^/]*\.py|[^/]*_test\.py|[^/]*Tests\.swift)$/.test(p)
+    || (/\.(py|swift)$/.test(p) && /(^|\/)(tests|Tests)\//.test(p));
+  return p.startsWith(TEST_PREFIX) || COLOCATED_TEST_RE.test(p) || stackTest;
+}
+
+/**
+ * A tracked path that LOOKS like a test, counted or not. Use the same corpus
+ * rules (#2021), including paths with uncounted extensions under `tests/`, to
+ * distinguish "no tests" from "tests the recipe cannot see" (#1451).
+ *
+ * @param {string} relPath repo-relative path
+ * @returns {boolean}
+ */
+export function isTestLikePath(relPath) {
+  const p = String(relPath).replace(/\\/g, '/').replace(/^\.\//, '');
+  return isTestCorpusPath(p);
+}
+
+/** The TV-003 ceiling. Exceeding it switches the consolidation rule on. */
+export const DEFAULT_CEILING = 1.6;
+
+/**
+ * Machine-readable schema tag for the --json envelope. `/3` since #2021: Python
+ * and Swift count, so a ratio under `/2` and one under `/3` are not comparable.
+ */
+export const SCHEMA = 'tests-src-ratio/3';
+
+/**
+ * Which bucket a repo-relative path belongs to.
+ *
+ * `src` is defined by NEGATION — every tracked code file that is not a test
+ * (under `tests/`, or co-located per COLOCATED_TEST_RE). That is what makes the
+ * two buckets a partition rather than two globs that can overlap or leave a gap.
+ *
+ * Known blind spot: a nested `pkg/tests/helper.ts` that is not itself named
+ * `*.test.*` counts as src — JS/TS keep the TOP-LEVEL `tests/` rule (#2021).
+ *
+ * @param {string} relPath repo-relative path, `/`-separated
+ * @returns {'test'|'src'|null} null = outside the metric entirely
+ */
+export function classifyPath(relPath) {
+  const p = String(relPath).replace(/\\/g, '/').replace(/^\.\//, '');
+  if (!CODE_EXTENSIONS.some((ext) => p.endsWith(ext))) return null;
+  if (DECLARATION_SUFFIXES.some((ext) => p.endsWith(ext))) return null;
+  return isTestCorpusPath(p) ? 'test' : 'src';
+}
+
+/**
+ * Which half of the EXCLUDED shell scope a path falls into — reported, never
+ * counted in the ratio. `.bats` is a test framework's own extension, so it is
+ * test-shell anywhere; any other shell file follows the code rule above.
+ *
+ * @param {string} relPath repo-relative path
+ * @returns {'test'|'src'|null} null = not shell
+ */
+function classifyShellPath(relPath) {
+  const p = String(relPath).replace(/\\/g, '/').replace(/^\.\//, '');
+  if (!EXCLUDED_SHELL_EXTENSIONS.some((ext) => p.endsWith(ext))) return null;
+  return p.endsWith('.bats') || isTestCorpusPath(p) ? 'test' : 'src';
+}
+
+/**
+ * Physical line count — blank lines and comment lines INCLUDED.
+ *
+ * Two deliberate choices:
+ *
+ * 1. No comment stripping. Stripping would need a real JS parser (a `//` inside
+ *    a string, a regex literal, or a template literal is not a comment), so the
+ *    stripper itself becomes a bug surface in the measuring instrument. It also
+ *    inverts the incentive: comments sit in the DENOMINATOR too, so a stripper
+ *    would reward deleting explanatory comments from src to move the ratio.
+ *
+ * 2. EOF-newline-insensitive. `wc -l` counts newline BYTES, so a file whose last
+ *    line has no trailing newline is undercounted by one — an off-by-one that
+ *    varies with an invisible byte. Here a trailing empty segment is dropped, so
+ *    "10 lines" means ten lines with or without the final newline.
+ *
+ * @param {string} content
+ * @returns {number}
+ */
+export function countPhysicalLines(content) {
+  if (content === '') return 0;
+  const parts = content.split('\n');
+  if (parts[parts.length - 1] === '') parts.pop();
+  return parts.length;
+}
+
+/**
+ * Measure the ratio over an explicit file list.
+ *
+ * Enumeration is injected rather than performed here, which is what lets the
+ * test drive a controlled fixture without a git repository.
+ *
+ * @param {object} opts
+ * @param {string[]} opts.files repo-relative paths
+ * @param {(relPath: string) => string|null} opts.readFile returns content, or null when unreadable
+ * @param {number} [opts.ceiling]
+ * @returns {{testFiles:number,testLoc:number,srcFiles:number,srcLoc:number,ratio:number|null,
+ *            ceiling:number,withinCorridor:boolean|null,consolidationWaveRequired:boolean|null,
+ *            skipped:number,testLikeFilesSeen:number,reason:'no-tests-found'|null,
+ *            excludedScope:{shell:{files:number,loc:number,testFiles:number,testLoc:number,
+ *                                  srcFiles:number,srcLoc:number,skipped:number}}}}
+ */
+export function measure({ files, readFile, ceiling = DEFAULT_CEILING }) {
+  let testFiles = 0;
+  let testLoc = 0;
+  let srcFiles = 0;
+  let srcLoc = 0;
+  let skipped = 0;
+  let testLikeFilesSeen = 0;
+  // Reported only — never added to testLoc/srcLoc (#1488 variant B). Always
+  // present, zeros included: a measured zero, not an absent measurement.
+  const shell = { files: 0, loc: 0, testFiles: 0, testLoc: 0, srcFiles: 0, srcLoc: 0, skipped: 0 };
+
+  for (const rel of files) {
+    if (isTestLikePath(rel)) testLikeFilesSeen++;
+    const shellBucket = classifyShellPath(rel);
+    if (shellBucket !== null) {
+      const content = readFile(rel);
+      if (content === null || content === undefined) {
+        shell.skipped++;
+        continue;
+      }
+      const lines = countPhysicalLines(content);
+      shell.files++;
+      shell.loc += lines;
+      if (shellBucket === 'test') {
+        shell.testFiles++;
+        shell.testLoc += lines;
+      } else {
+        shell.srcFiles++;
+        shell.srcLoc += lines;
+      }
+      continue;
+    }
+    const bucket = classifyPath(rel);
+    if (bucket === null) continue;
+    const content = readFile(rel);
+    if (content === null || content === undefined) {
+      skipped++;
+      continue;
+    }
+    const lines = countPhysicalLines(content);
+    if (bucket === 'test') {
+      testFiles++;
+      testLoc += lines;
+    } else {
+      srcFiles++;
+      srcLoc += lines;
+    }
+  }
+
+  // A repo with no src code has an undefined ratio, not an infinite one. Saying
+  // `null` keeps the consumer from reading Infinity as a corridor breach.
+  // Fail closed (#1451): a zero numerator next to tracked test-like files means
+  // the recipe cannot SEE this repo's tests (e.g. `tests/test_x.rb`), not that
+  // there are none. Reporting ratio 0 / withinCorridor true there turned "not found"
+  // into "green". The verdict is unknown, so every verdict field is null.
+  if (testFiles === 0 && testLikeFilesSeen > 0) {
+    return {
+      testFiles,
+      testLoc,
+      srcFiles,
+      srcLoc,
+      ratio: null,
+      ceiling,
+      withinCorridor: null,
+      consolidationWaveRequired: null,
+      skipped,
+      testLikeFilesSeen,
+      reason: 'no-tests-found',
+      excludedScope: { shell },
+    };
+  }
+
+  const ratio = srcLoc === 0 ? null : Number((testLoc / srcLoc).toFixed(4));
+  const withinCorridor = ratio === null ? true : ratio <= ceiling;
+
+  return {
+    testFiles,
+    testLoc,
+    srcFiles,
+    srcLoc,
+    ratio,
+    ceiling,
+    withinCorridor,
+    consolidationWaveRequired: !withinCorridor,
+    skipped,
+    testLikeFilesSeen,
+    reason: null,
+    excludedScope: { shell },
+  };
+}
+
+/**
+ * The self-describing definition block shipped inside every --json envelope, so
+ * a consumer never has to guess which recipe produced the number.
+ * @param {'git ls-files'|'stdin'} source
+ */
+export function definitionOf(source) {
+  return {
+    source: source === 'stdin' ? 'stdin path list' : 'git ls-files (tracked files only)',
+    codeExtensions: [...CODE_EXTENSIONS],
+    declarationsExcluded: [...DECLARATION_SUFFIXES],
+    numerator:
+      `tracked code files under a top-level ${TEST_PREFIX}, plus co-located tests anywhere: ` +
+      'basename *.test.<ext> / *.spec.<ext>, or any file under a __tests__/ directory; ' +
+      'Python/Swift also use any tests/ or Tests/ segment and test_*.py / *_test.py / *Tests.swift',
+    denominator: `every OTHER tracked code file (src defined by negation, not by a directory list)`,
+    lineRule: 'physical lines; blank + comment lines counted; EOF-newline-insensitive',
+    excluded:
+      `declaration files (${DECLARATION_SUFFIXES.map((x) => `*${x}`).join(', ')}: types, not ` +
+      'executable code) and non-code extensions (.md, .json, .jsonl, .yml) on BOTH sides; ' +
+      'untracked files (node_modules/, coverage/, scratch)',
+    excludedScope:
+      `shell (${EXCLUDED_SHELL_EXTENSIONS.join(' ')}, by extension only — extensionless shebang ` +
+      'scripts such as .husky/ hooks are not seen): counted in NEITHER bucket, its volume ' +
+      'reported under excludedScope.shell (#1488). test-shell = .bats anywhere, or the ' +
+      'numerator path rule above; every other shell file is src-shell. Same line rule.',
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Enumeration
+// ---------------------------------------------------------------------------
+
+/** @param {string} root */
+function trackedFiles(root) {
+  const out = execFileSync(hookProgram('git', root), ['ls-files'], { cwd: root, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+  return out
+    .split('\n')
+    .filter(Boolean)
+    .map((rel) => rel.replace(/\\/g, '/'));
+}
+
+/** @param {string} root */
+function stdinPaths(root) {
+  let raw;
+  try {
+    raw = readFileSync(0, 'utf8');
+  } catch {
+    return [];
+  }
+  return raw
+    .split('\n')
+    .map((l) => l.trim())
+    .filter(Boolean)
+    .map((p) => (isAbsolute(p) ? relative(root, p) : p).replace(/\\/g, '/'));
+}
+
+/** Short HEAD SHA, or null outside a git repo — the PSA-006 "measured WHEN" anchor. */
+function headRef(root) {
+  try {
+    return execFileSync(hookProgram('git', root), ['rev-parse', '--short', 'HEAD'], {
+      cwd: root,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Whether any TRACKED CODE file differs from the index/HEAD.
+ *
+ * Load-bearing, not cosmetic. Enumeration reads the git INDEX but line counts
+ * read the WORKING TREE, so on a dirty tree the pair (`ref`, `ratio`) is a claim
+ * nobody can reproduce at that SHA. Observed live while this module was written:
+ * a sibling agent grew one tracked src file 543 → 683 lines mid-measurement and
+ * the "same" ratio moved across three consecutive runs. `ref` alone would have
+ * stamped all three with the identical SHA.
+ *
+ * PSA-006 requires a measurement to carry WHEN it was taken; a SHA that does not
+ * reproduce the number fails that requirement while looking like it satisfies it.
+ *
+ * @returns {boolean|null} null when git cannot answer (not a repo)
+ */
+function isDirty(root) {
+  try {
+    // --no-optional-locks is load-bearing, not tidiness: a plain `git status`
+    // opportunistically refreshes and therefore LOCKS .git/index, which races a
+    // parallel session's index write (PSA-007). This matters here specifically
+    // because .claude/rules/test-value.md now instructs agents to run this
+    // script, so it executes inside live sessions. Measured on git 2.50.1 with
+    // stale stat info: plain status rewrote .git/index, the flagged form did not.
+    // Same flag, same reason as hooks/post-bash-write-verify.mjs.
+    const out = execFileSync(hookProgram('git', root), ['--no-optional-locks', 'status', '--porcelain', '--untracked-files=no'], {
+      cwd: root,
+      encoding: 'utf8',
+      maxBuffer: 16 * 1024 * 1024,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    return out
+      .split('\n')
+      .filter(Boolean)
+      .some((l) => classifyPath(l.slice(3).trim().split(' -> ').pop() ?? '') !== null);
+  } catch {
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// CLI
+// ---------------------------------------------------------------------------
+
+const USAGE =
+  'Usage: tests-src-ratio.mjs [<repo-root>] [--json] [--check] [--ceiling <n>] [--stdin]';
+
+/** @param {string[]} argv */
+/**
+ * Session-start Phase 4 banner probe.
+ *
+ * WHY THIS EXISTS: without it this module had zero consumers. TV-003 defines the
+ * ceiling as the trigger for a consolidation wave — and the trigger fired into a
+ * void, since the only references were two rule files asking a human to type the
+ * command. "Not a blocking gate" was conflated with "not wired at all"; the
+ * counter-example shipped in the same commit range, where `checkInstructionBudget`
+ * is equally non-blocking and does get a Phase 4 banner. This closes that asymmetry
+ * WITHOUT making the ratio a build gate — the arguments against a bidirectional
+ * ratchet in `.claude/rules/test-value.md` § TV-003 stand unchanged.
+ *
+ * Contract matches the sibling probes (`checkInstructionBudget`, `checkCiStatus`,
+ * `checkMocStaleness`): returns `null` for "nothing to say", or a single
+ * `{ severity, message }` record. Never throws — any failure degrades to silence,
+ * because a measurement problem must not block a session start.
+ *
+ * @param {{ repoRoot?: string, ceiling?: number }} [opts]
+ * The one non-null path besides a breach is `reason: 'no-tests-found'` (#1451):
+ * a repo whose tests the recipe cannot see gets a WARN, never silence — silence
+ * is what made the unmeasurable ratio read as green fleet-wide.
+ *
+ * @returns {{ severity: 'warn', message: string, ratio: number|null, ceiling: number, reason?: string } | null}
+ */
+export function checkTestsSrcRatio({ repoRoot, ceiling = DEFAULT_CEILING } = {}) {
+  try {
+    if (!repoRoot || typeof repoRoot !== 'string') return null;
+    const root = resolve(repoRoot);
+    if (!existsSync(root)) return null;
+
+    const files = trackedFiles(root);
+    const readFile = (rel) => {
+      const abs = join(root, rel);
+      try {
+        if (!statSync(abs).isFile()) return null;
+        return readFileSync(abs, 'utf8');
+      } catch {
+        return null;
+      }
+    };
+
+    const result = measure({ files, readFile, ceiling });
+    if (result.reason === 'no-tests-found') {
+      return {
+        severity: 'warn',
+        ratio: null,
+        ceiling: result.ceiling,
+        reason: result.reason,
+        message:
+          `⚠ tests:src ratio nicht messbar — 0 Testdateien gezählt, ` +
+          `${result.testLikeFilesSeen} test-artige Dateien getrackt (#1451). ` +
+          `Detail: node scripts/lib/tests-src-ratio.mjs --json`,
+      };
+    }
+    if (result.ratio === null || result.withinCorridor) return null;
+
+    const dirty = isDirty(root);
+    return {
+      severity: 'warn',
+      ratio: result.ratio,
+      ceiling: result.ceiling,
+      message:
+        `⚠ tests:src ${result.ratio.toFixed(4)} > ceiling ${result.ceiling} — ` +
+        `TV-003 consolidation wave is ON: no new test lands without removing a redundant one ` +
+        `(${result.testLoc} test LOC / ${result.srcLoc} src LOC across ` +
+        `${result.testFiles} + ${result.srcFiles} files${dirty ? ', dirty tree' : ''}). ` +
+        `Detail: node scripts/lib/tests-src-ratio.mjs --json`,
+    };
+  } catch {
+    return null; // never block a session start on a measurement failure
+  }
+}
+
+export function parseArgs(argv) {
+  const KNOWN = new Set(['--json', '--check', '--stdin', '--ceiling', '--help']);
+  const positionals = [];
+  let json = false;
+  let check = false;
+  let stdin = false;
+  let help = false;
+  let ceiling = DEFAULT_CEILING;
+
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (!a.startsWith('--')) {
+      positionals.push(a);
+      continue;
+    }
+    if (!KNOWN.has(a)) return { error: `Unknown flag: ${a}` };
+    if (a === '--json') json = true;
+    else if (a === '--check') check = true;
+    else if (a === '--stdin') stdin = true;
+    else if (a === '--help') help = true;
+    else if (a === '--ceiling') {
+      const v = Number(argv[++i]);
+      if (!Number.isFinite(v) || v <= 0) return { error: '--ceiling requires a positive number' };
+      ceiling = v;
+    }
+  }
+  if (positionals.length > 1) return { error: 'at most one positional <repo-root> is accepted' };
+  return { json, check, stdin, help, ceiling, root: positionals[0] };
+}
+
+function main() {
+  const args = parseArgs(process.argv.slice(2));
+  if (args.error) {
+    console.error(`Error: ${args.error}`);
+    console.error(USAGE);
+    process.exit(2);
+  }
+  if (args.help) {
+    console.log(USAGE);
+    console.log('');
+    console.log('The canonical tests:src LOC measurement for TV-003 (test-value.md).');
+    console.log('  numerator    tracked code under tests/, plus *.test.* / *.spec.* / __tests__/ anywhere');
+    console.log('  denominator  every other tracked code file (src by negation)');
+    console.log(`  code exts    ${CODE_EXTENSIONS.join(' ')}   (.md / .json never counted)`);
+    console.log(`  excluded     declaration files ${DECLARATION_SUFFIXES.join(' ')} on both sides`);
+    console.log(
+      `  shell        ${EXCLUDED_SHELL_EXTENSIONS.join(' ')} counted nowhere, volume reported (excludedScope.shell)`,
+    );
+    console.log('  lines        physical; blanks + comments counted; EOF-newline-insensitive');
+    console.log('');
+    console.log('  --json         machine-readable envelope on stdout');
+    console.log('  --check        exit 1 when the ratio exceeds the ceiling, 3 when not measurable');
+    console.log(`  --ceiling <n>  override the TV-003 ceiling (default ${DEFAULT_CEILING})`);
+    console.log('  --stdin        read newline-separated paths instead of git ls-files');
+    console.log('');
+    console.log(
+      'Exit: 0 ok / within corridor · 1 (--check) ceiling exceeded · 2 tool error · 3 (--check) not measurable',
+    );
+    process.exit(0);
+  }
+
+  const root = resolve(args.root ?? process.cwd());
+  if (!existsSync(root)) {
+    console.error(`Error: repo root does not exist: ${root}`);
+    process.exit(2);
+  }
+
+  let files;
+  try {
+    files = args.stdin ? stdinPaths(root) : trackedFiles(root);
+  } catch (err) {
+    console.error(`Error: could not enumerate files under ${root}: ${err?.message ?? err}`);
+    process.exit(2);
+  }
+
+  const readFile = (rel) => {
+    const abs = join(root, rel);
+    try {
+      if (!statSync(abs).isFile()) return null;
+      return readFileSync(abs, 'utf8');
+    } catch {
+      return null; // deleted/unreadable — counted as skipped, never as 0 lines
+    }
+  };
+
+  const result = measure({ files, readFile, ceiling: args.ceiling });
+  const dirty = args.stdin ? null : isDirty(root);
+  const envelope = {
+    schema: SCHEMA,
+    measuredAt: new Date().toISOString(),
+    root,
+    ref: headRef(root),
+    // `ref` is only a reproducible anchor when `dirty` is false — see isDirty().
+    dirty,
+    definition: definitionOf(args.stdin ? 'stdin' : 'git ls-files'),
+    ...result,
+  };
+
+  if (args.json) {
+    // writeStdoutLineSync, NOT console.log: stdout is async on a pipe on macOS,
+    // so anything past the ~64 KiB kernel buffer is discarded by process.exit().
+    // This envelope is small today, but --check exits explicitly below and the
+    // fail-open class is not worth re-litigating per payload size.
+    writeStdoutLineSync(JSON.stringify(envelope, null, 2));
+  } else {
+    const notMeasurable = result.reason === 'no-tests-found';
+    const r = notMeasurable
+      ? 'n/a (no tests found)'
+      : result.ratio === null
+        ? 'n/a (no src code)'
+        : result.ratio.toFixed(4);
+    const verdict = notMeasurable
+      ? `NOT MEASURABLE — ${result.testLikeFilesSeen} test-like files tracked but 0 counted (#1451)`
+      : result.withinCorridor
+        ? 'within corridor'
+        : `ABOVE ceiling ${result.ceiling} — TV-003 consolidation wave required`;
+    const at = envelope.ref ? ` @ ${envelope.ref}${dirty ? '+dirty' : ''}` : '';
+    const sh = result.excludedScope.shell;
+    writeStdoutLineSync(
+      `tests:src = ${r}  (${result.testLoc} test LOC / ${result.srcLoc} src LOC` +
+        `; ${result.testFiles} test + ${result.srcFiles} src files${at}) — ${verdict}` +
+        (sh.files > 0
+          ? `\n  excluded: shell ${sh.files} files / ${sh.loc} lines ` +
+            `(${sh.testFiles} test + ${sh.srcFiles} src files) — in neither bucket (#1488)`
+          : '') +
+        (dirty ? '\n  NOTE: working tree is dirty — this number is NOT reproducible at that SHA' : ''),
+    );
+  }
+
+  if (args.check && result.reason === 'no-tests-found') {
+    console.error(
+      `tests:src ratio not measurable — 0 test files counted but ${result.testLikeFilesSeen} ` +
+        `test-like files tracked (no-tests-found); see #1451`,
+    );
+    process.exit(3);
+  }
+  process.exit(args.check && !result.withinCorridor ? 1 : 0);
+}
+
+const isMain =isMainModule(import.meta.url);
+
+if (isMain) main();

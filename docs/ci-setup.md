@@ -1,0 +1,753 @@
+# CI Setup — session-orchestrator
+
+> **Maintainer-internal.** This document describes the maintainer's private CI mirror setup. It is not required for using the plugin.
+
+GitHub carries a curated mirror without `tests/`, vitest or ESLint config (#1594). Its `test` job (Linux and macOS) runs `npm run test:mirror`: manifests, syntax, dependencies and a SessionStart run. The non-blocking `test-windows-smoke` job on `windows-latest` (#1612) runs `npm run test:mirror` and then `scripts/ci/windows-smoke.mjs` (the product contract for Claude Code on Windows; it moves into `gate` after 10 green main runs). The full suite, lint, typecheck and coverage run on GitLab only. The fresh SessionStart smoke needs npm-registry access and reports unavailable network as unmeasurable.
+
+## schema-drift-check job
+
+The `schema-drift-check` job compares the vendored `vault-frontmatter` schema
+in this repo against the canonical source in
+`infrastructure/projects-baseline` (project ID 52, private).
+
+**Credential model (since 2026-11-01, #1820).** The job clones the baseline
+with its own job token:
+`https://gitlab-ci-token:${CI_JOB_TOKEN}@${CI_SERVER_HOST}/infrastructure/projects-baseline.git`.
+Because the target repo is a **different project** on the same instance,
+GitLab accepts that only if project 52 lists this project (74) on its
+**inbound job-token allowlist** — an admin action on project 52, done
+2026-11-01 (the same arrangement `agents/lead-session-orchestrator`, project
+223, already had). Without the entry the clone gets HTTP 403 and the job exits
+5 `UNAVAILABLE`.
+
+`SCHEMA_DRIFT_TOKEN` (the Project Access Token below) is now an **optional,
+legacy fallback**: the job tries it once, only when the job-token clone fails
+and the variable is set. Before #1820 it was the only credential, and since MR
+pipelines need it, it could not be `protected` — so any MR branch could read
+the real PAT. With the job token primary that is no longer necessary; see
+§ Retiring `SCHEMA_DRIFT_TOKEN` for the owner's follow-up.
+
+**Verify the prerequisite** (read-only):
+
+```bash
+glab api projects/52/job_token_scope/allowlist   # must list project 74 (infrastructure/session-orchestrator)
+```
+
+> **Armed (2026-09-03, #1175): the hard gate is live.** #531 landed upstream
+> — `infrastructure/projects-baseline` commit `cb9ec97` adds `peer-card`,
+> `board`, and `source-repo` to the canonical schema (the issue's AC named
+> only `peer-card`; the close comment widened scope to all three values
+> already vendored ahead here). That closed the vendored-schema divergence
+> which had blocked activation since 2026-09-02; `skills/vault-sync/
+> validator.mjs` was regenerated and `node scripts/sync-vault-schema.mjs
+> --check` now exits 0. The Project Access Token was re-minted (id 53, see
+> § Activation status below), the masked `SCHEMA_DRIFT_TOKEN` CI variable is
+> set on this project, and `SCHEMA_DRIFT_OPTIONAL` is `"false"` at both
+> sites in `.gitlab-ci.yml` — a missing or expired token now hard-fails the
+> pipeline (exit 4) instead of printing the amber `NOT VERIFIED` line that
+> was the accepted state under the prior (2026-08-28, #1062) decision. Both
+> directions were proven before the flip — see below. Since #1820 the
+> armed gate runs on `CI_JOB_TOKEN`; the PAT history below is kept as the
+> record of how it was armed and as the recipe for the legacy fallback.
+
+### Activation status (token re-minted 2026-09-03, id 53 — history; legacy since #1820)
+
+The Project Access Token was revoked on 2026-09-02 once a control run had
+answered the question it was minted for — an unused credential is a
+liability per SEC-005's secrets-lifecycle discipline. That control run had
+also surfaced the real reason activation was still blocked:
+`skills/vault-sync/validator.mjs`'s `vaultNoteTypeSchema` enum carried
+`peer-card` and `board`, and `vaultFrontmatterSchema` carried
+`source-repo: z.string().optional()`, none of which the canonical
+`infrastructure/projects-baseline` source had yet — the documented
+vendor-ahead state (`scripts/sync-vault-schema.mjs` header, "Vendor-ahead
+state (2026-05-23, #503, I5)"), tracked as upstream-sync-debt in issue #531
+(#503 itself was already closed).
+
+**#531 landed upstream** as commit `cb9ec97`: `vaultNoteTypeSchema` gained
+`peer-card` and `board`; `vaultFrontmatterSchema` gained `source-repo:
+z.string().optional()`. With the canonical source caught up,
+`node scripts/sync-vault-schema.mjs --check` exits 0 — no drift.
+
+**Token, re-minted:**
+
+- **Name:** `session-orchestrator-ci-schema-drift`
+- **Project:** `infrastructure/projects-baseline` (id 52) — the TARGET repo,
+  not this one
+- **Token id:** 53
+- **Scopes:** `read_repository`
+- **Access level:** Reporter (20)
+- **Expires:** 2027-09-01
+
+The masked `SCHEMA_DRIFT_TOKEN` CI variable was set on this project (id 74),
+**not** Protected — that was the price of being the only credential (Option A
+step 3 below). Since #1820 it is the legacy fallback and may be protected or
+deleted (§ Retiring `SCHEMA_DRIFT_TOKEN`).
+
+**Proof pipelines, both directions, run before the flip:**
+
+- **GREEN** — pipeline 8358 @ `dc9522dd` (branch
+  `proof/1175-schema-drift-green`): job `schema-drift-check` #84625 ran with
+  the token, cloned the baseline, and printed `RESULT: IN-SYNC (exit 0)`;
+  `pipeline-gate` succeeded.
+- **RED** — pipelines 8355–8357 @ `bca78dae` (branch
+  `proof/1175-schema-drift-red`, a deliberately bogus enum value injected
+  into the vendored copy): `sync-vault-schema.mjs` reported drift, the job
+  failed with exit 1 — outside `allow_failure.exit_codes: [3]` — and
+  `pipeline-gate` never ran.
+
+With both proofs recorded, `SCHEMA_DRIFT_OPTIONAL` is `"false"` at both
+sites in `.gitlab-ci.yml` — `schema-drift-check` and `pipeline-gate`.
+`tests/ci/schema-drift-check.test.mjs` pins the committed value on both
+jobs, so a half-revert or a template refresh flipping one site back to
+`"true"` fails the suite locally, not silently in a pipeline.
+
+**Rotation / re-arm sequence** (legacy PAT only — needed only while the
+fallback is kept; with the job token primary, an expired PAT no longer breaks
+the gate):
+
+0. **Re-mint the token.** Run the same `glab api --method POST … --input -`
+   recipe as Option A step 1, against the TARGET project (id 52), and copy
+   the response's `token` field immediately — it is shown exactly once.
+1. `read -rs TOKEN` at the prompt (no echo), then pipe it into `glab variable
+   set` rather than passing it as a `--value` argument — a value passed on the
+   command line is visible to any other process on the host via `ps`, while
+   stdin is not:
+
+   ```bash
+   read -rs TOKEN
+   printf '%s' "$TOKEN" | glab variable set SCHEMA_DRIFT_TOKEN \
+     -R infrastructure/session-orchestrator --masked
+   ```
+
+   **Not** `--protected`: `.gate-rules` (`.gitlab-ci.yml:74`) runs the job
+   on every branch and every MR pipeline, and a protected-only variable would
+   silently reproduce the exit-5 `UNAVAILABLE` failure on every unprotected
+   branch. (`glab variable set --help` documents stdin piping directly —
+   `cat file.txt | glab variable set SERVER_TOKEN` — but no `-`/dash value
+   for `--value`; the flag only accepts a literal string, so omitting it
+   entirely and piping the value is the only way to keep the token off argv.)
+2. Push an ordinary commit and read the `schema-drift-check` job log for
+   `RESULT: IN-SYNC` — and confirm the job DURATION is well over 20 seconds
+   (see the pipeline-6815 warning above). A fast "success" is the exit-3
+   soft-skip in disguise, not a real run.
+3. `SCHEMA_DRIFT_OPTIONAL` stays `"false"` at **both** sites —
+   `schema-drift-check` and `pipeline-gate`. A rotation replaces only the
+   credential, never the flag; if the flag was ever reverted for an
+   emergency, flip it back to `"false"` at both sites in one commit —
+   `tests/ci/schema-drift-check.test.mjs` pins the committed value on both
+   jobs, so a half-flip fails the suite locally.
+4. Local counter-probe before trusting the pipeline: clone
+   `infrastructure/projects-baseline` with the token, make a throwaway copy of
+   `packages/zod-schemas/src/vault-frontmatter.ts` with one field
+   deliberately edited, then run
+   `node scripts/sync-vault-schema.mjs --check --canonical <path-to-edited-copy>`
+   — expect exit 1 with a diff naming the edited field. That confirms the
+   check diffs real content rather than passing on a broken comparison.
+
+Per `.claude/rules/security.md` § SEC-005, this token's lifecycle belongs in
+`.claude/docs/SECRETS-INVENTORY.md` once one exists — that file is not present <!-- path-check: example -->
+in this repo (measured 2026-09-02: no `.claude/docs/` directory tracked), so
+the inventory is not adopted here and this section remains the sole record.
+
+### Credentials and prerequisite
+
+| Credential | Required | Source | Notes |
+|---|---|---|---|
+| `CI_JOB_TOKEN` | Yes (primary) | set by GitLab in every job | works only while project 52's inbound job-token allowlist contains project 74 |
+| `SCHEMA_DRIFT_TOKEN` | No (legacy fallback) | masked CI variable, Project Access Token or PAT — Option A/B below | tried once, only after a failed job-token clone; may be protected or deleted |
+
+An unset `SCHEMA_DRIFT_TOKEN` is **not** a misconfiguration any more. The
+no-credential guard fires only when **both** are empty (in practice: the script
+run outside GitLab). Then the job prints a `NOT VERIFIED` notice and exits
+**3** — which `allow_failure.exit_codes` renders as an amber *warning*, never
+as a pass — if `SCHEMA_DRIFT_OPTIONAL` is `"true"`, and **4** (hard failure)
+otherwise. The full exit taxonomy is the table in the next section.
+
+### Retiring `SCHEMA_DRIFT_TOKEN` (owner follow-up, #1820)
+
+Once one pipeline has shown `cloned infrastructure/projects-baseline with
+CI_JOB_TOKEN.` followed by `RESULT: IN-SYNC (exit 0)` in the
+`schema-drift-check` log, the PAT is no longer needed:
+
+1. Either mark the variable **Protected** (it then only reaches protected
+   branches, so MR branches can no longer read it), or delete it:
+   `glab variable delete SCHEMA_DRIFT_TOKEN -R infrastructure/session-orchestrator`.
+2. Revoke token id 53 on project 52 if the variable was deleted — an unused
+   credential is a liability (SEC-005).
+3. Optional cleanup afterwards: drop the fallback branch from the clone step in
+   `.gitlab-ci.yml` and the matching rows in
+   `tests/ci/schema-drift-check.test.mjs`.
+
+Deleting the variable without step 3 is safe: with it unset the fallback
+branch is simply never taken.
+
+Until 2026-07-30 this path exited **0**, so a job that had checked nothing
+reported exactly the same green tick as a job that had checked everything. It
+was visible in the timings: in pipeline 6815 `schema-drift-check` reported
+success after 17 seconds, which is not enough time to clone the baseline repo,
+let alone diff a schema against it. Issue #933.
+
+### Activating the hard gate (`SCHEMA_DRIFT_OPTIONAL`)
+
+`schema-drift-check` carries a committed job variable:
+
+```yaml
+variables:
+  SCHEMA_DRIFT_OPTIONAL: "false"
+```
+
+It is the review-visible declaration that "no credential" is *no longer* an
+accepted state — armed 2026-09-03 (#1175, see § Activation status above).
+The behaviour matrix:
+
+| Credentials | `SCHEMA_DRIFT_OPTIONAL` | Exit | State | Pipeline effect |
+|---|---|---|---|---|
+| neither `CI_JOB_TOKEN` nor `SCHEMA_DRIFT_TOKEN` | `"true"` | 3 | `SKIPPED` | amber warning; `pipeline-gate` prints `schema-drift: NOT VERIFIED` |
+| neither | anything else | 4 | `MISCONFIGURED` | hard failure — a credential is required and the check never ran |
+| job-token clone fails, PAT unset or its retry fails too | either | 5 | `UNAVAILABLE` | hard failure — project 52 allowlist missing, PAT scope/expiry, or network; **not** drift |
+| a clone works (job token, or the one PAT retry with a `WARNING` line) | either | 0 | `IN-SYNC` | pass; writes the `.ci-markers/schema-drift.ok` marker |
+| a clone works | either | 1 | `DRIFT` | hard failure — **the only code that means drift** |
+
+**One code per fact.** Exit 1 is reserved for a real schema divergence; 3, 4 and
+5 all mean NOT VERIFIED and none of them is a drift verdict. That split is the
+point of the taxonomy: before it, "there is no credential" and "the schema has
+diverged" were the same red, so the first person to see the failure went hunting
+a schema diff that does not exist. Only 3 is listed in
+`allow_failure.exit_codes`; 4 and 5 are hard failures by construction. Every
+outcome also prints its own `[schema-drift] RESULT: <STATE>` line, so the job log
+answers "what happened" without the reader having to know this table.
+
+**Caveat — a second, narrower exit-3 collision (do not change the YAML for
+it).** `scripts/sync-vault-schema.mjs` has its own exit 3, for a different
+condition: malformed sentinel comments in `validator.mjs` (only one of
+`begin`/`end` present). If `--check` ever hit that branch, it would return
+exit 3 from the tool itself — and `allow_failure.exit_codes: [3]` reads the
+shell's final exit code, not which tool produced it, so a genuine tooling
+defect (broken sentinels) would render as the same amber "no token, declared
+optional" warning that the missing-token guard produces. This is a caveat to
+note, not a blocker: the sentinels are intact today, and the fix — if it is
+ever needed — is giving `sync-vault-schema.mjs`'s malformed-sentinel case a
+distinct exit code, not a change here.
+
+**This is what the armed state looks like.** `SCHEMA_DRIFT_OPTIONAL` is
+`"false"` in `.gitlab-ci.yml` at **both** places: the `schema-drift-check`
+job and `pipeline-gate`. One flag, two enforcement points;
+`tests/ci/schema-drift-check.test.mjs` asserts the mirroring AND pins the
+literal `"false"` value on both jobs, so a half-flip — or a full revert —
+fails the suite locally rather than silently leaving one point advisory. A
+missing credential now hard-fails the pipeline (exit 4), and a refused clone
+exit 5, instead of the tolerated amber warning — that is the whole point of the flag: the opt-out is
+a line in a reviewed file, not the accidental side effect of an unset CI
+variable.
+
+**To switch it back to amber temporarily** (a token rotation window, or
+taking the check offline for an emergency): set `SCHEMA_DRIFT_OPTIONAL` to
+`"true"` at **both** sites, in one commit — the same mirrored-pair discipline
+applies in reverse, and the same test catches a half-revert. Re-arm by
+flipping both sites back to `"false"` once the reason for the amber window is
+resolved; see § Rotation / re-arm sequence above for the token side of that
+operation.
+
+**Fork / external-contributor MR caveat.** `.gate-rules` (`.gitlab-ci.yml:74`)
+includes `if: $CI_PIPELINE_SOURCE == "merge_request_event"`, so a merge
+request pipeline runs `schema-drift-check` regardless of who opened it — but
+a pipeline running a **forked** project's code gets neither the target
+project's masked CI/CD variables (by design, so an untrusted fork cannot
+exfiltrate a secret) nor a job token of THIS project: its `CI_JOB_TOKEN`
+belongs to the fork, which is not on project 52's allowlist. The job-token
+clone is refused and no PAT is there to retry with, so the job exits **5**
+(`UNAVAILABLE`), a hard pipeline failure — not the amber `SKIPPED` a
+same-project branch would get. The accepted mitigation is
+either of: a maintainer re-runs the pipeline from within this project (e.g.
+pushing the same commit to a branch here, where the variable IS available),
+or a maintainer temporarily sets `SCHEMA_DRIFT_OPTIONAL: "true"` on that one
+MR/branch for the duration of review. Do not weaken the committed default in
+`.gitlab-ci.yml` for this — it stays `"false"` at both sites per the armed
+state above.
+
+> **Before you flip it, run ONE pipeline with the token present while
+> `SCHEMA_DRIFT_OPTIONAL` is still `"true"`, and check the job's DURATION.**
+> A `schema-drift-check` that "succeeds" in under ~20 seconds did not clone the
+> baseline repo — that is the signature of the exit-3 soft-skip path, i.e. the
+> token is still not reaching the job (misspelled key, protected-variable on an
+> unprotected branch, or masking rejection). Flipping the flag on that state
+> converts a silent skip into a red pipeline whose message points at the wrong
+> problem. Confirm a real run first: the log must show
+> `RESULT: IN-SYNC (exit 0)` and the job must produce the
+> `.ci-markers/schema-drift.ok` artifact. This job has a recorded history of
+> exactly this failure — pipeline 6815 reported SUCCESS in 17 s having checked
+> nothing (issue #933).
+
+### Option A — Project Access Token (legacy fallback credential)
+
+Since #1820 this section matters only if you keep the legacy fallback; the
+primary credential is `CI_JOB_TOKEN` (see the top of this section).
+
+GitLab resolves a **deploy token** by its own fixed username
+(`gitlab+deploy-token-<n>`, or a custom username if one was set at creation).
+The job's fallback clone hardcodes the login as `oauth2:${SCHEMA_DRIFT_TOKEN}`
+(`schema-drift-check` clone step in `.gitlab-ci.yml`) — `oauth2` is the username GitLab expects for a
+Personal or Project Access Token, not for a deploy token. A deploy token's
+value paired with that hardcoded username fails authentication at clone time
+and surfaces as exit 5 `UNAVAILABLE`, which reads as a network/credential
+problem rather than "wrong username" (see the demoted Deploy Token option
+below). Tokens with **PAT semantics** — GitLab accepts any username alongside
+the token value — authenticate correctly with this clone URL: a Personal
+Access Token, or, least-privilege, a **Project Access Token** scoped to the
+TARGET project (`infrastructure/projects-baseline`). A Project Access Token
+is preferred over a personal PAT for the same reason the deploy token used to
+be recommended: it belongs to the project, not a person, and survives staff
+changes.
+
+1. Create the token via API against the TARGET project (id 52) — GitLab has
+   no path to create a Project Access Token FOR a project from outside that
+   project's own Settings UI, so use `glab api`:
+
+   ```bash
+   glab api --hostname "$GITLAB_HOST" -X POST "projects/52/access_tokens" \
+     -H 'Content-Type: application/json' --input - <<'JSON'
+   {"name":"session-orchestrator-ci-schema-drift","scopes":["read_repository"],"access_level":20,"expires_at":"2027-09-01"}
+   JSON
+   ```
+
+   `--input -` plus the explicit `Content-Type: application/json` header is
+   required because the payload has a nested type (`scopes` is a JSON array),
+   which `glab api`'s `-f`/`-F` flag form cannot express. `access_level: 20`
+   is Reporter — the lowest access level that can read repository content.
+   `expires_at` is an operator choice, not a fixed value; the token created
+   for this document's own dry run (2026-09-02) was set 1 year out
+   (`2027-09-01`) — rotate before expiry.
+
+2. The response's `token` field holds the token value and is **shown exactly
+   once** — copy it immediately; GitLab will not display it again.
+
+3. Store it in `session-orchestrator` CI/CD variables as `SCHEMA_DRIFT_TOKEN`.
+   Prefer stdin over `--value` — a value passed as a command-line argument is
+   visible to other processes on the host (`ps`), while stdin is not:
+
+   ```bash
+   read -rs TOKEN
+   printf '%s' "$TOKEN" | glab variable set SCHEMA_DRIFT_TOKEN \
+     -R infrastructure/session-orchestrator --masked
+   ```
+
+   **Masked:** Yes. Historically **not** `--protected` — `.gate-rules`
+   (`.gitlab-ci.yml:74`) runs the job on every branch and every MR pipeline,
+   and while the PAT was the only credential a protected-only variable would
+   have been absent everywhere the job needed it. As a fallback behind
+   `CI_JOB_TOKEN` it can be protected (#1820).
+
+### Option B — Personal Access Token (fallback)
+
+The same PAT-semantics reasoning from Option A applies: a personal PAT
+authenticates under any username, so it works with the hardcoded `oauth2:`
+clone login. Use this only if you cannot create a Project Access Token on
+`infrastructure/projects-baseline` (e.g. you lack Owner/Maintainer there).
+
+1. Go to your GitLab profile → **Access Tokens**.
+2. Create a token with scope `read_repository` and a reasonable expiry.
+3. Store it in `session-orchestrator` CI/CD variables as `SCHEMA_DRIFT_TOKEN`
+   (Masked: Yes, **not** Protected — see Option A step 3 above).
+
+A personal PAT is tied to the creating user's account and access; prefer the
+Project Access Token in Option A so the CI credential survives staff changes.
+
+### Deploy Token — does not work with the current clone URL
+
+This was the previously recommended option; it is demoted here because, as
+the job is written today, it does not authenticate. GitLab deploy tokens
+authenticate under their OWN username (`gitlab+deploy-token-<n>`, or a custom
+username set at creation) — never as `oauth2`. The job's fallback clone hardcodes
+`oauth2:${SCHEMA_DRIFT_TOKEN}` (`schema-drift-check` in `.gitlab-ci.yml`), so a deploy token's
+value paired with the wrong username fails authentication at clone time. This
+job reports that as exit 5 `UNAVAILABLE` — read as a network/credential-scope
+problem, when the actual cause is the username mismatch.
+
+To use a deploy token instead of Option A, `.gitlab-ci.yml`'s clone step would
+need to stop hardcoding `oauth2` — either read the deploy token's own username
+from a second CI variable and interpolate it into the clone URL, or create the
+deploy token with a custom username of `oauth2` if the GitLab instance allows
+choosing one. Neither change is made in this repo; that edit is out of this
+document's scope. Option A avoids needing it at all, by using a token whose
+username requirement (any username) already matches the hardcoded login.
+
+### Verification path
+
+After the allowlist entry exists (`glab api projects/52/job_token_scope/allowlist`):
+
+1. Push to a feature branch or open an MR against `main`.
+2. Observe the `schema-drift-check` job in the pipeline — it should log
+   `cloned infrastructure/projects-baseline with CI_JOB_TOKEN.` and run the
+   sync check. A `WARNING: CI_JOB_TOKEN clone failed` line means the job ran
+   on the legacy PAT: the allowlist entry is missing. Read the job's
+   `[schema-drift] RESULT:` line; it
+   names the state directly, and the duration corroborates it (a real run
+   clones a repo, so it cannot finish in seconds).
+3. Read the exit code against the table above before diagnosing anything:
+   - **0 (`IN-SYNC`)** — the vendored schema matches the canonical source.
+   - **1 (`DRIFT`)** — and only 1 — means drift was detected. Run
+     `node scripts/sync-vault-schema.mjs --update` locally and commit the
+     refreshed copy.
+   - **3 (`SKIPPED`)** — no credential reached the job (neither
+     `CI_JOB_TOKEN` nor `SCHEMA_DRIFT_TOKEN`). Nothing was compared; do not
+     read the amber tick as a pass.
+   - **4 (`MISCONFIGURED`)** — same, with `SCHEMA_DRIFT_OPTIONAL` not `"true"`.
+     There is no schema diff to look for.
+   - **5 (`UNAVAILABLE`)** — every clone attempt failed. First check project
+     52's inbound job-token allowlist; if the legacy PAT is still set, also its
+     `read_repository` scope and expiry. Also not drift.
+
+### The CI job-token allowlist on projects-baseline (the primary path since #1820)
+
+- Admin action on the foreign project: `infrastructure/projects-baseline →
+  Settings → CI/CD → Job token permissions`, add
+  `infrastructure/session-orchestrator` to the inbound allowlist (API:
+  `POST /projects/52/job_token_scope/allowlist`). Done 2026-11-01 for
+  project 74.
+- Read back with `glab api projects/52/job_token_scope/allowlist`.
+- Issue #279 originally chose the token-variable path because it needed no
+  admin action in the foreign project. #1820 reversed that: the variable had
+  to be unprotected for MR pipelines, so every MR branch could read a real
+  PAT, while the job token is scoped to the running job and expires with it.
+
+## `pack-lifecycle` job (#1375)
+
+Every other job in `.gitlab-ci.yml` measures the git checkout, where every
+tracked file is present by construction. `pack-lifecycle` is the only one that
+measures what an **npm consumer** actually receives: it runs
+`npm run test:pack`, which packs a tarball, installs it into a throwaway
+consumer package, and then executes the hook out of
+`node_modules/session-orchestrator/` rather than out of this repo.
+
+What it proves, in the four assertions of
+`tests/scripts/pack-install-lifecycle.test.mjs`:
+
+1. The sha512 of the tarball the test packed is byte-for-byte the `integrity`
+   the fresh consumer's own `package-lock.json` recorded — so a tarball mutated
+   between pack and install, or a pipeline installing something other than what
+   it packed, is caught. (It is not a re-hash of the extracted tree: unpacking
+   does not preserve mtimes, so that would differ for non-defect reasons.)
+2. The **installed** `hooks/pre-bash-destructive-guard.mjs` denies `rm -rf /`
+   with a single PreToolUse deny envelope on stdout. This is the class the
+   repo-checkout suite is blind to: with `.orchestrator/policy/` missing from the
+   published artefact the guard warns on stderr, prints nothing, and **exits 0**
+   — fail-open, and indistinguishable from a healthy allow by exit code alone
+   (measured 2026-09-16: plugin root without the policy file → `exit=0`,
+   `stdout=""`; with it → `exit=0`, 634 bytes, `permissionDecision: deny`).
+3. The installed guard still allows a benign command with empty stdout — so a
+   packed guard that denies everything is caught too.
+4. Every `$CLAUDE_PLUGIN_ROOT/…` path the installed `hooks/hooks.json` wires (28
+   at the time of writing, incl. `hooks/run-node.sh`) exists inside the installed
+   tree.
+
+`tests/scripts/pack-policy-floor.test.mjs` does **not** subsume this: it reads
+the pack**list** (`npm pack --dry-run --json`), which is a manifest claim about
+names. It never writes a tarball, never installs, and never runs a line out of
+the artefact.
+
+**Cost and why it is opt-in locally.** ~20–30 s for the whole job (measured
+2026-09-16: `npm pack` ~15 s, `npm install <tgz>` ~3 s / 67 packages, suite wall
+time 26.8 s). It is the one job that **reaches the npm registry** — the consumer
+install resolves this package's own runtime dependencies — so it is excluded
+from the default `npm test`. `vitest.config.mjs` includes `tests/**` and is
+config-protected, so the gate is an env flag rather than an exclude:
+
+```bash
+npm run test:pack          # SO_PACK_TEST=1 vitest --run tests/scripts/pack-install-lifecycle.test.mjs
+npx vitest run tests/scripts/pack-install-lifecycle.test.mjs   # without the flag → 4 skipped, exit 0
+```
+
+The job is hard-`needs`-ed by `pipeline-gate`, like `test`: deleting it from
+this file is a pipeline-*creation* error rather than a silently narrower gate.
+The trade-off that buys is registry availability — a registry outage fails this
+job, and therefore the pipeline, without any code being wrong. Retry the job;
+do not make it `allow_failure`, which would restore the silent hole.
+
+## `commitlint` job (#1458)
+
+Runs `commitlint` over the commits a pipeline introduces, with the CI-only rule
+set `commitlint.ci.config.mjs` (= `commitlint.config.mjs`, Conventional Commits
+with `header-max-length 120`, plus stricter ignores). CI is needed in addition to
+the husky `commit-msg` hook because the hook is inactive in a fresh clone until
+`npx husky` has run, absent for Codex / web edits, and skipped by `--no-verify`.
+
+- **Range** `<from>..$CI_COMMIT_SHA`, first match wins: `CI_MERGE_REQUEST_DIFF_BASE_SHA`
+  (MR pipelines), else `CI_COMMIT_BEFORE_SHA` (branch pipelines), else the first
+  parent of the pipeline commit (a new branch has an all-zero before-sha, so only
+  its tip is linted until its MR pipeline lints the whole range). The job logs
+  the range and the commits it lints.
+- **Force-pushed branch without an open MR (#1477 item 3, closed).** The old
+  before-sha is not in the fresh clone. On a branch other than
+  `$CI_DEFAULT_BRANCH` the job fetches `origin/$CI_DEFAULT_BRANCH` and lints from
+  the merge-base instead, and says so in the log. Only plain branch pipelines can
+  hit this: a branch with an open MR runs MR pipelines only, and `main` is
+  protected against force-push, so a missing base on `main` stays a red job.
+  The all-zero before-sha of a new branch deliberately keeps the tip-only range:
+  a branch created at `main`'s tip (GitLab UI, `git push origin main:x`) would
+  otherwise lint an empty range and go red.
+- **Fail-closed.** `commitlint --from X --to Y` exits 0 over an *empty* range
+  (measured 2026-09-29, `@commitlint/cli` 19.8.1), so the script itself fails
+  when the range is empty, its base is missing from the clone, or the fallback
+  cannot fetch `origin/$CI_DEFAULT_BRANCH` or find a merge-base. "Nothing was
+  checked" is never a pass.
+- **`GIT_DEPTH: "0"`.** The project default clone depth is 20, so the range base
+  can be absent from a shallow clone. `semgrep` uses the same setting for its
+  baseline commit.
+- **Stricter ignores in CI (#1477 item 4, closed).** commitlint's built-in default
+  ignores (`@commitlint/is-ignored` 19.8.1) skip far more than git's own merge and
+  revert messages: any message with a `Merge …` line *anywhere* (the pattern is
+  multiline, so one body line exempts the whole message), `revert <anything>`,
+  `Reapply <anything>`, `amend!`/`fixup!`/`squash!`, version headers (`v1.2.3`)
+  and `Merged …` / `Automatic merge…` / `Auto-merged … into …`. The CI config sets
+  `defaultIgnores: false` and accepts only first lines git or GitLab generate:
+  merges (`Merge branch 'x' into 'main'` from GitLab, and git's
+  `Merge branch 'main' into x`, `Merge remote-tracking branch 'origin/main' into x`,
+  `Merge branch 'main' of <remote>`), and `Revert "…"` / `Reapply "…"`. Both CI
+  call sites (range and squash title) pass `-g commitlint.ci.config.mjs`.
+  The first line alone does not prove git or GitLab wrote it (#1507 item 1): a
+  normal commit titled `Merge branch 'a' into b` or `Revert "x"` used to skip
+  every rule. So the job lints the range in two passes that together cover it
+  exactly: `--git-log-args=--no-merges` with `COMMITLINT_MERGE_COMMITS=0`, where
+  a merge-shaped subject is linted like any other, and `--git-log-args=--merges`
+  with `COMMITLINT_MERGE_COMMITS=1`, where git has counted two or more parents
+  and the merge shape is accepted. A hand-written message on a real merge is
+  still linted in the second pass. A revert or reapply shape is accepted only
+  with the body line git or GitLab writes under it: `This reverts commit <sha>`
+  (git, and GitLab's revert of a single commit) or `This reverts merge request
+  !<iid>` (GitLab's revert of a merged MR; taken from GitLab's source, not
+  measured on this instance). The squash-title call sets
+  `COMMITLINT_MERGE_COMMITS=0`: a squash commit has one parent, so a
+  merge-shaped or bare `Revert "…"` MR title fails. The
+  husky hook keeps the lenient defaults on purpose, so a local `git revert`,
+  `git commit --fixup` or `git pull` merge is not blocked mid-work; a `fixup!`
+  commit has to be autosquashed before its MR pipeline goes green.
+  History check (2026-10-02 @ `ff3e43b5`): the 200 most recent `main` commits
+  all pass the CI config (0 failures, as under the husky config). Over the full
+  history (1277 commits) it fails 10, 6 of which already failed under the old
+  config; the 4 new ones are hand-written merge subjects from 2026-04-30 to
+  2026-06-11 (e.g. `Merge branch 'x' (MR !21, …)`). The job only lints new
+  ranges, so old history cannot turn a pipeline red.
+- **MR title on a squash merge (#1477 item 1, closed).** A squash merge commits
+  the MR title (the project's squash commit template is unset, so GitLab uses
+  `%{title}`), which no linted range contains. When
+  `CI_MERGE_REQUEST_SQUASH_ON_MERGE` is `"true"` (GitLab renders
+  `squash_on_merge?`, so the project's `always`/`never` option is included),
+  the job also lints `CI_MERGE_REQUEST_TITLE`, after stripping GitLab's Draft
+  prefixes (`Draft:`, `[Draft]`, `(Draft)`, any case, repeated). An MR that will
+  not squash keeps a free-form title, because its commits are what lands. A red
+  title blocks the merge, since the project only merges with a green pipeline.
+  After fixing a title, run a new pipeline for the MR. When the title is not
+  linted the log says why (#1502): not a merge-request pipeline, the variable is
+  unset (GitLab did not provide it), or the MR does not squash.
+- **A non-conventional commit that reaches `main` (#1502).** Two cases slip past
+  every MR pipeline: the squash box ticked after the last pipeline (the variable
+  is fixed when the pipeline is created, and neither ticking squash nor editing
+  the title starts a new one), and a squash or merge commit message edited in
+  the merge dialog. `main` push pipelines run this job over `before-sha..sha`,
+  which contains the squash commit as the merge's second parent (measured
+  2026-10-02: job 152074, pipeline 16004, range `84c107a1..ff3e43b5`), so the
+  commit is caught after the fact. `main` cannot be force-pushed, so on the
+  default branch a red job prints the remedy: revert what landed via an MR
+  (`git revert -m 1 <sha>` for a merge commit, `git revert <from>..<sha>` for
+  directly pushed commits), then re-land the change from a new branch with a
+  conventional message (`git revert --no-commit <the revert commit>`, then
+  `git commit -m 'fix: …'`).
+  Closing these before the merge was an **owner decision** (project settings,
+  not changed by code):
+  - `squash_option: never` removes the squash case entirely. Cost: low,
+    measured 2026-10-02: 3 of 71 merged MRs were squashed, the newest on
+    2026-05-22. **Set by the owner on 2026-10-03** (was `default_off`;
+    verified via `glab api projects/:id` at 2026-10-03T06:47Z, #1507 item 5).
+    The title lint above stays as the guard should the setting ever change.
+  - A push rule (`commit_message_regex`) would reject an edited message at
+    merge time, but push rules are not available on this instance's tier
+    (the push-rule API answers 404).
+  A merge-commit message hand-edited in the dialog stays detectable only after
+  the fact, as above.
+- **Suggestion commits (#1477 item 2, owner setting, set).** With
+  `suggestion_commit_message` unset, GitLab commits "Apply 1 suggestion(s) to
+  1 file(s)", which fails `type-empty` / `subject-empty`. A template that passes
+  (measured exit 0 against the CI config, 2026-10-02):
+  `chore: Apply %{suggestions_count} suggestion(s) to %{files_count} file(s)`.
+  **Set to exactly this template by the owner on 2026-10-03** (project setting
+  `suggestion_commit_message`, under the merge-request settings; verified via
+  `glab api projects/:id` at 2026-10-03T06:47Z, #1507 item 5). Keep
+  `%{file_paths}` out of it if it is ever edited: the template is the header,
+  and a few paths break `header-max-length 120`.
+- **Cancelled push pipelines (#1477 item 5, accepted ceiling).** An MR pipeline
+  re-lints the whole MR range on every push. A direct push is linted per push
+  only (`before-sha..sha`), and every job here is `interruptible` with
+  `auto_cancel_pending_pipelines` enabled, so a push pipeline auto-cancelled by
+  the next push could leave its commits unlinted if that happened before the
+  validate stage finished. Measured: of the last 100 `main` pipelines, 11 were
+  cancelled (7 with direct-push commits), and in all 11 every security and
+  validate job had already finished (2026-09-29); re-measured 0 of 11 affected
+  on 2026-10-02. No CI change: making the job non-interruptible on `main` would
+  stop auto-cancel for every merge and cost a full 30–40 minute pipeline each on
+  the constrained runner. Remedy if it recurs: lint `main` from the previous
+  successful `main` pipeline's SHA (needs a token that can read the pipeline
+  list) or from the last release tag, instead of the before-sha, which
+  re-covers a cancelled predecessor.
+  **Revisit trigger:** a non-conventional commit is found on `main` that no
+  pipeline linted because its pipeline was cancelled. Check with
+  `npx --no -- commitlint -g commitlint.ci.config.mjs --from <sha> --to origin/main`.
+
+  Two non-conforming commits reached `main` after `commitlint.config.mjs` was
+  added and before this job (`c99f57d9`, a 126-character header; `c5252e68`, a
+  `merge:` type). The same command from the commit that added this job shows
+  whether anything has slipped through since.
+- Hard-`needs`-ed by `pipeline-gate` and on the shared gate rules, so it runs on
+  every non-scheduled pipeline. Behavioural tests: `tests/ci/commitlint.test.mjs`
+  (they execute the committed script block against temp git repos).
+
+## `pipeline-gate` — the fan-in job
+
+The last stage holds one job that depends on every blocking gate. It exists
+because until #933 nothing depended on anything: a gate could be deleted, or
+ruled out for a whole pipeline type, and the pipeline still went green.
+
+Two mechanisms, because "the gate is gone" and "the gate ran but verified
+nothing" are different failures:
+
+1. **Hard `needs:`** on every gate that runs on all non-scheduled pipelines.
+   On GitLab 18.11, needing a job that is absent from the pipeline is a
+   pipeline-*creation* error, not a silent skip (verified via
+   `POST /projects/74/ci/lint` with `dry_run`). Removing a gate from
+   `.gitlab-ci.yml` therefore produces no pipeline at all instead of a green
+   one — which is exactly the alarm we want, so these needs are intentionally
+   **not** `optional`.
+2. **Marker artifacts** for the two conditional jobs, `coverage` and
+   `schema-drift-check`. Each writes `.ci-markers/<name>.ok` as the final line
+   of its script, so the marker is reachable only from the path where the job
+   really verified something. `pipeline-gate` reads those markers and prints one
+   line per gate. This is what catches an amber `schema-drift-check`: an
+   `allow_failure` job never blocks a dependent job, so `needs:` alone is blind
+   to it.
+
+`coverage` runs only on the default branch (`main`). It is the most expensive
+job and re-runs a suite `test` has already run: across 14 MR pipelines
+(2026-09-27..29) it took 5.0 to 12.9 min, median 6.6 min, 29% of the MR job
+minutes (measured 2026-09-29 13:24 CEST). `pipeline-gate` requires
+`.ci-markers/coverage.ok` when `CI_COMMIT_BRANCH` is the default branch (push,
+web and api pipelines alike); on every MR and branch pipeline it prints
+`coverage: NOT MEASURED here` — absent, but never silently absent.
+
+Consequence: an MR no longer gets the thresholds (70/70/70/60, set in the
+vitest configuration) nor a second, instrumented full-suite run; both fire
+after the merge, so a coverage regression turns `main` red, not the MR. The
+MR page also loses its coverage percentage. The second run has caught things
+before: in the failed-job history (measured 2026-09-29, oldest 2026-05-11) 3 of
+14 failed `coverage` jobs were in MR pipelines, each with every `test` shard
+green. Revisit trigger: a `main` coverage failure whose MR pipeline was green,
+or a switch to measuring coverage inside the three `test` shards with
+`vitest --merge-reports`.
+
+## Pre-push full gate
+
+`.husky/pre-push` runs `npm run quality-gate`
+(`scripts/run-quality-gate.mjs --variant full-gate`: typecheck + full vitest
+suite + lint) and blocks the push on any non-zero exit.
+
+- `full-gate` is used because it is the only **blocking** variant — the
+  `incremental` handler ends in an unconditional `process.exit(0)` and reports
+  rather than gates.
+- Delete-only pushes skip the gate (no code ships).
+- `SKIP_QUALITY_GATE=1 git push` is the named bypass. Prefer it over
+  `git push --no-verify`, which disables every hook silently and leaves no
+  record of what was skipped.
+
+The hook materialises the pushed commit in an isolated tracked checkout, so
+uncommitted, untracked and gitignored source files cannot make the pushed tree
+pass. One push is gated as exactly one commit (#1787): refs that peel to the
+same commit (a branch and its tag, lightweight or annotated) are gated once; a
+push whose refs point at more than one commit is blocked, and each commit has
+to be pushed on its own. Failure to materialise the commit blocks the push.
+
+### Remote routing (#1532)
+
+Remote execution requires `offload` on the local PATH and a reachable host listed
+in the pushed tree's Session Config `remote-hosts` block with `test` in
+`roles-allowed`. For example, using an SSH alias configured on your machine:
+
+```yaml
+remote-hosts:
+  - alias: gate-host
+    roles-allowed: [test]
+```
+
+The router tries eligible aliases in configuration order, checking each with
+`offload doctor -H <alias> --brief --no-probe`. The alias selects a gate execution
+host; it is independent of the Git remote being pushed to. With no eligible
+host, no `offload` executable, or unavailable remote readiness/transport, the
+hook falls back locally. A classified transport failure can first try the next
+configured host.
+
+The local fallback depends on the push target (#1642):
+
+- **A branch other than `main` on `origin`** (by remote name or its exact push
+  URL) takes the local **partial** gate, `scripts/lib/pre-push-local-partial.mjs`.
+  It computes the files changed since the merge-base with origin's default
+  branch and runs `node --check` and ESLint on the changed source files, plus
+  `vitest related --run` for all changed files. A red check blocks the push. The
+  full suite then runs in the MR pipeline on the pushed head SHA.
+- **Everything else** (any push that includes `main` or a tag — every pushed ref counts, not only the first — the GitHub mirror, a push
+  by URL to another host, a hand invocation without a remote) runs the full
+  gate locally. No MR pipeline stands between those pushes and their result.
+- The partial gate exits 10 and hands over to the full local gate when there is
+  no merge-base, when a source file was deleted or renamed, when `package.json`, `package-lock.json`, `vitest.config.*` or
+  `eslint.config.*` changed, or when `eslint`/`vitest` is missing from
+  `node_modules` (fail-closed). Its ledger event is
+  `orchestrator.quality_gate.{passed,failed}` with `variant: 'local-partial'`.
+- Ceiling: `vitest related` follows the import graph. A test that reaches a
+  changed file only by spawning it (hooks, `.husky/`, CLIs) or by reading it
+  from disk (policy JSON, Markdown, fixtures; edited or deleted) is not
+  selected locally, and the MR pipeline catches that class. Only a deleted or
+  renamed source file (`.mjs`/`.cjs`/`.js`) falls back to the full gate (#1643).
+
+Without an override the router picks the gate host by load (#2173). The
+candidates are the Session Config `remote-hosts` entries whose `roles-allowed`
+include `test`, in listed order. For each one it reads
+`offload status -H <alias> --json` and takes the first host that has a free
+`gate` slot (`klassen.gate.frei > 0`) and whose `last_5` is below its own
+`batch_last_max`. That host moves to the front, and the others stay behind it
+as fall-through routes. If no host qualifies, or the probe cannot measure one
+(timeout, no JSON, a `grund`, `null` values), the configured order stays as it
+is and one stderr line names each host's state. An unmeasurable probe never
+blocks a push. When a remote check hits its deadline, the failure line names
+`SO_GATE_HOSTS=<alias> git push` as the retry on a less loaded host. The
+threshold is offload's batch admission limit, because `status` reports no
+gate-specific load limit. offload itself admits a gate by `cpu_idle`.
+
+`SO_GATE_HOSTS` overrides the host order for one push without a config commit:
+`SO_GATE_HOSTS=hostA,hostB git push` tries exactly those aliases, in that order,
+instead of the configured `remote-hosts` list (whitespace-only counts as unset).
+Every alias must have a regular file `<alias>.env` in offload's host registry
+(`${OFFLOAD_CONFIG_DIR:-$HOME/.config/remote-offload}/hosts/`, the same rule
+`offload -H` uses) and match `^[A-Za-z0-9._-]+$`. An unknown or invalid alias,
+or an override none of whose hosts can run the gate (not ready, transport
+failure, no `offload`), blocks the push with exit 2 and does **not** fall back
+to the local gate. The router logs the chosen host and its source (`config`,
+`override`, or `fallback` to local) on stderr, and the remote gate's ledger
+event carries `host` and `host_source`.
+
+On the remote checkout, the command checks out the pushed SHA again, verifies
+`HEAD` and a clean source tree, and runs `npm run --silent quality-gate`.
+Acceptance requires a nonce-bound receipt for that SHA, successful command
+exits, and the canonical `full-gate` JSON report with no stubbed checks: tests
+must pass without failures, suite death or timeout; typecheck and lint must
+report `pass` or an explicitly configured `skip` without a timeout. A gate failure or an unconfirmed result
+blocks the push; it does not trigger a local retry that could hide the failure.
+
+Linked worktrees retain their main repository's basename and original Git
+remote URL in the isolated checkout. Offload 1.5.1 resolves an external temp
+checkout by basename; it has no explicit repository-mapping option. Nested
+`Ventures/org` layouts therefore do not retain their full host path mapping,
+and repositories with the same basename can collide. The gate still verifies
+the exact pushed commit; remote setup failures use the fallback above.
+
+The local router records the remote verdict in the originating repository's
+`orchestrator.quality_gate.passed` or `.failed` event, with `remote_host`,
+`pushed_sha` and available canonical suite counts. Logs identify the chosen
+route and fallback reason. This verifies the pushed commit before publication;
+CI status remains a separate check on the published SHA.

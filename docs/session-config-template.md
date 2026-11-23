@@ -1,0 +1,1168 @@
+# Session Config Template (Baseline)
+
+> Project-instruction file: this lives under `## Session Config` in CLAUDE.md (Claude Code / Cursor) or AGENTS.md (Codex CLI). See [skills/_shared/instruction-file-resolution.md](../skills/_shared/instruction-file-resolution.md) for the alias resolution rule.
+
+> Canonical field reference (types, defaults, edge cases): [docs/session-config-reference.md](./session-config-reference.md). This template is the **adopter-facing** companion: copy-paste blocks plus a structural walk-through of every field.
+
+## How to use this template
+
+1. Pick the host file: `CLAUDE.md (or AGENTS.md on Codex CLI)`. Never both.
+2. Add a single `## Session Config` H2. The header must match exactly — `skills/_shared/config-reading.md` parses the block under that heading.
+3. Start from the [Starter config](#starter-config-copy-paste) directly below. Add opt-in blocks one at a time as you adopt features; the [Full opt-in baseline](#full-opt-in-baseline-copy-paste) near the end shows every block at once.
+4. Run `/bootstrap --retroactive` to schema-validate the result.
+5. Validate at any time with `node scripts/parse-config.mjs --json`.
+
+The format is the same on every platform. A top-level key this template does not list has no effect, so `node scripts/parse-config.mjs` reports it on stderr with file, line and key — a typo, or a key from a newer plugin version. The report appears under `enforcement: warn` and `strict` and never refuses the run; `enforcement: off` silences it.
+
+## Starter config (copy-paste)
+
+The smallest valid Session Config — passes `validate-config` without warnings on a typical Node/TS repo:
+
+```yaml
+## Session Config
+
+test-command: npm test
+typecheck-command: npm run typecheck
+lint-command: npm run lint
+agents-per-wave: 6
+waves: 5
+persistence: true
+enforcement: warn
+```
+
+That's enough for `/session feature` → `/go` → `/close` to work end-to-end. Every other field falls back to documented defaults.
+
+## Where this file lives
+
+The session-orchestrator plugin reads its Session Config from the per-repo project-instruction file. Exactly which file it picks depends on the platform:
+
+### CLAUDE.md (Claude Code, Cursor IDE)
+
+Claude Code and Cursor IDE both read `CLAUDE.md` natively. Add the `## Session Config` H2 anywhere in that file.
+
+### AGENTS.md (Codex CLI)
+
+Codex CLI uses `AGENTS.md` as its canonical instruction file. Same `## Session Config` H2, same field set.
+
+The plugin resolves the file via [`scripts/lib/common.mjs::resolveInstructionFile`](../scripts/lib/common.mjs); the rule is documented in [`skills/_shared/instruction-file-resolution.md`](../skills/_shared/instruction-file-resolution.md). `CLAUDE.md` always wins ties when both files exist.
+
+## Mandatory fields (schema-validated)
+
+These seven fields are enforced by `scripts/lib/config-schema.mjs`. Validation is gated by the `enforcement` field itself: `off` skips, `warn` reports + emits, `strict` reports + exits 1.
+
+```yaml
+test-command: npm test                # non-empty string — quality-gate test runner
+typecheck-command: npm run typecheck   # non-empty string — canonical typecheck runner
+lint-command: npm run lint             # non-empty string — Full Gate lint runner
+agents-per-wave: 6                     # integer ≥ 2 (or { default: 6, deep: 18 }) — see § Session Structure
+waves: 5                               # integer ≥ 3 — base count; actual wave count is resolved per session type by `scripts/session-shape.mjs`
+persistence: true                      # boolean — STATE.md + memory file resumption
+enforcement: warn                      # strict | warn | off — hook strictness AND validator gate
+```
+
+Read by: `scripts/parse-config.mjs`, `scripts/validate-config.mjs`, `skills/_shared/config-reading.md`, every quality-gate skill.
+
+## Session Structure
+
+Controls wave count, parallelism, and freeform per-repo notes the orchestrator must follow.
+
+```yaml
+agents-per-wave: 6                     # integer or "6 (deep: 18)" override syntax
+waves: 5                               # integer ≥ 3 — base count only; resolved shape may ignore it (see below)
+recent-commits: 20                     # how many commits to display at session-start
+special: "any repo-specific instructions"   # freeform — orchestrator reads + obeys
+```
+
+Read by: `skills/session-start/SKILL.md` (Phase 4.5), `skills/session-plan/SKILL.md`, `skills/wave-executor/wave-loop.md`.
+
+**Wave count, roles and per-wave agent caps are resolved by `scripts/session-shape.mjs`, not derived from `waves` by hand.** Housekeeping is always 1 coordinator-direct maintenance-loop wave; feature is 3 waves (Impl-Core / Impl-Polish+Quality / Finalization); deep is 5 waves (4 when the scope is already known — Discovery is dropped); the `ultradeep` profile is a fixed 7-wave shape that IGNORES `waves` entirely (`wavesConfigHonored: false`). `agents-per-wave` resolves via `resolveAgentCap()` in the same module. Full table: [`session-config-reference.md` § Session Shapes](./session-config-reference.md#session-shapes).
+
+**The override key set is open.** `_coerceInteger` (`scripts/lib/config/coercers.mjs`) parses whatever keys stand inside the parentheses, so `agents-per-wave: 6 (deep: 18, ultradeep: 18)` is valid today with no code change — it yields `{"default": 6, "deep": 18, "ultradeep": 18}`.
+
+**`session-profile` is NOT a Session Config key — do not add one here.** The wave-shape profile (`ultradeep`) lives in STATE.md frontmatter, written per session by the `/session ultradeep` argument alias, and is absent by default. `parseSessionConfig()` emits no such key, so writing one into a repo's `## Session Config` block is inert prose — the same trap as `session-type:`. Full contract: [`session-config-reference.md` § Session Profile](./session-config-reference.md). The PRD's `ultradeep.max-*` budget block is deliberately NOT implemented and no key of that name is read anywhere (deferred until measured, HR-105).
+
+## VCS & Infrastructure
+
+```yaml
+vcs: gitlab                            # github | gitlab — auto-detected from remote when unset
+gitlab-host: gitlab.example.com        # only if remote URL doesn't expose it
+mirror: github                         # session-end pushes to the `github` remote (none | github | curated; absent = push if remote exists; curated = public snapshot via scripts/github-export.mjs)
+cross-repos: [related-repo-1]          # bare name → ~/Projects/<name>; `/` or `~/` = path; rule: session-config-reference.md § cross-repos
+pencil: path/to/design.pen             # design-code alignment input
+ecosystem-health: true                 # toggle health-endpoint probes
+health-endpoints:                      # nested block form — content-scoped parse, see reference doc (#1174)
+  - { name: API, url: https://api.example.com/health }
+issue-limit: 50                        # max issues fetched at session-start
+stale-branch-days: 7                   # branch-age threshold for stale flag
+stale-issue-days: 30                   # issue-age threshold for triage flag
+```
+
+Read by: `skills/session-start/SKILL.md`, `skills/ecosystem-health/SKILL.md`, `skills/gitlab-ops/SKILL.md`.
+
+## Auto-Skill Dispatch
+
+```yaml
+auto-skill-dispatch: false             # opt-in; phrase-match meta-skill — see skills/using-orchestrator/SKILL.md
+```
+
+Top-level scalar (not nested). When `true`, entry-point skills invoke `skills/using-orchestrator/SKILL.md` once before their own Phase 1 to detect implicit slash-command intent in the user's first message (bilingual EN/DE phrase map, confidence-scored, AUQ-disambiguated on close ties). Default `false` — zero behavior change until opted in.
+
+Read by: `skills/using-orchestrator/SKILL.md`, `skills/_shared/bootstrap-gate.md`.
+
+## Quality Gates
+
+```yaml
+test-command: npm test                 # mandatory
+typecheck-command: npm run typecheck   # mandatory; `skip` for non-TS projects
+lint-command: npm run lint             # mandatory
+ssot-files: [STATUS.md, STATE.md]      # files watched for staleness
+ssot-freshness-days: 5                 # days before SSOT flagged
+plugin-freshness-days: 30              # days before the plugin itself flagged
+```
+
+Read by: `skills/quality-gates/SKILL.md`, `skills/session-end/SKILL.md`. The three `*-command` fields are overridden by `.orchestrator/policy/quality-gates.json` when that file exists (#183).
+
+## Discovery
+
+```yaml
+discovery-on-close: auto               # auto = true for every session type (was housekeeping=false until 2026-07-29)
+discovery-probes: [all]                # all | code | infra | ui | arch | session | audit | vault | feature
+discovery-exclude-paths: []            # globs (e.g. "vendor/**", "dist/**")
+discovery-severity-threshold: low      # critical | high | medium | low
+discovery-confidence-threshold: 60     # 0–100; below this auto-defers
+discovery-parallelism: 5               # 1..16 probe agents in parallel
+```
+
+Read by: `skills/discovery/SKILL.md` and the probe modules under `skills/discovery/probes-*.md`.
+
+## Issue Budget
+
+```yaml
+issue-budget:
+  max-per-session: 12                  # non-exempt issues one session may create (0 = block all)
+  mode: strict                         # strict | warn | off
+  overflow: collect-issue              # collect-issue | vault-note
+```
+
+Quantity cap, not a quality filter — `discovery-*-threshold` above cannot bound creation volume. `priority::critical`, the carryover class and `broken-window` issues are exempt. Read by: `hooks/pre-bash-issue-budget.mjs`, `scripts/lib/spiral-carryover.mjs`, `skills/session-end/SKILL.md` Phase 5 Step 3b.
+
+## Persistence & Safety
+
+```yaml
+persistence: true                      # mandatory
+memory-cleanup-threshold: 5            # recommend /memory-cleanup after N memory files
+memory-cleanup-soft-limit: 180         # hard ceiling on memory file count before nudge (#502)
+learning-expiry-days: 30               # learnings auto-expire after N days untouched
+learnings-surface-top-n: 15            # how many learnings appear in Project Intelligence
+learning-decay-rate: 0.05              # 0.0..<1.0 untouched-learning confidence decay
+enforcement: warn                      # mandatory; strict | warn | off
+enforcement-gates:
+  path-guard: true
+  command-guard: true
+  post-edit-validate: true
+  bash-write-verify: true              # PostToolUse/Bash working-tree diff, warn-only (#915)
+  # bash-write-guard: true             # ⚠ INVERTED DEFAULT — this is the ONE gate that is
+                                       #   OFF when the key is absent. Every other key above
+                                       #   means "enabled unless set to false"; this one runs
+                                       #   only on a literal `true`. Leaving it out does NOT
+                                       #   leave Bash writes guarded (#800/#915).
+allow-destructive-ops: false           # INERT since #2089 (ignored with a warning); relax via SO_HOOK_PROFILE / owner.yaml hooks.profile
+reasoning-output: false                # opt-in STATE:/PLAN: agent transparency markers
+grounding-check: true                  # session-end Phase 1.1a planned-vs-touched diff
+grounding-injection-max-files: 3       # 0 disables (#85)
+isolation: auto                        # worktree | none | auto (graduated default #194)
+max-turns: auto                        # per session shape (scripts/lib/session-shape.mjs): 8/15/25; ultradeep is per-wave 40/25/15
+auto-commit-per-wave: false            # opt-in: commit after each wave's Quality-Lite PASS (default false; V3.6 plumbing)
+```
+
+Read by: `skills/session-start/SKILL.md`, `skills/session-end/SKILL.md`, `hooks/pre-edit-scope.mjs`, `hooks/pre-bash-destructive-guard.mjs`, `hooks/pre-bash-enforce-commands.mjs`, `hooks/post-edit-validate.mjs`, `hooks/post-bash-write-verify.mjs`.
+
+> **The `bash-write-guard` gate is the single inverted default in this block.** `hooks/enforce-commands.mjs` runs it only when `gates['bash-write-guard'] === true` is set literally; a missing key means the gate is OFF, unlike `path-guard`/`command-guard`/`post-edit-validate`/`bash-write-verify`, where a missing key means ON. Assuming otherwise is exactly the gap #915 was filed for — `hooks/enforce-scope.mjs` gates only `Edit`/`Write`/`MultiEdit`, so with `bash-write-guard` off nothing pre-checks the path of a `echo x > out-of-scope.mjs`. Full rationale (including the measured false-positive rate that justifies keeping it opt-in) in `docs/session-config-reference.md` § enforcement-gates.
+
+## Resource Awareness (env-aware)
+
+Introduced by Epic #157. Lets session-start sense host RAM/CPU/SSH/peers and adapt wave planning. Safe to omit — defaults are conservative.
+
+```yaml
+resource-awareness: true               # master toggle for env-aware runtime
+enable-host-banner: true               # emit host + resource banner at session-start
+resource-thresholds:
+  ram-free-min-gb: 4                   # below: cap agents-per-wave at 2
+  ram-free-critical-gb: 2              # below: recommend coordinator-direct
+  cpu-load-max-pct: 80                 # sustained above: cap agents-per-wave at 2
+  concurrent-sessions-warn: 5          # report-only: names peer sessions, never caps (#1654)
+  ssh-no-docker: true                  # SSH session: avoid Docker-based tests
+  zombie-threshold-min: 30             # min idle time before stale-process flag (#178)
+```
+
+Read by: `hooks/on-session-start.mjs`, `scripts/lib/resource-probe.mjs`, `scripts/lib/wave-sizing.mjs`.
+
+## Planning
+
+```yaml
+baseline-ref: null                     # git ref on baseline project (or null = legacy MR sync)
+baseline-project-id: "52"              # GitLab project ID of baseline (default: infrastructure/projects-baseline)
+plan-baseline-path: ~/Projects/projects-baseline   # optional local baseline clone for /plan new (unset = bundled templates)
+plan-default-visibility: internal      # internal | private | public — for /plan new
+plan-prd-location: docs/prd            # PRD output directory
+plan-retro-location: docs/retro        # retro output directory
+```
+
+Read by: `skills/plan/SKILL.md` and the three plan modes (`mode-new`, `mode-feature`, `mode-retro`).
+
+## Vault Sync
+
+Quality gate at session-end Phase 2 that validates YAML frontmatter against `vaultFrontmatterSchema` and flags dangling wiki-links. Opt-in.
+
+```yaml
+vault-sync:
+  enabled: false                       # opt-in
+  mode: warn                           # warn | hard | off — `hard` blocks session close
+  vault-dir: .                         # absolute or repo-relative
+  exclude:
+    - "**/_MOC.md"
+    - "**/_overview.md"
+    - "**/README.md"
+```
+
+Read by: `skills/vault-sync/SKILL.md` + `skills/vault-sync/validator.mjs`.
+
+## Vault Integration
+
+Auto-sync that writes learnings + session summaries into a Meta-Vault after each session, and (with `--session-id`) auto-commits the result.
+
+```yaml
+vault-integration:
+  enabled: false                       # opt-in
+  vault-dir: ~/Projects/vault          # absolute path to vault repo
+  mode: warn                           # warn | strict | off
+  vault-name:                          # optional (#660) — overrides git-derived repo slug for per-project vault namespacing; null/absent → deriveRepo()
+  gitlab-groups:                       # optional — for /plan retro vault-backfill sub-mode
+    - infrastructure
+    - clients
+  briefing-search: false               # optional (#2169) — session-start vault pointers (candidates) via vault-search
+```
+
+Read by: `scripts/vault-mirror.mjs`, `scripts/vault-backfill.mjs`, `scripts/print-vault-pointers.mjs` (`briefing-search`), `skills/session-end/session-metrics-write.md`, `skills/evolve/SKILL.md`, `skills/plan/mode-retro.md`.
+
+> **Host-local override (#653).** `vault-dir` (and `plan-baseline-path`) resolve host-locally with precedence: env-var (`SO_VAULT_DIR` / `SO_BASELINE_PATH`) > `owner.yaml` `paths:` section (`vault-dir` / `baseline-path`) > the committed default shown above. This keeps maintainer-specific absolute paths out of version control. Resolver: `scripts/lib/config/host-paths.mjs`.
+
+## Vault Mirror Quality
+
+Quality thresholds applied by `scripts/vault-mirror.mjs` before mirroring a learning or session note to the Meta-Vault. Notes below the thresholds are skipped (not an error). PRD F1.2 / issue #504.
+
+```yaml
+vault-mirror:
+  quality:
+    min-narrative-chars: 400           # integer ≥ 0 — minimum session free text (notes/narrative/summary) for an own note; below → month rollup (#1513)
+    min-confidence: 0.5                # float 0.0..1.0 — minimum learning confidence to mirror
+```
+
+Read by: `scripts/vault-mirror.mjs`.
+
+## Cold Start
+
+Cold-start detector that nudges the operator when sessions go silent (no commits, no learnings, long wall-clock idle). PRD F1.3 / issue #500.
+
+```yaml
+cold-start:
+  enabled: true                        # opt-out master toggle; default true
+  nudge-after-hours: 1                 # integer ≥ 0 — hours of wall-clock idle before nudge
+  silence-after-sessions: 1            # integer ≥ 0 — consecutive silent sessions before nudge
+```
+
+Read by: `scripts/lib/cold-start-detector.mjs`.
+
+## Memory Banner
+
+Controls the session-start "📚 Loaded from memory" banner that surfaces top learnings and peer-card excerpts at the start of every session. PRD F2.3 / issue #505.
+
+```yaml
+memory:
+  banner:
+    enabled: true                # PRD F2.3 (#505) — silence the session-start "📚 Loaded from memory" banner when false
+```
+
+Read by: `scripts/lib/config/memory.mjs`; consumed in Phase 6.7 of `skills/session-start/SKILL.md`.
+
+## Memory Proposals (#501)
+
+Agent-writable memory tool. During a wave, an agent may call `node scripts/memory-propose.mjs --type … --subject … --insight … --evidence … --confidence …` to queue a learning proposal. At session-end Phase 3.6.3, the coordinator surfaces queued proposals via `AskUserQuestion` for accept/reject/edit. PRD F2.1 / issue #501.
+
+```yaml
+memory:
+  proposals:
+    enabled: true                # PRD F2.1 (#501) — agent-writable memory tool; gates the propose() CLI + session-end AUQ
+    quota-per-wave: 5            # max proposals one agent can queue per wave (exit 1 / quota-exceeded when exceeded)
+    confidence-floor: 0.5        # proposals below this are rejected (exit 2 / rejected-low-confidence)
+```
+
+Agents invoke via `SO_WAVE_AGENT=1 node scripts/memory-propose.mjs …`. The `SO_WAVE_AGENT=1` env-var is set automatically by the wave-executor boilerplate; direct CLI calls without it exit `3` (`rejected-wrong-context`).
+
+Read by: `scripts/lib/memory-proposals/{schema,store,collector,sink}.mjs`, `scripts/memory-propose.mjs`, `docs/memory-proposal-flow.md`, `hooks/pre-bash-memory-propose-audit.mjs`, `skills/session-end/SKILL.md` Phase 3.6.3.
+
+## Auto-Dream Proposal Filter (#566)
+
+Collect-emit confidence floor applied at session-end Phase 3.6.3 by `collectProposals()` (`scripts/lib/memory-proposals/collector.mjs`). This is a SECOND gate above the write-time `memory.proposals.confidence-floor` enforced by `scripts/memory-propose.mjs`: the per-record write-floor runs first when an agent calls the CLI; the collect-emit floor here filters what surfaces to the operator's AUQ at session-end. Issue #566.
+
+```yaml
+auto-dream:
+  min-confidence: 0.5                  # float 0.0..1.0 — collect-emit floor for proposals surfaced to AUQ
+```
+
+Read by: `scripts/lib/config/auto-dream.mjs` (parser), `scripts/lib/memory-proposals/collector.mjs` (filter applied at session-end Phase 3.6.3 inside `collectProposals()`).
+
+## STATE.md Lock
+
+Mechanical write-lock around STATE.md to prevent race conditions between parallel worker sessions writing the same file (PRD gsd Pattern 1 / issue #518). When enabled, `withStateMdLock(fn)` acquires `.orchestrator/state.lock` before invoking `fn` and releases on completion or throw. Stale-lock override via PID-liveness mirrors the existing `session.lock` design.
+
+```yaml
+state-md-lock:
+  enabled: true                        # default true; mechanical guard against PSA-003/PSA-004 violations
+  timeout-ms: 10000                    # integer ≥ 0 — acquire timeout in milliseconds
+```
+
+Read by: `scripts/lib/session-lock.mjs` (new `acquireStateLock`/`releaseStateLock`/`withStateMdLock` helpers), every STATE.md writer under `scripts/lib/state-md/`.
+
+## Handover Alignment Gate
+
+Interactive gate in `/close` (session-end) that surfaces open questions before carryover issues are filed — giving the operator a chance to align on scope/expectations before the session's incomplete work is handed off (issue #769). Fail-open by design: the gate is skipped entirely when disabled, when running headless, or under `/autopilot` — it never blocks an unattended run.
+
+```yaml
+handover-gate:
+  enabled: true                  # default true; skips when disabled/headless/autopilot (fail-open)
+  max-open-questions: 3          # integer ≥ 0 — max open questions surfaced in the gate's triage AUQ (0 = none; channel stays active)
+```
+
+Read by: `scripts/lib/config/handover-gate.mjs`, `skills/session-end/SKILL.md` Phase 1.65.
+
+## Context Threshold
+
+`PostToolUse` hook that reads the session's own context size from its transcript (`input_tokens + cache_read_input_tokens + cache_creation_input_tokens` of the last main-chain assistant line; with `usage.iterations` the last iteration of type `message`, never an `advisor_message`, #2112) and injects one hint at `prepare-k` („Übergabe-Datei vorbereiten, keine neue Welle mehr beginnen“) and one at `handover-k` („am nächsten MR-Schnitt übergeben“). Values in thousands of tokens. Warn-only; an unmeasurable context stays silent and is reported as „nicht messbar“ (issue #1960).
+
+```yaml
+context-threshold:
+  enabled: true                  # default true; profile-gate also applies
+  prepare-k: 700                 # thousand tokens — prepare the handover, start no new wave
+  handover-k: 800                # thousand tokens — hand over at the next MR cut (must exceed prepare-k)
+```
+
+Read by: `scripts/lib/config/context-threshold.mjs`, `hooks/post-tool-context-threshold.mjs`.
+
+## Agent Caps
+
+How many agents a session may run at once, and when a low-memory brake stops new ones. Leave it out to keep the defaults. Details: [session-config-reference § Agent Caps](session-config-reference.md#agent-caps).
+
+```yaml
+agent-caps:
+  process-starting: 6            # agents that can edit files; a number from 1, or off
+  reading: 6                     # read-only agents; a number from 1, or off
+  brake-engage-pct: 15           # no new process-starting agent below this % free memory; 1 to 99, or off
+  brake-release-pct: 20          # brake lets go above this %; 1 to 99, not below brake-engage-pct
+```
+
+Read by: `scripts/lib/config/agent-caps.mjs`, `hooks/pre-agent-cap.mjs`.
+
+## Broken-Window Budget
+
+Opt-in gate in `/close` (session-end Phase 2.6). When enabled, it aggregates THIS session's "knowingly-broken shipments" (echo-stubs shipped under `enforcement: warn`, Phase 2.3/2.5 "Override and close" choices, MED/LOW findings routed to "Unresolved Review Findings", wave-level overridden findings) and files ONE hard-terminated closure issue per item (labels `broken-window` + `priority::high`, hard due-date). Non-blocking and idempotent (issue #730, Epic H / H5).
+
+```yaml
+broken-window-budget:
+  enabled: false                 # opt-in; session-end Phase 2.6 files hard-due-date closure issues for knowingly-broken shipments
+  due-days: 7                    # integer ≥ 1 — hard due-date horizon (glab native --due-date; gh Due: <date> body line)
+```
+
+Read by: `scripts/lib/config/broken-window.mjs`, `skills/session-end/SKILL.md` Phase 2.6.
+
+## Slopcheck (Package Legitimacy Gate)
+
+Opt-in defense against LLM-hallucinated package names ("slopsquatting"). When enabled, `classifyPackages(pkgs)` consults the registry and returns `LEGITIMATE` / `ASSUMED` / `SUS` / `SLOP` per package. Hooked into `/plan` PRD generation and `/discovery` supply-chain probes. PRD gsd Pattern 2 / issue #520.
+
+```yaml
+slopcheck:
+  enabled: false                       # opt-in; defaults to off so existing sessions are unaffected
+  sources: [plan, discovery]           # array of "plan" | "discovery" — where classifyPackages is invoked
+```
+
+Read by: `scripts/lib/slopcheck.mjs` (Wave 3 module — `classifyPackages`), `skills/plan/SKILL.md` Phase 3.5, `skills/discovery/probes/supply-chain-slopcheck.mjs`.
+
+## Templates-First Hook
+
+PreToolUse `Bash` hook that blocks `gh|glab pr|mr|issue create` calls unless the matching repo template (`.github/PULL_REQUEST_TEMPLATE*`, `.github/ISSUE_TEMPLATE*`, `.gitlab/merge_request_templates/*`, `.gitlab/issue_templates/*`) was Read in the current session. Per-session acknowledgement via `.orchestrator/runtime/templates-acknowledged.json`. PRD gsd Pattern 3 / issue #519.
+
+```yaml
+templates-first:
+  enabled: true                        # default true; mechanical replacement for gitlab-ops template advice
+  hosts: [github, gitlab]              # array of "github" | "gitlab" — host allow-list
+```
+
+Read by: `hooks/pre-bash-templates-first.mjs`, `.orchestrator/policy/templates-policy.json`.
+
+## Verification Auto-Fix Loop
+
+Opt-in retry loop that dispatches a `code-implementer` fixer-agent after an inter-wave Quality-Gate failure, supplying failure output + `corrective_context` + changed file paths. Bounded by `max-retries` (default 2). When disabled (default), an Incremental gate failure becomes fix tasks for the next wave; the Full Gate after the Quality wave must pass (#2189). PRD gsd Pattern 4 / issue #521.
+
+```yaml
+verification-auto-fix:
+  enabled: false                       # opt-in; default false keeps fix-tasks-next-wave for Incremental failures
+  max-retries: 2                       # integer ≥ 0 — bounded fixer-agent retries before hard abort
+```
+
+Read by: `scripts/lib/quality-gate.mjs` (`runQualityGateWithRetry`), `skills/wave-executor/SKILL.md` inter-wave checkpoint.
+
+## Custom Phases (#637)
+
+Opt-in, repo-declared deterministic phases that run as their own phase during session close (and/or housekeeping). This is a **contract**, not a convention: each phase has a `command` executed via Bash with exit-code gating, plus summary reporting in the Final Report. Empty/absent ⇒ no custom phases run.
+
+```yaml
+custom-phases:
+  - name: eval-learn-aggregate         # required, non-empty, SAFE slug ([A-Za-z0-9._-])
+    when: housekeeping                  # housekeeping | session-end | both (default: session-end)
+    command: npm run eval:aggregate     # required; run verbatim — NO interpolation from records
+    mode: hard                          # warn | hard | off (default: warn)
+    review: docs/eval/last-run.md       # optional; SAFE-path; coordinator reads it after the command (default: null)
+```
+
+Field semantics:
+- **`when`** — `housekeeping` phases run only on housekeeping sessions; `session-end` (default) runs on every non-housekeeping session-type; `both` runs on all.
+- **`mode`** — `off` skips the phase; `warn` (default) runs + reports but never blocks; `hard` + non-zero exit code BLOCKS the close (AskUserQuestion: Fix / Override+log Deviation / Abort).
+- **`review`** — when set, the coordinator reads that file as a review step after the command completes.
+
+Security: `command` and `review` reject shell metacharacters; records failing validation (missing `name`/`command`, unsafe value) are dropped with a stderr WARN. Like `test-command`, a `command` is commit-gated and trusted under the same VCS-trust-anchor model — see `.claude/rules/quality-gates-autofix.md` § "Session Config Command Injection".
+
+Read by: `scripts/lib/config/custom-phases.mjs`, `skills/session-end/SKILL.md` Phase 2.5.
+
+## Remote Hosts (#1160)
+
+Opt-in declaration of ssh-reachable hosts that heavy wave roles may be OFFLOADED to instead of shrinking the wave under local resource pressure. Declaring a host does not enable anything by itself: the wave resource gate only routes a wave to a host when the wave role is offloadable AND the coordinator supplies a readiness witness. Absent/empty ⇒ `[]` ⇒ everything runs locally, exactly as before.
+
+```yaml
+remote-hosts:
+  - alias: build-host                  # required, SAFE slug ([A-Za-z0-9._-]); reaches argv as `-H <alias>`
+    roles-allowed: [test, ui, perf]    # subset of test|ui|perf (default: all three)
+    repo-path: ~/Projects/Alice     # optional SAFE path (default: null)
+    claude-path: ~/.local/bin/claude   # optional SAFE path (default: null)
+```
+
+Field semantics:
+- **`alias`** — the ssh destination as configured on this host. Required; a record without it is dropped with a stderr WARN.
+- **`roles-allowed`** — the `agent-mapping` roles this host accepts. `test`, `ui` and `perf` only — impl, db, security, compliance and docs work never leaves the local host. Unknown entries are filtered with a WARN; a record left with an empty list is dropped.
+- **`repo-path` / `claude-path`** — where the checkout and the `claude` binary live on the remote host, when they differ from the defaults the dispatch adapter assumes.
+
+A declared alias is also what an `agent-mapping` value of the form `<role>: ssh:<alias>` is validated against — naming an undeclared host is a parse error, not a runtime surprise.
+
+The gate never probes the network. Without a readiness witness no host counts as ready and the decision stays local (fail toward local).
+
+Read by: `scripts/lib/config/remote-hosts.mjs`, `scripts/lib/wave-resource-gate.mjs`.
+
+`offload-first` (#1465) makes placement the first choice instead of the answer to pressure: with `true`, an offloadable role (`test` / `ui` / `perf`) goes to the first witnessed-ready declared host even when the gate verdict is `proceed`. It needs both a `remote-hosts` entry and a readiness witness to act; without them the wave stays local and the gate names the reason.
+
+```yaml
+offload-first: false                   # true = offloadable roles go to a witnessed-ready remote host even on `proceed`
+```
+
+Read by: `scripts/lib/config.mjs`, `scripts/lib/config-schema.mjs`, `scripts/lib/wave-resource-gate.mjs`.
+
+## Evolve Extra Sources (#638)
+
+Opt-in EXTRA learning sources for `/evolve`. A domain measurement (e.g. an eval-learn harness) or owner-decision export runs OUT-OF-BAND and writes a sidecar JSON; `/evolve` then READS each declared sidecar and emits `domain-regression` candidates for persistent regression flags or `owner-preference` candidates for qualifying owner-decision patterns. `/evolve` NEVER runs the measurement itself — this is a strict read-only consumption contract. Absent/empty ⇒ `[]` ⇒ no extra sources are read.
+
+```yaml
+evolve:
+  extra-sources:
+    - path: eval/learn/reports/latest.json   # required; SAFE path (no shell metacharacters)
+      kind: regression-flags                  # enum: regression-flags | owner-decisions (unknown ⇒ entry dropped + WARN)
+      learning-type: domain-regression        # enum: domain-regression | owner-preference (unknown/crossed pair ⇒ entry dropped + WARN)
+```
+
+Field semantics:
+- **`path`** — repo-relative path to a sidecar JSON; absolute paths and `..` segments are rejected. Schema-gated against the selected kind (see `docs/session-config-reference.md` § Evolve Extra Sources). An unknown/missing sidecar schema ⇒ skip + WARN.
+- **`kind`** — selects the sidecar parser: `regression-flags` (default) or `owner-decisions`. An unknown value DROPS the entry with a stderr WARN (schema gate — `/evolve` never guesses a parser).
+- **`learning-type`** — stamps the emitted learning candidate; defaults by kind: `regression-flags` → `domain-regression`, `owner-decisions` → `owner-preference`. Unknown values and crossed pairs DROP the entry with a stderr WARN. Both types have a 60-day TTL; `owner-preference` is analyzer-only and excluded from `PROPOSAL_TYPES`.
+
+Security: `path` rejects shell metacharacters; confinement at the read sink is the path-traversal guard. Like all command/path-bearing config, changes are commit-gated under the VCS-trust-anchor model.
+
+Read by: `scripts/lib/config/evolve.mjs` (parser), `skills/evolve/SKILL.md` Step 3.1b (read + emit).
+
+## Reconcile Engine (#696 / #697)
+
+Opt-in config foundation for the FA3 (#696) advisory rule-proposal delivery at session-end Phase 3.6.8. When `enabled: true`, the session-end coordinator reads learning candidates from the reconcile engine (FA2 — `scripts/lib/reconcile/`) and surfaces approved rule proposals via `AskUserQuestion`. Rules are **never auto-applied** — every write is operator-AUQ-gated. The `mode: warn` default means proposals are surfaced as advisory banners; `mode: off` silences them entirely. The `rule-expiry-days` key defaults to `null` so the engine falls back to per-type TTL (default 60d in `emitter.mjs`); a non-null committed default would force flat expiry and change FA2 behaviour.
+
+```yaml
+reconcile:
+  enabled: false                 # opt-in; FA3 reads this to gate session-end Phase 3.6.8
+  mode: warn                     # off | warn — advisory only; rules NEVER auto-applied (#696)
+  targets: [repo-local]          # closed enum: repo-local = .claude/rules/ · baseline = <plan-baseline-path>/proposals/ (#1099)
+  rule-expiry-days: null         # null = per-type TTL (default 60d); set positive integer for flat override (#697)
+  confidence-floor: 0.5          # float 0.0..1.0 — min learning confidence for rule proposal eligibility
+  min-rule-days: 7               # #741.1 — floor for emitted rule expires-at: max(derived, now + N days); prevents born-dead rules
+  min-insight-chars: 24          # #741.2 — reject a learning whose trimmed insight is shorter than N chars before rule conversion
+```
+
+Field semantics:
+- **`enabled`** — master toggle. `false` (default) means session-end Phase 3.6.8 is a no-op.
+- **`mode`** — `warn` surfaces proposals as an advisory AUQ at session-end; `off` silences all output. No `strict` mode — rules are never auto-applied in v1.
+- **`targets`** — list of write locations for approved rules. `repo-local` writes to `.claude/rules/` in the current repo.
+- **`rule-expiry-days`** — `null` (default) lets the reconcile engine use per-type TTL (fragile-pattern=30d, anti-pattern=90d, etc.). A positive integer N uses the learning's `created_at` plus N days as the eligibility cutoff and as the basis for the generated rule's `expires-at`, subject to the `min-rule-days` floor on the emitted date.
+- **`confidence-floor`** — learnings below this confidence level are not eligible for rule proposals. Default 0.5 matches `memory.proposals.confidence-floor`.
+- **`min-rule-days`** — floor window (days) applied to a proposed rule's `expires-at` so a near-dead or already-elapsed natural expiry never produces a born-dead rule. Positive integer; malformed or ≤0 falls back to 7 (issue #741.1).
+- **`min-insight-chars`** — opt-in minimum insight length gating the eligibility placeholder-insight check; rejects a learning whose trimmed insight is shorter than N characters before rule conversion. Integer ≥ 0; `0` disables the check (issue #741.2).
+- **`targets`** — CLOSED enum, `repo-local` | `baseline` (issue #1099). `repo-local` writes `<repoRoot>/.claude/rules/<slug>.md`; `baseline` writes `<baselineRoot>/proposals/<slug>.md`, where `<baselineRoot>` is `plan-baseline-path` resolved host-locally (`SO_BASELINE_PATH` env > `owner.yaml` `paths.baseline-path` > committed value). Both are AUQ-gated and advisory — the baseline write commits nothing in that repo. An unknown member is dropped with a stderr WARN naming it and the valid set; `global` is documented-but-unimplemented and is NOT a member. A `baseline` target whose root is unresolvable, is still an `OVERRIDE-IN-…` placeholder, is not absolute, or does not exist on disk degrades to a no-op with a WARN — the root is never created.
+
+Read by: `scripts/lib/config/reconcile.mjs` (parser), `skills/session-end/SKILL.md` Phase 3.6.8 (FA3 delivery). FA2 engine: `scripts/lib/reconcile/`.
+
+## Discovery-Validator (PSA-006 Enforcement)
+
+Non-blocking `SubagentStop` hook that mechanically enforces PSA-006: distributional claims ("N of M", "100% of", "all N", "no remaining", "every X", "none of") in a subagent's transcript tail must carry an adjacent fenced grep/rg/find transcript. When a claim lacks one, the hook records a `discovery_validator_violation` event in `.orchestrator/metrics/events.jsonl` and emits a stderr WARN. v1 is log + warn only (exit 0 always — never blocks an agent) — a blocking hard-gate is reserved for a future iteration. OFF by default (opt-in). Issue #567; #690 flip reverted 2026-09-02 after fleet measurement.
+
+```yaml
+discovery-validator:
+  enabled: true                        # opt-in; hook is off unless this block sets it
+```
+
+Read by: `scripts/lib/config/discovery-validator.mjs`, `hooks/post-subagent-discovery-validator.mjs`.
+
+## Dialectic-Deriver
+
+Opt-in mode for `/evolve --dialectic` and session-end Phase 3.6.7 auto-trigger. When `cadence > 0`, session-end auto-dispatches `/evolve --dialectic --dry-run` after every N sessions to produce a proposed update to peer cards (#503). Set `cadence: 0` as a kill-switch to permanently disable auto-dispatch (manual `/evolve --dialectic` always works regardless). PRD F2.5 / issue #506.
+
+```yaml
+dialectic:
+  cadence: 5              # integer ≥ 0; 0 = kill-switch (no critique dispatches)
+  model: haiku            # haiku | sonnet | opus — fail-fast on unknown value
+  budget-tokens: 32000    # integer ≥ 0 — input token CEILING per critique call; the pre-dispatch estimate aborts above it
+```
+
+`32000` — card bodies + steering alone estimated ~12k tokens in this repo, a consumer repo measured 30,262 (2026-09-18); the value is a ceiling, the pre-dispatch estimate aborts above it.
+
+Read by: `scripts/lib/config/dialectic.mjs`, `scripts/lib/auto-dialectic.mjs`, `skills/session-end/SKILL.md` Phase 3.6.7, `skills/evolve/SKILL.md` Phase 6.
+
+## Eval (#803)
+
+Opt-in configuration for the Standard v1 evaluation harness and `/eval` (Session-Prozess-Eval); see `skills/eval/SKILL.md` for the current workflow.
+
+The original config proposal is in the archived PRD `docs/prd/2026-07-16-aiat-llm-eval.md` §S6 (Epic #803). <!-- path-check: historical -->
+
+```yaml
+eval:
+  enabled: false           # opt-in
+  mode: warn               # warn | off
+  judge: off               # off | haiku | sonnet
+  report: html             # html | none
+  handle:                  # optional string — null/absent → null
+```
+
+**Gotcha:** the `eval:` key-line itself must carry NO inline comment (strict `/^eval:\s*$/` block-open match — same restriction as `dialectic:` and `custom-phases:` above). A trailing `# comment` on that exact line silently disables the whole block; defaults apply with no warning.
+
+Read by: `scripts/lib/config/eval.mjs`. Skill consumer: `skills/eval/SKILL.md` (not yet shipped as of this parser).
+
+## Security-Delta (#1769)
+
+Opt-in close-time check of what THIS session changed (lockfiles vs OSV, Node security floors, floating image tags, gitleaks count, age-gate setting). Runs at session-end Phase 2.4. Default `off`.
+
+```yaml
+security-delta:
+  mode: off                # off | warn | strict
+```
+
+`warn` reports findings and offers them as carryover; `strict` blocks the close only on an introduced malicious package or an introduced critical vulnerability with a known fix. Same key-line gotcha as `eval:` — no inline comment on the `security-delta:` line itself.
+
+Read by: `scripts/lib/config/security-delta.mjs`, `scripts/security-delta.mjs`, `skills/session-end/references/phase-2-quality-gate.md` § 2.4. Details: `docs/session-config-reference.md` § Security-Delta.
+
+## Vault Staleness
+
+Vault-drift discovery probes. Used by `/discovery vault` and (when `enabled`) session-end Phase 2.3.
+
+```yaml
+vault-staleness:
+  enabled: false                       # opt-in
+  mode: warn                           # warn | strict | off (NOT 'hard'; canonical per #217)
+  thresholds:
+    top: 30                            # tier=top narrative staleness (days)
+    active: 60                         # tier=active
+    archived: 180                      # tier=archived
+```
+
+Read by: `skills/discovery/probes/vault-staleness.mjs`, `skills/discovery/probes/vault-narrative-staleness.mjs`, `skills/session-end/SKILL.md` Phase 2.3.
+
+## Docs Staleness
+
+Filesystem-mtime staleness probe for living reference docs (`docs/*.md` root-level + `docs/examples/*.md`; excludes `docs/adr/` — historically stable — and `docs/prd/` — active work-in-progress). Used by `/discovery` when enabled (#781, Epic #774).
+
+```yaml
+docs-staleness:
+  enabled: false                       # opt-in
+  mode: warn                           # strict | warn | off
+  thresholds:
+    living: 90                         # days — single tier; severity escalates at 1×/2×/3× threshold
+moc-staleness:
+  # Parser gotcha: this key line must carry NO inline comment.
+  enabled: false                       # opt-in — <vault>/08-topics/*-moc.md staleness banner (session-start Phase 4)
+  thresholds:
+    moc: 90                            # days — frontmatter `updated:` threshold; missing/unparseable is EXCLUDED, not reported
+  mode: warn                           # warn | off
+context-coverage:
+  # Parser gotcha: this key line must carry NO inline comment.
+  enabled: false                       # opt-in — registered 01-projects/ folders lacking context.md AND _passive.md
+  mode: warn                           # warn | off
+worktree-orphans:
+  # Parser gotcha: this key line must carry NO inline comment.
+  enabled: false                       # opt-in — session-end Phase 4b sweep; CANDIDATES ONLY, never auto-deletes (PSA-003)
+  base-branch: main                    # validated — a leading-dash value is rejected and falls back to main
+  mode: warn                           # warn | off
+```
+
+Read by: `skills/discovery/probes/docs-staleness.mjs`, `scripts/lib/config/docs-staleness.mjs`.
+
+## CLAUDE.md Drift Check
+
+Narrative-drift gate at session-end Phase 2.2. Ten checks (see `skills/claude-md-drift-check/SKILL.md` for the full spec):
+
+1. `path-resolver` — absolute-path resolution
+2. `project-count-sync` — `01-projects/` count claims
+3. `issue-reference-freshness` — closed refs in forward-looking sections
+4. `session-file-existence` — `50-sessions/YYYY-MM-DD-*.md` references
+5. `command-count` — claimed "N commands" vs actual `commands/*.md`
+6. `session-config-parity` — top-level keys diffed against `docs/session-config-template.md`
+7. `vault-dir-parity` — `CLAUDE.md` vs `AGENTS.md` agreement on `vault-integration.vault-dir`
+8. `generated-rule-staleness` (WARN-only) — auto-generated rules whose `learning-key` is absent or expired
+9. `rule-scoping` — `.claude/rules/*.md` `paths:`/`globs:` frontmatter defects, cited-but-missing rule citations, zero-match globs, foreign glob tokens
+10. `docs-parity` — `docs/components.md` count-claims vs actual on-disk counts, Session Config key parity between `docs/session-config-template.md` and `docs/session-config-reference.md`, and legacy pre-`.orchestrator/metrics/` path references in the docs tree
+
+```yaml
+drift-check:
+  enabled: false                       # opt-in
+  mode: warn                           # warn | hard | off
+  include-paths:
+    - CLAUDE.md
+    - AGENTS.md
+    - _meta/**/*.md
+  check-path-resolver: true
+  check-project-count-sync: true
+  check-issue-reference-freshness: true
+  check-session-file-existence: true
+  check-command-count: true
+  check-session-config-parity: true
+  check-vault-dir-parity: true
+  check-generated-rule-staleness: true
+  check-rule-scoping: true
+  check-docs-parity: true
+```
+
+Read by: `skills/claude-md-drift-check/SKILL.md`, `skills/claude-md-drift-check/checker.mjs`.
+
+## Docs Orchestrator
+
+Audience-split (User / Dev / Vault) doc generation, hooked into session-start Phase 2.5, session-plan Step 1.5/1.8, session-end Phase 3.2.
+
+```yaml
+docs-orchestrator:
+  enabled: false                       # opt-in; activates the docs-writer agent
+  audiences: [user, dev, vault]        # subset allowed
+  mode: warn                           # warn | strict | off
+```
+
+Read by: `skills/docs-orchestrator/SKILL.md`, `skills/session-start/phase-2-5-docs-planning.md`, `skills/session-end/phase-3-2-docs-verification.md`, `agents/docs-writer.md`.
+
+## Events Rotation
+
+Size-based rotation of `.orchestrator/metrics/events.jsonl` (#251). Fires only at session-start.
+
+```yaml
+events-rotation:
+  enabled: true                        # default true
+  max-size-mb: 10                      # 1..1024
+  max-backups: 5                       # 1..20
+```
+
+Read by: `hooks/on-session-start.mjs`, `scripts/lib/events-rotation.mjs`.
+
+## Express Path
+
+Codified coordinator-direct flow for housekeeping + simple single-issue sessions (#214). Activates when session-type=housekeeping AND issues ≤ 3 AND no parallel agents.
+
+```yaml
+express-path:
+  enabled: true                        # default true; set false to always use full 5-wave flow
+```
+
+Read by: `skills/session-start/phase-8-5-express-path.md`, `skills/session-plan/SKILL.md` (express-path short-circuit).
+
+## Hook Runtime Profile (env-only, not config)
+
+`SO_HOOK_PROFILE` and `SO_DISABLED_HOOKS` are environment variables, **not Session Config fields**. They control hook execution at runtime without editing `hooks.json`. The same two settings can be kept per host in `owner.yaml` as `hooks.profile` (`strict`, `full`, `standard`) and `hooks.disabled` (#1881); the environment wins. owner.yaml cannot choose `minimal`/`off` or disable a safety hook.
+
+| Variable | Values | Default | Effect |
+|----------|--------|---------|--------|
+| `SO_HOOK_PROFILE` | `strict` \| `standard` \| `minimal` \| `off` (`full` = `strict`) | `standard` | Preset bundle — `standard` leaves `pre-bash-templates-first` and `pre-tool-state-md-path-guard` off and lets `worktree-remove-unsafe` warn when it cannot measure the target; `minimal` keeps only `on-session-start` + `pre-bash-destructive-guard`. |
+| `SO_DISABLED_HOOKS` | comma-separated hook names | _(none)_ | Per-hook override; takes precedence over the profile. |
+
+Read by: `hooks/_lib/profile-gate.mjs`. See [docs/session-config-reference.md § Hook Runtime Profile Control](./session-config-reference.md#hook-runtime-profile-control-211).
+
+## Agent Mapping
+
+Explicit role-to-agent binding. Without this block, session-plan auto-matches tasks to agents based on description content.
+
+```yaml
+agent-mapping:
+  impl: code-implementer
+  test: test-writer
+  ui: ui-developer
+  db: db-specialist
+  security: security-reviewer
+  docs: docs-writer
+  perf: code-implementer
+```
+
+Read by: `skills/session-plan/SKILL.md`, `skills/wave-executor/wave-loop.md`.
+
+The dispatch resolution is three-tier: project agents (`.claude/agents/`) > plugin agents (`session-orchestrator:*`) > `general-purpose`.
+
+## Full opt-in baseline (copy-paste)
+
+Everything turned on for a project that wants the full feature surface (vault, docs, drift checks, env-aware sizing). Trim to taste:
+
+```yaml
+## Session Config
+
+# Mandatory
+test-command: npm test
+typecheck-command: npm run typecheck
+lint-command: npm run lint
+agents-per-wave: 6 (deep: 18)
+waves: 5
+persistence: true
+enforcement: warn
+
+# Session structure
+recent-commits: 20
+special: "follow .claude/rules/parallel-sessions.md"
+project-name: my-project               # informational: written by /bootstrap, names the repo for readers; no runtime reader
+
+# VCS & infrastructure
+vcs: gitlab
+gitlab-host: gitlab.example.com        # only if remote URL doesn't expose it
+mirror: github
+cross-repos: []
+cross-repo:
+  projects: [~/Projects/my-app]        # block form (#469) — NOT the flat `cross-repos` above; INLINE list only
+pencil: path/to/design.pen             # design-code alignment input
+ecosystem-health: true
+health-endpoints: []
+issue-limit: 50
+stale-branch-days: 7
+stale-issue-days: 30
+
+# Auto-skill dispatch
+auto-skill-dispatch: false             # opt-in; phrase-match meta-skill — see skills/using-orchestrator/SKILL.md
+
+# Quality
+ssot-files: [STATE.md]
+ssot-freshness-days: 5
+plugin-freshness-days: 30
+
+# Discovery
+discovery-on-close: auto
+discovery-probes: [all]
+discovery-exclude-paths: ["vendor/**", "dist/**", "node_modules/**"]
+discovery-severity-threshold: low
+discovery-confidence-threshold: 60
+discovery-parallelism: 5
+
+# Issue budget — QUANTITY cap on issue creation (not a quality filter)
+issue-budget:
+  max-per-session: 12                  # non-exempt issues one session may create (0 = block all)
+  mode: strict                         # strict | warn | off
+  overflow: collect-issue              # collect-issue | vault-note
+
+# Persistence & safety
+memory-cleanup-threshold: 5
+memory-cleanup-soft-limit: 180
+learning-expiry-days: 30
+learnings-surface-top-n: 15
+learning-decay-rate: 0.05
+enforcement-gates:
+  path-guard: true
+  command-guard: true
+  post-edit-validate: true
+  bash-write-verify: true              # PostToolUse/Bash working-tree diff, warn-only (#915)
+  # bash-write-guard: true             # ⚠ INVERTED DEFAULT: absent = OFF (opposite of the keys above)
+allow-destructive-ops: false
+reasoning-output: false
+grounding-check: true
+grounding-injection-max-files: 3
+isolation: auto
+max-turns: auto
+auto-commit-per-wave: false            # opt-in: commit after each wave's Quality-Lite PASS (V3.6 plumbing)
+
+# Heavy-repo preflight & worktree hygiene (HR-003)
+heavy-repo: false                      # true clamps the dispatched agent count to agents-per-wave
+worktree-cleanup: default              # default | aggressive
+worktree-exclude: [node_modules, dist, build, .next, .nuxt, coverage, .cache, .turbo, .vercel, out]   # default; top-level dirs removed from a createWorktree() worktree; null disables
+
+# Env-aware
+resource-awareness: true
+enable-host-banner: true
+resource-thresholds:
+  ram-free-min-gb: 4
+  ram-free-critical-gb: 2
+  cpu-load-max-pct: 80
+  concurrent-sessions-warn: 5
+  ssh-no-docker: true
+  zombie-threshold-min: 30
+
+# Planning
+baseline-ref: main
+baseline-project-id: "52"
+plan-baseline-path: ~/Projects/projects-baseline
+plan-default-visibility: internal
+plan-prd-location: docs/prd
+plan-retro-location: docs/retro
+
+# Vault sync
+vault-sync:
+  enabled: true
+  mode: warn
+  vault-dir: .
+  exclude: ["**/_MOC.md", "**/_overview.md", "**/README.md"]
+
+# Vault integration
+vault-integration:
+  enabled: true
+  vault-dir: ~/Projects/vault
+  mode: warn
+  vault-name:                          # optional (#660) — per-project vault namespace override; null/absent → deriveRepo()
+  gitlab-groups: []
+  briefing-search: false               # optional (#2169) — session-start vault pointers
+
+# Product-vault registration — written by /bootstrap (skills/bootstrap/_shared-template.md);
+# its presence is the marker hasVaultConfig() reads so bootstrap does not ask again
+vault:
+  path: ~/Projects/vault
+  product-domain: my-domain
+  persona-db:
+
+# GitLab portfolio dashboard — /portfolio (GH #41); needs vault-integration.vault-dir
+gitlab-portfolio:
+  enabled: false                       # opt-in; only the literal true enables it
+  mode: warn                           # warn | strict | off
+  stale-days: 30                       # integer ≥ 1
+  critical-labels:                     # BLOCK list only — an inline [a, b] is silently ignored
+    - priority::critical
+    - priority::high
+
+# Vault mirror quality thresholds
+vault-mirror:
+  quality:
+    min-narrative-chars: 400
+    min-confidence: 0.5
+
+# Cold-start detector
+cold-start:
+  enabled: true
+  nudge-after-hours: 1
+  silence-after-sessions: 1
+
+# Memory banner (PRD F2.3 / #505) + Memory proposals (PRD F2.1 / #501)
+memory:
+  banner:
+    enabled: true                # PRD F2.3 (#505) — silence the session-start "📚 Loaded from memory" banner when false
+  proposals:
+    enabled: true                # PRD F2.1 (#501) — agent-writable memory tool (memory.propose CLI + session-end AUQ)
+    quota-per-wave: 5            # max proposals one agent can queue per wave (exit 1 / quota-exceeded when exceeded)
+    confidence-floor: 0.5        # proposals below this are rejected (exit 2 / rejected-low-confidence)
+
+# Auto-Dream proposal filter (#566) — SECOND gate above memory.proposals.confidence-floor
+auto-dream:
+  min-confidence: 0.5            # collect-emit floor applied by collectProposals() at session-end Phase 3.6.3
+
+# STATE.md lock (PRD gsd Pattern 1 / #518)
+state-md-lock:
+  enabled: true
+  timeout-ms: 10000
+
+# Handover Alignment Gate (#769)
+handover-gate:
+  enabled: true
+  max-open-questions: 3
+
+# Context threshold hints (#1960) — PostToolUse, warn-only, thousand tokens
+context-threshold:
+  enabled: true
+  prepare-k: 700
+  handover-k: 800
+
+# Agent caps (#1959) — per-session agent limits and the low-memory brake
+agent-caps:
+  process-starting: 6
+  reading: 6
+  brake-engage-pct: 15
+  brake-release-pct: 20
+
+# Broken-Window Budget (#730/H5)
+broken-window-budget:
+  enabled: false
+  due-days: 7
+
+# Slopcheck (PRD gsd Pattern 2 / #520)
+slopcheck:
+  enabled: false
+  sources: [plan, discovery]
+
+# Templates-first hook (PRD gsd Pattern 3 / #519)
+templates-first:
+  enabled: true
+  hosts: [github, gitlab]
+
+# Wave reviewers — opt-in inter-wave architecture/QA/PRD audit dispatch (#461 / #478)
+wave-reviewers:
+  enabled: false                       # opt-in; absent, false, or an empty reviewers array = no-op
+  reviewers: []                        # ["architect-reviewer", "qa-strategist", "analyst"]
+  mode: warn                           # warn | strict | off
+
+# Persona gate — opt-in persona-panel fan-out after a wave (#458)
+persona-gate-wave:
+  enabled: false                       # opt-in
+  after: quality                       # quality | impl-polish
+  threshold: all                       # all | any | <m>-of-<n>
+  personas: []                         # persona slugs the panel dispatches
+  dispatch-model: opus                 # alias or full model ID — default 'opus'
+  mode: off                            # off | warn | strict — enabled: true with mode: off never fires
+
+# Agentic test orchestrator (/test) — run profiles and artifact retention
+test:
+  enabled: false                       # opt-in
+  default-profile: smoke               # profile name looked up in profiles-path
+  profiles-path: .orchestrator/policy/test-profiles.json
+  mode: warn                           # parsed, read by no step yet (#1452) — strict does not block
+  retention-days: 30                   # days test-run artifacts are kept (0 = no cleanup)
+
+# Design review on UI touch (#1452) — DEFAULT ON; this block is only needed to opt out or tune globs
+# host-local off without a commit: SO_DESIGN_REVIEW=off or owner.yaml design-review.enabled: false
+design-review:
+  enabled: true                        # false = no wave review, no close gate
+  close-gate: warn                     # warn ("would refuse", exit 0) | refuse — no automatic switch, #1452
+  include: []                          # replaces the default UI globs when non-empty
+  exclude: []                          # added to the default exclusions (tests, stories, build output)
+  designer:                            # optional path to agentic-designer's `designer` CLI; empty = look it up on PATH
+  act-on-verdicts: false               # review findings (designer and ux-evaluator) create work only when true (agentic-designer#85)
+
+# Verification auto-fix loop (PRD gsd Pattern 4 / #521)
+verification-auto-fix:
+  enabled: false
+  max-retries: 2
+
+# Custom phases — repo-declared deterministic close/housekeeping phases (#637)
+custom-phases:
+  - name: eval-learn-aggregate         # required, SAFE slug
+    when: housekeeping                  # housekeeping | session-end | both (default: session-end)
+    command: npm run eval:aggregate     # required; run verbatim — no record interpolation
+    mode: hard                          # warn | hard | off (default: warn)
+    review: docs/eval/last-run.md       # optional SAFE path read after the command (default: null)
+
+# Remote hosts — ssh-reachable offload targets for heavy roles (#1160)
+remote-hosts:
+  - alias: build-host                  # required, SAFE slug; reaches argv as `-H <alias>`
+    roles-allowed: [test, ui, perf]    # subset of test|ui|perf (default: all three)
+    repo-path: ~/Projects/Alice     # optional SAFE path (default: null)
+    claude-path: ~/.local/bin/claude   # optional SAFE path (default: null)
+offload-first: false                   # #1465: true = offloadable roles go to a witnessed-ready remote host even on `proceed`
+
+# Evolve extra-sources — opt-in EXTRA /evolve learning sources (#638)
+evolve:
+  extra-sources:
+    - path: eval/learn/reports/latest.json   # required; SAFE path to a sidecar JSON
+      kind: regression-flags                  # enum: regression-flags | owner-decisions
+      learning-type: domain-regression        # enum: domain-regression | owner-preference (defaults by kind)
+
+# Reconcile engine — FA3 advisory rule-proposal delivery (#696 / #697)
+reconcile:
+  enabled: false                 # opt-in; FA3 reads this to gate session-end Phase 3.6.8
+  mode: warn                     # off | warn — advisory only; rules NEVER auto-applied
+  targets: [repo-local]          # rule-write location; repo-local = .claude/rules/ in v1
+  rule-expiry-days: null         # null = per-type TTL (default 60d); set integer to override
+  confidence-floor: 0.5          # float 0.0..1.0 — min confidence for rule proposal eligibility
+  min-rule-days: 7               # #741.1 — floor for emitted rule expires-at (prevents born-dead rules)
+  min-insight-chars: 24          # #741.2 — reject a learning whose trimmed insight is shorter than N chars
+
+# Discovery-validator — PSA-006 enforcement (#567)
+discovery-validator:
+  enabled: true                  # opt-in; hook is off unless this block sets it
+
+# Dialectic-Deriver (#506)
+dialectic:
+  cadence: 5              # integer ≥ 0; 0 = kill-switch (no critique dispatches)
+  model: haiku            # haiku | sonnet | opus — fail-fast on unknown value
+  budget-tokens: 32000    # integer ≥ 0 — input token ceiling per critique call (aborts above, never truncates)
+
+# Eval — Standard v1 harness config surface (#809 / Epic #803)
+eval:
+  enabled: false           # opt-in
+  mode: warn               # warn | off — fail-fast on unknown value
+  judge: off               # off | haiku | sonnet — fail-fast on unknown value
+  report: html             # html | none — fail-fast on unknown value
+  handle:                  # optional string — null/absent → null
+
+# Security-Delta — close-time delta checks (#1769, session-end Phase 2.4)
+security-delta:
+  mode: off                # off | warn | strict — fail-fast on unknown value
+
+# Vault staleness
+vault-staleness:
+  enabled: true
+  mode: warn
+  thresholds:
+    top: 30
+    active: 60
+    archived: 180
+
+# Docs staleness (#781)
+docs-staleness:
+  enabled: false
+  mode: warn
+  thresholds:
+    living: 90
+moc-staleness:
+  enabled: false
+  thresholds:
+    moc: 90
+  mode: warn
+context-coverage:
+  enabled: false
+  mode: warn
+worktree-orphans:
+  enabled: false
+  base-branch: main
+  mode: warn
+
+# CLAUDE.md drift check
+drift-check:
+  enabled: true
+  mode: warn
+  include-paths: [CLAUDE.md, AGENTS.md, "_meta/**/*.md"]
+  check-path-resolver: true
+  check-project-count-sync: true
+  check-issue-reference-freshness: true
+  check-session-file-existence: true
+  check-command-count: true
+  check-session-config-parity: true
+  check-vault-dir-parity: true
+  check-generated-rule-staleness: true
+  check-rule-scoping: true
+  check-docs-parity: true
+
+# Docs orchestrator
+docs-orchestrator:
+  enabled: true
+  audiences: [user, dev, vault]
+  mode: warn
+
+# Events rotation
+events-rotation:
+  enabled: true
+  max-size-mb: 10
+  max-backups: 5
+
+# Express path
+express-path:
+  enabled: true
+
+# Frontend-slop PostToolUse hook (#684) — DEPRECATED (#1121), removal in the next major
+# opt-in, warn-only, non-blocking; enabled: true prints one deprecation line on stderr
+frontend-slop-hook:
+  enabled: false           # PostToolUse frontend-slop detector after UI-file edits; profile-gate also gates it
+
+# Runaway tool-loop guard (ecc-analysis / #619)
+loop-guard:
+  enabled: true            # PostToolUse warn-only loop detector; profile-gate also gates it
+  threshold: 3             # identical (tool+argsHash) calls within window before warn
+  window: 5                # ring-buffer size
+
+# Always-on instruction-budget guard (#687) — session-start Phase 4, warn-only, growth-ratchet
+instruction-budget:
+  enabled: true            # always-on directive-budget banner; off-by-config silences it
+  # Ceilings: do NOT copy numbers from here. Each ceiling key you set marks
+  # that axis as calibrated for THIS repo (#1995), and the plugin defaults were
+  # measured on the plugin's own corpus. Run
+  #   node "<plugin>/scripts/instruction-budget-calibrate.mjs"
+  # and replace this whole block with the one it prints (it sets ceiling,
+  # byte-ceiling, generated-byte-ceiling, path-scoped-byte-ceiling). Only the
+  # first instruction-budget block in the file is read.
+  mode: warn               # warn (surface banner) | off (silent no-op)
+
+# Config-protection guard (ecc-analysis / #622)
+config-protection:
+  enabled: true            # PreToolUse: warn on gate-weakening Edit/Write
+  mode: warn               # warn | strict (strict blocks loosening, exit 2)
+allow-config-weakening: false   # per-session bypass
+
+# Orphan-process watchdog (#1425 / #1432) — DEFAULT OFF; arm only after measuring its firing rate (HR-101)
+reaper:
+  enabled: false                 # only an explicit `true` arms it; it can send signals to processes
+  mode: report                   # report (decide + audit only) | kill (send signals — PRD Stufe 2)
+  min-age-seconds: 300           # the host watchdog's hard limit for tsgo; the 2026-09-20 orphans were 7–17 min old
+  min-scan-interval-seconds: 30  # throttle; keeps a PostToolBatch storm from taxing every tool call
+  kill-grace-ms: 10000           # DEFAULT_KILL_GRACE_MS from process-group.mjs:52 — repo convention
+  verify-wait-ms: 500            # wait before reading the effect back (a sent signal proves nothing)
+  max-hook-latency-ms: 50        # ceiling a scan may delay a hook by
+  false-alarm-window: 50         # rolling window of audit decisions the HR-101 10 % rate is judged over
+
+# Quality-gate path B ceiling (#1425 A3) — SO_GATE_TIMEOUT_MS still overrides this per run
+gate:
+  timeout-path-b-ms: 900000      # 15 min; same cap as GATE_TIMEOUT_MS on path A
+
+# Agent mapping
+agent-mapping:
+  impl: code-implementer
+  test: test-writer
+  ui: ui-developer
+  db: db-specialist
+  security: security-reviewer
+  docs: docs-writer
+  perf: code-implementer
+```
+
+## Validation & Bootstrap
+
+- **Validate manually:** `node scripts/parse-config.mjs --json` (writes to stdout) or `node scripts/validate-config.mjs` (mandatory-field check).
+- **Auto-validate at session-start:** Always runs. Behavior is gated by `enforcement` (`off`/`warn`/`strict`).
+- **Bypass:** `SO_SKIP_CONFIG_VALIDATION=1`.
+- **Patch missing fields:** `/bootstrap --retroactive` adds the seven mandatory fields to an existing config without overwriting custom values.
+
+## Cross-reference
+
+- [docs/session-config-reference.md](./session-config-reference.md) — full canonical reference, types, edge cases.
+- [skills/_shared/instruction-file-resolution.md](../skills/_shared/instruction-file-resolution.md) — CLAUDE.md ↔ AGENTS.md alias rule.
+- [skills/_shared/config-reading.md](../skills/_shared/config-reading.md) — runtime parser used by every skill.
+- [docs/USER-GUIDE.md](./USER-GUIDE.md) — adopter walk-through with examples.
+- [docs/examples/](./examples/) — Session Config samples for Next.js, Express, Swift.
+
+## Skill Evolution
+
+> **Parity-exempt section.** This H2 is intentionally placed outside the `## Session Config` block so that the `claude-md-drift-check` Check-6 parity scanner (which extracts only column-0 keys inside the `## Session Config` block) does not flag repos that have not yet adopted this feature. Adding `skill-evolution:` as a column-0 key *inside* `## Session Config` would cause every repo running `drift-check.mode: hard` that lacks the key to hard-fail at session-end — portfolio-wide breakage. Issue #646.
+
+Opt-in configuration for the Skill Self-Evolution Foundation (Epic #643, Sub-issue #646). When `autonomy: advisory`, the `/evolve` skill surfaces a session-end summary of skill health signals (D-token rollup, telemetry gaps, A/B experiment deltas) for operator review — no automated edits. When `autonomy: autonomous-gated`, a deterministic evidence gate is checked first; only repairs that clear the gate AND belong to the repo's own local config artifacts (e.g., Session Config fields, local skill overrides) are applied automatically. **Plugin-level and remote skill repairs are always MR-only, regardless of autonomy setting.** The default is `off` — no behavior change for repos that omit this block.
+
+```yaml
+skill-evolution:
+  autonomy: off            # off | advisory | autonomous-gated — default off (opt-in)
+  evidence-floor: 0.5      # float 0.0..1.0 — min evidence before an autonomous-gated repair acts
+  judge: off               # opt-in session-end LLM-judge for A's L3 (advisory only); default off
+```
+
+Read by: `skills/evolve/SKILL.md` (skill-health summary), `scripts/lib/config/skill-evolution.mjs` (parser). PRD: "Skill Self-Evolution Foundation" (#643; archived in the private Meta-Vault). Issue: #646.
+
+## Dispatcher Autonomy
+
+> **Parity-exempt section.** This H2 is intentionally placed outside the `## Session Config` block so that the `claude-md-drift-check` Check-6 parity scanner (which extracts only column-0 keys inside the `## Session Config` block) does not flag repos that have not yet adopted this feature. Adding `dispatcher-autonomy:` as a column-0 key *inside* `## Session Config` would cause every repo running `drift-check.mode: hard` that lacks the key to hard-fail at session-end — portfolio-wide breakage. Issue #679.
+
+Opt-in configuration for the cross-repo free-repo dispatcher autonomy gate (Epic #673, Sub-issue #679). When `autonomy: advisory`, the `/dispatcher` flow surfaces ranked free-repo candidates for operator review — no automated dispatch. When `autonomy: autonomous-gated`, a deterministic confidence gate is checked first; only dispatches that clear the `confidence-floor` are routed automatically. The default is `off` — fail-closed, no behavior change for repos that omit this block. The effective `autonomy` resolves with host-local precedence `SO_DISPATCHER_AUTONOMY` env > `owner.yaml` `dispatcher.autonomy` > committed > `off` (#653 pattern).
+
+```yaml
+dispatcher-autonomy:
+  autonomy: off            # off | advisory | autonomous-gated — default off (fail-closed)
+  confidence-floor: 0.5    # float 0.0..1.0
+```
+
+Read by: `scripts/lib/config/dispatcher-autonomy.mjs` (parser + resolver), `skills/dispatcher/SKILL.md` (cross-repo dispatch flow). PRD: "Cross-Repo Vault-Status / Autopilot Dispatcher" (#673; archived in the private Meta-Vault). Issue: #679.

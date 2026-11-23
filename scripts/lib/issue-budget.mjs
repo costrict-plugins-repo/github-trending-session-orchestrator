@@ -1,0 +1,954 @@
+/**
+ * issue-budget.mjs — per-session issue-creation cap: state, exemptions, verdict.
+ *
+ * WHY: measured on the private instance over four weeks, sessions created 1784
+ * issues against 1285 closed (net +499), with a median inter-creation gap of
+ * 2.6 s and 62 % of creations inside bursts of >= 5 per minute. The pre-existing
+ * `discovery-severity-threshold` / `discovery-confidence-threshold` keys cannot
+ * bound that: they filter individual FINDINGS by quality (and the `low` default
+ * filters nothing), they are only consulted in skill prose, and the biggest
+ * producers — session-end carryover filing, plan issue creation,
+ * `scripts/lib/spiral-carryover.mjs` — never read them at all.
+ *
+ * This module is the single decision point for BOTH producer paths:
+ *   - shell path:        `hooks/pre-bash-issue-budget.mjs` (PreToolUse/Bash)
+ *   - programmatic path: `scripts/lib/spiral-carryover.mjs` `runCli()`
+ *
+ * EXEMPTIONS ARE LOAD-BEARING. `skills/session-end/SKILL.md` carries two
+ * standing promises the cap must not break:
+ *   - `:319` — "SPIRAL / FAILED agent carryover → auto-carry candidate …
+ *     (non-deselectable)"
+ *   - `:1113` — "ALWAYS create issues for unfinished PLANNED work … nothing
+ *     planned-but-unfinished is 'remembered' without one."
+ * A cap that silently swallowed a SPIRAL carryover would turn a hard promise
+ * into a lie, so the carryover class plus `priority::critical` bypass the cap
+ * entirely (they are counted for observability, but never blocked).
+ *
+ * Stdlib only — the hook path must stay cheap enough to run on every Bash call.
+ */
+
+import { digestSha256Short } from './crypto-digest-utils.mjs';
+import { existsSync, readFileSync, readdirSync, statSync, unlinkSync } from 'node:fs';
+import { homedir } from 'node:os';
+import path from 'node:path';
+
+import { writeJsonAtomicSync } from './io.mjs';
+import { resolveEventsLedgerRoot } from './platform.mjs';
+import { resolveInstructionFile } from './common.mjs';
+import { _parseIssueBudget } from './config/issue-budget.mjs';
+import { parseStateMd } from './state-md/yaml-parser.mjs';
+import { resolveStateMdWriteTarget } from './state-md/frontmatter-mutators.mjs';
+
+/**
+ * Legacy single-slot counter file, relative to the repo root.
+ *
+ * Kept as the path for IDENTITY-LESS callers only, and as the one-time
+ * migration source for a session whose spend was recorded before #1141.
+ */
+export const BUDGET_STATE_REL = '.orchestrator/runtime/issue-budget.json';
+
+/** Directory holding the per-session counter files, relative to the repo root. */
+export const BUDGET_STATE_DIR_REL = '.orchestrator/runtime/issue-budget';
+
+/**
+ * Relative path of the counter file for one accounting session (#1141).
+ *
+ * WHY per session and not one file: the counter used to be ONE slot per
+ * WORKING COPY, keyed by whichever `sessionId` happened to write last, and
+ * `readBudgetState` zeroes the state whenever the file's `sessionId` differs
+ * from the reader's. Two concurrent sessions in one working copy therefore
+ * alternately reset each other's counter and BOTH ran with the cap silently
+ * off — measured 2026-08-23, where the live file was owned by a session that
+ * had started 11 h before the one reading it. Session identity belongs in the
+ * FILE NAME, not in a field the next writer overwrites.
+ *
+ * The name is a truncated SHA-256 rather than the id itself because session
+ * ids are operator/host-supplied strings: a semantic id contains `/`-free but
+ * unbounded text, and a raw id is a UUID. Hashing gives a fixed-length,
+ * filesystem-safe, path-traversal-free name for both shapes. 16 hex chars
+ * (64 bits) is far beyond the handful of sessions that ever share one working
+ * copy; revisit only if a repo ever needs the id to be readable from the name
+ * (it never has — every reader already knows which session it is).
+ *
+ * An identity-less caller (`null`/empty) keeps the legacy flat path: it never
+ * reads and never persists (see `readBudgetState` / `chargeIssueBudget`), so
+ * it needs a stable path only to NAME the store in messages.
+ *
+ * @param {string|null|undefined} sessionId accounting session key
+ * @returns {string} repo-relative path
+ */
+export function budgetStateRel(sessionId) {
+  const key = typeof sessionId === 'string' && sessionId.length > 0 ? sessionId : null;
+  if (key === null) return BUDGET_STATE_REL;
+  const digest = digestSha256Short(key, { length: 16 });
+  return `${BUDGET_STATE_DIR_REL}/${digest}.json`;
+}
+
+/**
+ * Resolve the accounting key for a native session id.
+ *
+ * A semantic id is an accounting continuity bridge only after the native id
+ * proves that `current-session.json` belongs to this invocation. This neither
+ * establishes lock ownership nor bridges a host rotation that changes both ids.
+ *
+ * @param {string|null|undefined} candidateRawSessionId native hook/env session id
+ * @param {unknown} currentSession parsed `.orchestrator/current-session.json`
+ * @returns {string|null} semantic key for a verified pair, otherwise raw key
+ */
+export function resolveIssueBudgetSessionId(candidateRawSessionId, currentSession) {
+  const rawSessionId =
+    typeof candidateRawSessionId === 'string' && candidateRawSessionId.length > 0
+      ? candidateRawSessionId
+      : null;
+  if (
+    rawSessionId === null ||
+    !currentSession ||
+    typeof currentSession !== 'object' ||
+    Array.isArray(currentSession) ||
+    currentSession.session_id !== rawSessionId ||
+    typeof currentSession.semantic_session_id !== 'string' ||
+    currentSession.semantic_session_id.length === 0
+  ) {
+    return rawSessionId;
+  }
+  return currentSession.semantic_session_id;
+}
+
+/**
+ * Commands whose issue creation MUST NOT be blocked, with the reason recorded
+ * for the stderr trace and for the overflow bookkeeping.
+ *
+ * Each entry is `[regex, reason]`. Both the scoped (`priority::critical`) and
+ * the legacy unscoped (`priority:critical`) spellings are accepted: the label
+ * migration to scoped `priority::` runs alongside this change and a
+ * half-migrated producer must not lose its exemption mid-flight.
+ */
+const EXEMPT_RULES = [
+  [/priority::?critical\b/i, 'priority::critical'],
+  // `[Carryover] [SPIRAL] …` / `[Carryover] [FAILED] …` — the exact title
+  // template `createSpiralCarryoverIssue` emits, plus the `type::carryover`
+  // and bare `carryover` labels used by the vault/drift/docs strict fallbacks.
+  [/\[(SPIRAL|FAILED)\]/, 'spiral-failed-auto-carry'],
+  [/\[Carryover\]/i, 'carryover-class'],
+  [/\btype::?carryover\b/i, 'carryover-class'],
+  [/(^|[\s,"'=])carryover([\s,"']|$)/i, 'carryover-class'],
+  [/(^|[\s,"'=])broken-window([\s,"']|$)/i, 'broken-window-closure'],
+  [/\[Backlog-Sammel\]/i, 'overflow-collector'],
+];
+
+/**
+ * Decide whether an issue-create command bypasses the cap.
+ *
+ * @param {string} command — the full shell command (or a reconstructed argv join)
+ * @returns {{ exempt: boolean, reason: string|null }}
+ */
+export function classifyExemption(command) {
+  if (typeof command !== 'string' || command.length === 0) {
+    return { exempt: false, reason: null };
+  }
+  for (const [re, reason] of EXEMPT_RULES) {
+    if (re.test(command)) return { exempt: true, reason };
+  }
+  return { exempt: false, reason: null };
+}
+
+/**
+ * Resolve the effective cap for one session type out of a parsed config.
+ *
+ * Precedence is `raw[sessionType] ?? raw.default ?? cfg['max-per-session']` —
+ * an unknown or absent session type falls through to the default, never to a
+ * hard-coded number, and a config parsed before the override syntax existed
+ * (no `max-per-session-raw` key at all) still resolves via the last term.
+ *
+ * @param {{ "max-per-session"?: number, "max-per-session-raw"?: number|Record<string, number> }} cfg
+ * @param {string|null|undefined} sessionType — e.g. `feature`, `deep`, `housekeeping`
+ * @returns {number} non-negative integer cap
+ */
+export function resolveMaxPerSession(cfg, sessionType) {
+  const fallback =
+    Number.isInteger(cfg?.['max-per-session']) && cfg['max-per-session'] >= 0
+      ? cfg['max-per-session']
+      : 12;
+  const raw = cfg?.['max-per-session-raw'];
+  if (Number.isInteger(raw) && raw >= 0) return raw;
+  if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+    const key = typeof sessionType === 'string' ? sessionType.trim().toLowerCase() : '';
+    const override = key === '' ? undefined : raw[key];
+    if (Number.isInteger(override) && override >= 0) return override;
+    if (Number.isInteger(raw.default) && raw.default >= 0) return raw.default;
+  }
+  return fallback;
+}
+
+/**
+ * Read `session-type:` from the active STATE.md frontmatter.
+ *
+ * Never throws: a missing STATE.md, unparseable frontmatter, or an absent /
+ * non-string `session-type` all yield `null`, which `resolveMaxPerSession`
+ * reads as "use the default". The hook path runs on every Bash call, so a
+ * broken STATE.md must degrade to today's behaviour rather than fail.
+ *
+ * @param {string} repoRoot
+ * @returns {string|null}
+ */
+export function readSessionTypeFromStateMd(repoRoot) {
+  try {
+    // #1636: the write side's ownership rule — another platform's STATE.md not
+    // proven to be this process's must not set THIS session's budget; it counts
+    // as absent (default budget). No warn line: this runs on every Bash call.
+    const { path: filePath, rejected } = resolveStateMdWriteTarget(repoRoot);
+    if (rejected || !existsSync(filePath)) return null;
+    const parsed = parseStateMd(readFileSync(filePath, 'utf8'));
+    const value = parsed?.frontmatter?.['session-type'];
+    return typeof value === 'string' && value.trim() !== '' ? value.trim() : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Load the `issue-budget` config from the repo's instruction file
+ * (CLAUDE.md / AGENTS.md). Reads only that one file and only that one block —
+ * `parseSessionConfig()` is deliberately NOT used here so the hook path does
+ * not pay for host-path resolution and owner.yaml I/O on every Bash call.
+ *
+ * `max-per-session` is returned ALREADY RESOLVED for the current session type
+ * (read from the active STATE.md frontmatter), so every existing consumer that
+ * treats it as a plain number keeps working and automatically gains the
+ * per-session-type override. The unresolved value stays available under
+ * `max-per-session-raw`, and `session-type-resolved` records which type the
+ * resolution used (`null` when STATE.md is absent or carries no session-type).
+ *
+ * @param {string} repoRoot
+ * @returns {{ "max-per-session": number, "max-per-session-raw": number|Record<string, number>, "session-type-resolved": string|null, mode: string, overflow: string }}
+ */
+export function loadIssueBudgetConfig(repoRoot) {
+  const defaults = {
+    'max-per-session': 12,
+    'max-per-session-raw': 12,
+    'session-type-resolved': null,
+    mode: 'strict',
+    overflow: 'collect-issue',
+  };
+  let parsed;
+  try {
+    const resolved = resolveInstructionFile(repoRoot);
+    if (!resolved) return defaults;
+    parsed = _parseIssueBudget(readFileSync(resolved.path, 'utf8'));
+  } catch {
+    return defaults;
+  }
+  const sessionType = readSessionTypeFromStateMd(repoRoot);
+  return {
+    ...parsed,
+    'max-per-session': resolveMaxPerSession(parsed, sessionType),
+    'session-type-resolved': sessionType,
+  };
+}
+
+/**
+ * Absolute path of the runtime counter file for one session in a repo.
+ *
+ * @param {string} repoRoot
+ * @param {string|null} [sessionId] accounting session key; omitted/empty
+ *   yields the legacy identity-less flat path.
+ * @returns {string}
+ */
+export function budgetStatePath(repoRoot, sessionId = null) {
+  return path.join(budgetStateRoot(repoRoot), budgetStateRel(sessionId));
+}
+
+/**
+ * Root directory the runtime counter files live under (#1729). The PreToolUse
+ * hook charges at `CLAUDE_PROJECT_DIR` (usually the MAIN checkout) while
+ * session-end reconciles and reaps with the linked-worktree root; joining the
+ * raw root made the two sides open different files and report a false
+ * `no-ledger`. Mapping a linked worktree to its main checkout (the same
+ * resolver the event ledger uses) makes every reader and writer agree. Any
+ * other root (plain checkout, non-git dir, submodule) is returned resolved but
+ * otherwise unchanged. A non-string or blank root is passed through untouched
+ * so `path.join` keeps its previous behaviour instead of falling back to the
+ * ambient project dir.
+ *
+ * @param {string} repoRoot
+ * @returns {string}
+ */
+function budgetStateRoot(repoRoot) {
+  if (typeof repoRoot !== 'string' || repoRoot.trim() === '') return repoRoot;
+  return resolveEventsLedgerRoot(repoRoot);
+}
+
+/**
+ * Is this a well-formed charge record (#1347)?
+ *
+ * A record that fails this test is DROPPED rather than repaired: it can no
+ * longer prove which unit it was charged to, and a refund against an
+ * unclassifiable record is exactly the drain this ledger exists to prevent.
+ *
+ * @param {unknown} r
+ * @returns {boolean}
+ */
+function _isChargeRecord(r) {
+  return (
+    !!r &&
+    typeof r === 'object' &&
+    !Array.isArray(r) &&
+    typeof r.key === 'string' &&
+    r.key.length > 0 &&
+    (r.unit === 'count' || r.unit === 'exempt')
+  );
+}
+
+/**
+ * Coerce a parsed counter file into a state object, or `null` when it does not
+ * belong to `accountingSessionId`.
+ *
+ * The owner check survives the move to per-session files: the file NAME now
+ * carries identity, but a hand-edited, hash-colliding or hand-copied file must
+ * still not hand its spend to a different session.
+ *
+ * @param {unknown} data
+ * @param {string} accountingSessionId
+ * @returns {{ sessionId: string, count: number, exempt: number, overflow: object[] }|null}
+ */
+function _coerceState(data, accountingSessionId) {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return null;
+  if (data.sessionId !== accountingSessionId) return null;
+  return {
+    sessionId: accountingSessionId,
+    count: Number.isInteger(data.count) && data.count >= 0 ? data.count : 0,
+    exempt: Number.isInteger(data.exempt) && data.exempt >= 0 ? data.exempt : 0,
+    overflow: Array.isArray(data.overflow) ? data.overflow : [],
+    // #1347 CHARGE ledger — PROOF OF CHARGE, the thing a refund must present.
+    // Coerced here and NOT elsewhere: this function is the only reader, so a key
+    // it drops is a key that does not survive a round trip.
+    charged: Array.isArray(data.charged) ? data.charged.filter(_isChargeRecord) : [],
+  };
+}
+
+/**
+ * Read a counter file and coerce it, swallowing every I/O and parse error
+ * (fail-open: an unreadable ledger must never block a creation).
+ *
+ * @param {string} file
+ * @param {string} accountingSessionId
+ * @returns {object|null}
+ */
+function _readStateFile(file, accountingSessionId) {
+  if (!existsSync(file)) return null;
+  try {
+    return _coerceState(JSON.parse(readFileSync(file, 'utf8')), accountingSessionId);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Read the counter file. A missing, malformed, or foreign-session file yields
+ * a fresh zeroed state for `sessionId` — the counter is per session by
+ * construction, so a new session never inherits the previous session's spend.
+ *
+ * An identity-less invocation always gets a fresh state and never reads a
+ * persisted budget. It therefore cannot provide durable per-session continuity,
+ * but avoiding cross-session budget and overflow attribution wins over a
+ * continuity guess without a verified native identity.
+ *
+ * The counter file is per session since #1141, but an identity-less charge
+ * still must never PERSIST its fresh state — it would land on the shared
+ * legacy path and, before the split, silently zeroed a live session's count
+ * and deleted its parked overflow records. `chargeIssueBudget` enforces that
+ * write-side half.
+ *
+ * MIGRATION (one-time, read-only): a session that started before the per-session
+ * split has its spend in the legacy flat file. When no per-session file exists
+ * yet and the legacy file still names THIS session, seed from it — otherwise the
+ * split itself would hand every in-flight session a fresh cap, which is the very
+ * failure it exists to remove. The legacy file is never written back; the first
+ * charge after the seed persists to the per-session path.
+ *
+ * @param {string} repoRoot
+ * @param {string|null} sessionId
+ * @returns {{ sessionId: string|null, count: number, exempt: number, overflow: object[] }}
+ */
+export function readBudgetState(repoRoot, sessionId) {
+  const accountingSessionId =
+    typeof sessionId === 'string' && sessionId.length > 0 ? sessionId : null;
+  const fresh = { sessionId: accountingSessionId, count: 0, exempt: 0, overflow: [], charged: [] };
+  if (accountingSessionId === null) return fresh;
+
+  const ownFile = budgetStatePath(repoRoot, accountingSessionId);
+  const own = _readStateFile(ownFile, accountingSessionId);
+  if (own) return own;
+  // A present-but-unusable own file is a fail-open fresh state, NOT a reason to
+  // fall back to the legacy slot — the migration seed applies only before the
+  // session has a file of its own.
+  if (existsSync(ownFile)) return fresh;
+
+  return (
+    _readStateFile(path.join(budgetStateRoot(repoRoot), BUDGET_STATE_REL), accountingSessionId) ?? fresh
+  );
+}
+
+/**
+ * Persist the counter file for `state.sessionId`. Best-effort: a write failure
+ * never blocks a creation (fail-open), it only means the count is
+ * under-reported.
+ *
+ * The target path is derived from `state.sessionId`, so a state object can only
+ * ever be written into its OWN session's slot. `writeJsonAtomicSync` mkdir -p's
+ * the containing directory (`io.mjs#atomicWriteWithBackup`), which is what
+ * creates `.orchestrator/runtime/issue-budget/` on first use.
+ *
+ * @param {string} repoRoot
+ * @param {object} state
+ * @returns {boolean} true on success
+ */
+export function writeBudgetState(repoRoot, state) {
+  const res = writeJsonAtomicSync(budgetStatePath(repoRoot, state?.sessionId ?? null), state, {
+    tmpPrefix: '.issue-budget',
+  });
+  return res.ok === true;
+}
+
+/**
+ * Named ceilings for a parked overflow record (#1314, BV-004). GitLab accepts
+ * descriptions up to ~1 MB; 16 KiB covers every real issue body this repo files,
+ * and the record lives in a per-session JSON file that session-end folds into
+ * ONE collector issue. Revisit if `truncated: true` shows up in a fold.
+ * Measured in UTF-16 code units (≈ bytes for ASCII bodies).
+ */
+export const OVERFLOW_DESCRIPTION_MAX = 16 * 1024;
+export const OVERFLOW_COMMAND_MAX = 2 * 1024;
+/** A description file above GitLab's own ~1 MB limit is not read at all. */
+const OVERFLOW_DESCRIPTION_FILE_MAX_BYTES = 1024 * 1024;
+
+/**
+ * Build the structured overflow record BOTH park sites write (#1314) — the
+ * hook's chain pre-flight and `chargeIssueBudget`'s strict branch. Before this
+ * both parked only the raw command, so a body passed as `$(cat /tmp/x.md)` was
+ * lost once the temp file was gone. The description file is read NOW, at block
+ * time; any read failure yields `description: null`, silently — the park itself
+ * must never fail. Old records (`title/command/at` only) stay readable: every
+ * added key is optional.
+ *
+ * Path resolution: a leading `~` / `~/` expands to the home directory; an
+ * absolute path is used as is; a relative path resolves against `cwd` (the
+ * PreToolUse input's working directory) when that is absolute, else against
+ * `repoRoot`. When `cwdChanged` (a `cd` earlier in the same chain) a relative
+ * path is NOT resolved — the record says `descriptionUnresolved: 'cwd-changed'`
+ * instead of parking whichever file happens to sit at the guessed location.
+ * NAMED CEILING (BV-004): `~user/` is not expanded. Revisit if it shows up.
+ *
+ * @param {{ repoRoot: string, title?: string|null, description?: string|null,
+ *           descriptionFile?: string|null, repo?: string|null,
+ *           cwd?: string|null, cwdChanged?: boolean,
+ *           command: string, at: string }} opts
+ * @returns {{ title: string|null, description: string|null, repo: string|null,
+ *             command: string, at: string, truncated: boolean,
+ *             descriptionUnresolved?: 'cwd-changed' }}
+ */
+export function buildOverflowRecord({
+  repoRoot,
+  title = null,
+  description = null,
+  descriptionFile = null,
+  repo = null,
+  cwd = null,
+  cwdChanged = false,
+  command,
+  at,
+}) {
+  let body = typeof description === 'string' ? description : null;
+  let truncated = false;
+  let unresolved = null;
+  if (body === null && typeof descriptionFile === 'string' && descriptionFile.length > 0) {
+    try {
+      let file = descriptionFile;
+      if (file === '~' || file.startsWith('~/')) file = path.join(homedir(), file.slice(1));
+      if (!path.isAbsolute(file)) {
+        if (cwdChanged) {
+          unresolved = 'cwd-changed';
+          throw new Error('cwd-changed');
+        }
+        const base = typeof cwd === 'string' && path.isAbsolute(cwd) ? cwd : repoRoot;
+        file = path.resolve(base, file);
+      }
+      const st = statSync(file);
+      if (st.isFile() && st.size <= OVERFLOW_DESCRIPTION_FILE_MAX_BYTES) {
+        body = readFileSync(file, 'utf8');
+      } else if (st.isFile()) {
+        truncated = true;
+      }
+    } catch {
+      body = null;
+    }
+  }
+  if (body !== null && body.length > OVERFLOW_DESCRIPTION_MAX) {
+    body = body.slice(0, OVERFLOW_DESCRIPTION_MAX);
+    // Never end on half a surrogate pair — a lone high surrogate is not text.
+    const last = body.charCodeAt(body.length - 1);
+    if (last >= 0xd800 && last <= 0xdbff) body = body.slice(0, -1);
+    truncated = true;
+  }
+  const raw = String(command);
+  if (raw.length > OVERFLOW_COMMAND_MAX) truncated = true;
+  const record = {
+    title: title ?? null,
+    description: body,
+    repo: typeof repo === 'string' && repo.length > 0 ? repo : null,
+    command: raw.slice(0, OVERFLOW_COMMAND_MAX),
+    at,
+    truncated,
+  };
+  if (unresolved !== null) record.descriptionUnresolved = unresolved;
+  return record;
+}
+
+/**
+ * Charge one issue creation against the session budget and return the verdict.
+ *
+ * Decision table:
+ *   mode `off`                          → `{ decision: 'off' }`, no state written
+ *   exempt command                      → `{ decision: 'exempt' }`, `exempt` counter++
+ *   count < max                         → `{ decision: 'allow' }`, `count`++
+ *   count >= max, mode `warn`           → `{ decision: 'warn' }`, `count`++ (creation proceeds)
+ *   count >= max, mode `strict`         → `{ decision: 'block' }`, overflow record appended
+ *
+ * In `strict` the blocked creation is NOT counted (it never happened); the
+ * request is parked in `overflow[]` so session-end can file exactly one
+ * collector issue instead of losing the item.
+ *
+ * @param {{
+ *   repoRoot: string,
+ *   sessionId?: string|null,
+ *   command: string,
+ *   title?: string|null,
+ *   description?: string|null,
+ *   descriptionFile?: string|null,
+ *   repo?: string|null,
+ *   cwd?: string|null,
+ *   cwdChanged?: boolean,
+ *   config?: { "max-per-session": number, mode: string, overflow: string },
+ *   now?: string,
+ * }} opts
+ * @returns {{
+ *   decision: 'off'|'exempt'|'allow'|'warn'|'block',
+ *   count: number,
+ *   max: number,
+ *   mode: string,
+ *   overflowSink: string,
+ *   overflowPath: string,
+ *   overflowCount: number,
+ *   reason?: string|null,
+ * }}
+ */
+export function chargeIssueBudget({
+  repoRoot,
+  sessionId = null,
+  command,
+  title = null,
+  description = null,
+  descriptionFile = null,
+  repo = null,
+  cwd = null,
+  cwdChanged = false,
+  toolCallId = null,
+  statementIndex = 0,
+  config,
+  now = new Date().toISOString(),
+}) {
+  const cfg = config ?? loadIssueBudgetConfig(repoRoot);
+  const max = cfg['max-per-session'];
+  const mode = cfg.mode;
+  const overflowSink = cfg.overflow;
+  const accountingSessionId =
+    typeof sessionId === 'string' && sessionId.length > 0 ? sessionId : null;
+  // Per-session store (#1141) — the path an operator or session-end must open
+  // to find THIS session's parked overflow, so the verdict has to name the
+  // session's own slot, not the directory or the legacy flat file.
+  const overflowPath = budgetStatePath(repoRoot, accountingSessionId);
+
+  const base = { max, mode, overflowSink, overflowPath };
+
+  if (mode === 'off') {
+    return { ...base, decision: 'off', count: 0, overflowCount: 0, reason: null };
+  }
+
+  const state = readBudgetState(repoRoot, accountingSessionId);
+  state.sessionId = accountingSessionId;
+
+  // An identity-less charge has no key to account under, so it must not touch
+  // the SHARED counter file at all. Writing its fresh state would reset a live
+  // session's count to 0 AND drop its parked overflow[] entries — breaking the
+  // strict cap (a single identity-less call clears it) and session-end's
+  // "nothing is lost" promise. Read-side isolation alone does not cover this.
+  const persist = (next) =>
+    accountingSessionId === null ? false : writeBudgetState(repoRoot, next);
+
+  // The charge RECORD is the only thing a later refund may act on (#1347). It is
+  // written on every branch that actually increments a counter, and on NO branch
+  // that does not — which is what makes a parked (blocked) creation unrefundable
+  // by construction rather than by a heuristic in the refund hook.
+  const record = (unit) => {
+    state.charged = [
+      ...state.charged,
+      {
+        id: bookingId({ toolCallId, statementIndex }),
+        key: bookingKey({ sessionId: accountingSessionId, command: String(command ?? ''), statementIndex }),
+        unit,
+        at: now,
+      },
+    ].slice(-CHARGED_LEDGER_MAX);
+  };
+
+  const { exempt, reason } = classifyExemption(command);
+  if (exempt) {
+    state.exempt += 1;
+    record('exempt');
+    persist(state);
+    return {
+      ...base,
+      decision: 'exempt',
+      count: state.count,
+      overflowCount: state.overflow.length,
+      reason,
+    };
+  }
+
+  if (state.count < max) {
+    state.count += 1;
+    record('count');
+    persist(state);
+    return { ...base, decision: 'allow', count: state.count, overflowCount: state.overflow.length, reason: null };
+  }
+
+  if (mode === 'warn') {
+    state.count += 1;
+    record('count');
+    persist(state);
+    return { ...base, decision: 'warn', count: state.count, overflowCount: state.overflow.length, reason: null };
+  }
+
+  // strict — park the request, do not count it.
+  state.overflow.push(
+    buildOverflowRecord({
+      repoRoot, title, description, descriptionFile, repo, cwd, cwdChanged, command, at: now,
+    }),
+  );
+  persist(state);
+  return {
+    ...base,
+    decision: 'block',
+    count: state.count,
+    overflowCount: state.overflow.length,
+    reason: null,
+  };
+}
+
+/**
+ * How many CHARGE records one session's counter file remembers (#1347, BV-004).
+ *
+ * A record is REMOVED only when its refund is honoured; the record of a create
+ * that SUCCEEDED stays for the rest of the session (nothing else prunes it), so
+ * the ledger holds every charge of the session, not only the outstanding ones.
+ * 64 covers a cap of 12 plus the uncapped exempt creates of a long deep
+ * session (measured this repo: ≤ 12 per session so far) and keeps the file in
+ * the low-kilobyte class. Eviction is fail-CLOSED: an evicted record
+ * makes its refund `not-charged`, i.e. the slot stays spent (the cap ends up
+ * slightly tighter), never refundable twice. Revisit if a session legitimately
+ * exceeds 64 outstanding charges — then the bound, not the direction, is wrong.
+ */
+export const CHARGED_LEDGER_MAX = 64;
+
+/**
+ * The EXACT id of one charged statement, when the harness publishes a tool-call
+ * id for the invocation.
+ *
+ * `<tool_use_id>#<statementIndex>` — instance-unique per statement, so a chain
+ * of two creates yields two ids and a re-delivered failure of the same call
+ * yields the same one.
+ *
+ * @param {{ toolCallId?: string|null, statementIndex?: number }} opts
+ * @returns {string|null} `null` when the harness published no id
+ */
+export function bookingId({ toolCallId = null, statementIndex = 0 } = {}) {
+  if (typeof toolCallId !== 'string' || toolCallId.length === 0) return null;
+  return `${toolCallId}#${Number.isInteger(statementIndex) ? statementIndex : 0}`;
+}
+
+/**
+ * The deterministic fallback key of one charged statement.
+ *
+ * Deliberately session + command text + statement index and NOTHING ELSE — in
+ * particular NOT the counter value at charge time (`countBefore`, the #1347
+ * first-cut key). That value made every retry of the same create mint a FRESH
+ * key: measured against a cap of 3, three retries of a create that was PARKED
+ * (never charged) refunded three slots and drove `count` to 0 while the parked
+ * record still sat in `overflow[]` — i.e. `max-per-session` was unbounded by
+ * retrying a denied create. The key is now stable across retries, and proof of
+ * charge comes from the record's PRESENCE rather than from the key's shape.
+ *
+ * @param {{ sessionId: string|null, command: string, statementIndex?: number }} opts
+ * @returns {string}
+ */
+export function bookingKey({ sessionId, command, statementIndex = 0 }) {
+  const idx = Number.isInteger(statementIndex) ? statementIndex : 0;
+  return digestSha256Short(`cmd:${sessionId ?? ''}|${command}|${idx}`, { length: 16 });
+}
+
+/**
+ * Give one booking back to the session budget (#1347) — ONLY against a recorded
+ * CHARGE.
+ *
+ * WHY THIS EXISTS: `chargeIssueBudget` books the slot in PreToolUse — BEFORE the
+ * command runs. When `glab issue create` then fails (network, rejected label,
+ * expired auth) and the coordinator retries, the SAME issue consumed two slots,
+ * and under `max-per-session: 12` + `mode: strict` that pushes a legitimate
+ * issue into overflow parking. This is the compensating half of the charge.
+ *
+ * WHY IT IS LEDGER-BASED AND NOT INFERRED: the first cut decremented whenever a
+ * failure signal arrived for an issue-create command. It could not tell a CHARGE
+ * from a NON-charge, and at `count === max` the pre-hook PARKS the create and
+ * denies WITHOUT charging while the failure event still fires — so retrying a
+ * DENIED create refunded a slot that was never spent. Presenting the charge
+ * record is the only form of proof that closes that class; every "was this
+ * really charged?" heuristic is a guess about state this module already knows.
+ *
+ * Matching: the exact `<tool_use_id>#<index>` id when both sides have one,
+ * otherwise the deterministic `bookingKey`. Both routes are consulted because
+ * the charging and refunding payloads are separate harness events and only one
+ * of them may carry a tool-call id.
+ *
+ * Decision table:
+ *   mode `off`                  → `{ decision: 'off' }`, nothing written
+ *   no accounting session id    → `{ decision: 'no-session' }`, nothing written
+ *   no matching charge record   → `{ decision: 'noop', reason: 'not-charged' }`
+ *   record with `unit: exempt`  → `{ decision: 'refunded-exempt' }`, `exempt`--
+ *   record with `unit: count`   → `{ decision: 'refunded' }`, `count`--
+ *
+ * Three invariants:
+ *   - The matched record is REMOVED, so a re-delivered failure of the same call
+ *     finds nothing and is `not-charged`. Dedupe is the removal, not a second
+ *     ledger.
+ *   - The refund lands on the SAME counter the charge did (`count` vs `exempt`),
+ *     read off the record — never re-classified from the command text, which a
+ *     retry can have edited.
+ *   - `overflow[]` is NEVER touched. A parked record means the creation was
+ *     BLOCKED, so it was never charged and there is nothing to give back;
+ *     removing it would drop the item session-end promises to file.
+ *
+ * Fail-open like every other function here: an unwritable ledger means the
+ * refund is lost (the cap stays a little tighter), never an exception.
+ *
+ * @param {{
+ *   repoRoot: string,
+ *   sessionId?: string|null,
+ *   command: string,
+ *   toolCallId?: string|null,
+ *   statementIndex?: number,
+ *   config?: { "max-per-session": number, mode: string, overflow: string },
+ * }} opts
+ * @returns {{
+ *   decision: 'off'|'no-session'|'noop'|'refunded'|'refunded-exempt',
+ *   count: number,
+ *   exempt: number,
+ *   max: number,
+ *   mode: string,
+ *   overflowCount: number,
+ *   bookingId: string|null,
+ *   reason: string|null,
+ * }}
+ */
+export function refundBooking({
+  repoRoot,
+  sessionId = null,
+  command,
+  toolCallId = null,
+  statementIndex = 0,
+  config,
+}) {
+  const cfg = config ?? loadIssueBudgetConfig(repoRoot);
+  const base = { max: cfg['max-per-session'], mode: cfg.mode };
+  const accountingSessionId =
+    typeof sessionId === 'string' && sessionId.length > 0 ? sessionId : null;
+
+  if (cfg.mode === 'off') {
+    return { ...base, decision: 'off', count: 0, exempt: 0, overflowCount: 0, bookingId: null, reason: null };
+  }
+  // Identity-less: `chargeIssueBudget` never PERSISTED such a charge, so there
+  // is provably nothing to refund — and writing here would hit the shared legacy
+  // slot and reset a live session's count (the #1141 hazard).
+  if (accountingSessionId === null) {
+    return { ...base, decision: 'no-session', count: 0, exempt: 0, overflowCount: 0, bookingId: null, reason: null };
+  }
+
+  const state = readBudgetState(repoRoot, accountingSessionId);
+  state.sessionId = accountingSessionId;
+  const exactId = bookingId({ toolCallId, statementIndex });
+  const key = bookingKey({
+    sessionId: accountingSessionId,
+    command: String(command ?? ''),
+    statementIndex,
+  });
+  const verdict = (decision, reason = null, matchedId = null) => ({
+    ...base,
+    decision,
+    count: state.count,
+    exempt: state.exempt,
+    overflowCount: state.overflow.length,
+    bookingId: matchedId ?? exactId ?? key,
+    reason,
+  });
+
+  // Match order (review MED-1, measured): the deterministic key is shared by
+  // EVERY charge of the same command text in this session, so a refund that
+  // carries a tool_use_id must match by id first and may fall back to the key
+  // only among records charged WITHOUT an id (the id-less harness / a
+  // one-sided id). Falling back onto an id-bearing record would hand the
+  // refund to an OLDER charge that may have SUCCEEDED — two charges, one
+  // delivery each, and the second delivery drained the successful create's slot.
+  let at = exactId !== null ? state.charged.findIndex((r) => r.id === exactId) : -1;
+  if (at === -1) {
+    at = state.charged.findIndex((r) => r.key === key && (exactId === null || r.id === null || r.id === undefined));
+  }
+  if (at === -1) return verdict('noop', 'not-charged');
+
+  const rec = state.charged[at];
+  state.charged = [...state.charged.slice(0, at), ...state.charged.slice(at + 1)];
+  if (rec.unit === 'exempt') {
+    if (state.exempt > 0) state.exempt -= 1;
+  } else if (state.count > 0) {
+    state.count -= 1;
+  }
+  writeBudgetState(repoRoot, state);
+  return verdict(rec.unit === 'exempt' ? 'refunded-exempt' : 'refunded', null, rec.id ?? rec.key);
+}
+
+/**
+ * Human-readable block message. Shared by the hook (stderr + deny JSON) and the
+ * programmatic path so an agent sees the same instruction either way.
+ *
+ * @param {{ count: number, max: number, overflowPath: string, overflowSink: string, overflowCount: number }} v
+ * @returns {string}
+ */
+export function formatBlockReason(v) {
+  const sink =
+    v.overflowSink === 'vault-note'
+      ? 'a note under `vault/00-inbox/`'
+      : 'ONE collector issue `[Backlog-Sammel] <session-id>, N zurückgestellte Punkte`';
+  return [
+    `issue-budget: session cap reached — ${v.count}/${v.max} issues already created.`,
+    `This request was NOT created. It is parked as overflow entry #${v.overflowCount} in:`,
+    `  ${v.overflowPath}`,
+    `session-end Phase 5 will fold all overflow entries into ${sink}. Nothing is lost.`,
+    `Exempt from the cap: priority::critical, the carryover class (SPIRAL/FAILED, [Carryover]),`,
+    `and broken-window closure issues — those are never deferred.`,
+    `To raise the cap for this repo, edit \`issue-budget.max-per-session\` in the Session Config;`,
+    `\`mode: warn\` reports without blocking, \`mode: off\` disables the gate.`,
+  ].join('\n');
+}
+
+/**
+ * Default age past which a per-session counter file is reaped (#1151).
+ *
+ * BV-004 ceiling: 14 days is a "nobody will ever drain this now" horizon, not a
+ * measured retention requirement. A session's overflow is drained at ITS OWN
+ * close (session-end Phase 5 Step 3b), so a file still carrying undrained
+ * overflow two weeks later belongs to a session that ended without closing —
+ * its parked items are already unreachable by the drain, which only ever reads
+ * the CURRENT session's file. Revisit if a triage workflow ever reads a foreign
+ * session's overflow after the fact.
+ */
+export const BUDGET_REAP_MAX_AGE_DAYS = 14;
+
+/**
+ * Recognised per-session counter file name — the 16-hex digest `budgetStateRel`
+ * emits, plus `.json`. Anything else in the directory is left alone: the reaper
+ * must only ever remove files it can prove it wrote itself.
+ */
+const BUDGET_FILE_NAME_RE = /^[0-9a-f]{16}\.json$/;
+
+/**
+ * Remove stale per-session counter files (#1151).
+ *
+ * WHY: the per-session split (#1141) writes one file per accounting session
+ * into `.orchestrator/runtime/issue-budget/` and NOTHING ever removed them —
+ * there was not a single unlink site for that directory in the repo. Every
+ * session in a working copy therefore left a permanent 100-200 byte artefact
+ * behind. This is the missing other half of the file's lifecycle, owned by
+ * session-end Phase 5 Step 3b (the drain runs first, this sweeps after).
+ *
+ * Age is judged by MTIME, and the CURRENT session's file is exempt regardless
+ * of age. Both halves are safety, not convenience: a parallel session in the
+ * same working copy (PSA-001) owns a file this process did not write, and its
+ * freshly-touched mtime is the only evidence available here that the owner is
+ * still alive — the same age-gate discipline `session-registry.mjs`
+ * `sweepZombies` uses for in-flight claim files.
+ *
+ * Best-effort by contract: every failure path is swallowed and the file counted
+ * as kept. A reaper that throws would abort the session close it runs inside,
+ * which is a strictly worse outcome than an un-reaped counter file.
+ *
+ * @param {{
+ *   repoRoot: string,
+ *   sessionId?: string|null,
+ *   maxAgeDays?: number,
+ *   now?: number,
+ * }} opts `sessionId` is the accounting session id whose file must survive;
+ *   `now` is an epoch-ms injection point for tests.
+ * @returns {{ removed: string[], kept: string[] }} absolute paths, so a caller
+ *   gets both a count (`.length`) and an audit trail.
+ */
+export function reapStaleBudgetFiles({
+  repoRoot,
+  sessionId = null,
+  maxAgeDays = BUDGET_REAP_MAX_AGE_DAYS,
+  now = Date.now(),
+} = {}) {
+  const removed = [];
+  const kept = [];
+  try {
+    // Directory and own file from ONE mapped root (#1729): mapping only one of
+    // them would make the `file === ownFile` protection below never match.
+    const stateRoot = budgetStateRoot(repoRoot);
+    const dir = path.join(stateRoot, BUDGET_STATE_DIR_REL);
+    const cutoff = now - maxAgeDays * 24 * 60 * 60 * 1000;
+    const ownFile =
+      typeof sessionId === 'string' && sessionId.length > 0
+        ? path.join(stateRoot, budgetStateRel(sessionId))
+        : null;
+
+    let names;
+    try {
+      names = readdirSync(dir);
+    } catch {
+      // No directory yet (or unreadable) — nothing to reap, not an error.
+      return { removed, kept };
+    }
+
+    for (const name of names) {
+      // Unrecognised entries are not part of this reaper's population at all:
+      // neither removed nor reported as kept.
+      if (!BUDGET_FILE_NAME_RE.test(name)) continue;
+      const file = path.join(dir, name);
+      if (file === ownFile) {
+        kept.push(file);
+        continue;
+      }
+      try {
+        if (statSync(file).mtimeMs >= cutoff) {
+          kept.push(file);
+          continue;
+        }
+        unlinkSync(file);
+        removed.push(file);
+      } catch {
+        // Vanished under us (a peer's own reaper), or permission-denied.
+        kept.push(file);
+      }
+    }
+  } catch {
+    // Unreachable in practice; the contract is "never throws", not "never fails".
+  }
+  return { removed, kept };
+}

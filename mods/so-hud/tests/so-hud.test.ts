@@ -1,0 +1,288 @@
+import { expect, mock, test, type Plugin } from 'claude-code/testing'
+import type { On } from 'claude-code'
+import type { SoBeacon, SoSnapshot } from '../types/index'
+import { comparablePath, hostFolder, windowsPath } from '../hooks/logic'
+import { findCollisions } from '../hooks/rules'
+
+const at = '2026-10-10T15:10:00.000Z'
+const measured: Omit<SoSnapshot, 'age_ms'> = {
+  schema_version: 1, measured_at: at, repo: { root: '/repo', name: 'repo' }, lock: null, session: null,
+  wave: { running: true, number: 2, role: 'Impl-Core', agents_total: 3, source: '.claude/wave-scope.json' },
+  agents: { entries: [], source: 'live-map', at, degraded: null, running: 3, stale_reason: null },
+  state: { status: 'active', session_type: 'deep', current_wave: 2, total_waves: 5 },
+  gate: { last: { variant: 'full-gate', passed: true, check_failed: null, exit_code: 0, at }, last_green_sha: null },
+  peers: [], vault: { enabled: false, mode: 'warn', last_run: null, board: null }, degraded: [],
+}
+const UUID = '3f1c2b9a-6d4e-4f7a-9b2c-1e5d8a7c6b40'
+function world(on: On, collector: 'ok' | 'failed' | 'invalid' | 'missing' | 'pre-1730' = 'ok', env: Record<string, string> = { HOME: '/home/test' }, registered = '', identityHome?: string) {
+  const writes: SoBeacon[] = []
+  const statuses: string[] = []
+  const calls = { pluginList: 0, collector: [] as string[][], reads: [] as string[], timeouts: [] as (number | undefined)[] }
+  const clock = mock.clock(on, { now: Date.parse(at) })
+  mock.env(on, env)
+  mock.store(on)
+  on('fs.read', (_$, e) => { calls.reads.push((e as { path?: string }).path ?? ''); return { value: registered } })
+  on('fs.list', () => ({ value: [] }))
+  on('session.id', () => ({ value: collector === 'pre-1730' ? UUID : 'test-session' }))
+  on('session.cwd', () => ({ value: '/repo' }))
+  on('session.model', () => ({ value: 'sonnet' }))
+  on('session.usage', () => ({ value: { startedAt: Date.parse(at), context: { window: 200000, tokens: 40000, percent: 20 }, rateLimits: [] } }))
+  on('process.run', (_$, e) => {
+    let stdout = 'null'
+    if (e.argv.includes('identity')) stdout = JSON.stringify({ pid: 123, home: identityHome })
+    else if (e.argv.includes('write')) writes.push(JSON.parse(e.init?.stdin ?? '{}') as SoBeacon)
+    else if (e.argv.some(a => a.endsWith('/scripts/so-hud.mjs'))) {
+      calls.collector.push([...e.argv])
+      calls.timeouts.push(e.init?.timeoutMs)
+      if (collector === 'failed') return { value: { exitCode: 6, stdout: '', stderr: 'measurement failed', isStdoutTruncated: false, isStderrTruncated: false } }
+      // A collector from before #1730 knows no --session-id: strict parseArgs, usage exit 2.
+      if (collector === 'pre-1730' && e.argv.includes('--session-id')) return { value: { exitCode: 2, stdout: '', stderr: 'so-hud: --json erforderlich; siehe --help\n', isStdoutTruncated: false, isStderrTruncated: false } }
+      stdout = collector === 'invalid' ? '{}' : JSON.stringify(measured)
+    }
+    else if (collector === 'missing' && e.argv.includes('list')) { calls.pluginList++; stdout = '[]' }
+    else if (e.argv.includes('alive')) stdout = '[123]'
+    else throw new Error(`Unexpected process: ${e.argv[0]}`)
+    return { value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+  })
+  on('ui.status', (_$, e) => { statuses.push(e.text ?? ''); return { value: undefined } })
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('turn.start', (_$, e) => ({ turnId: e.turnId }))
+  return { writes, statuses, calls, clock }
+}
+
+// A real consumer module is scanned for custom-interface calls; the test's
+// engine event table itself does not expose plugin-defined nouns.
+const consumer: Plugin = {
+  name: 'so-consumer',
+  register(on) {
+    on('turn.complete', async ($) => ({ text: JSON.stringify({
+      version: await $.so.version(), snapshot: await $.so.snapshot(),
+      beacons: await $.so.beacons(), profile: await $.so.profile(),
+    }) }))
+  },
+}
+const probe = { answer: 'Probe', turnId: 'probe', durationMs: 0, isAborted: false, reason: 'answer' as const }
+
+test('$.so v1 is installed and is empty before the first measurement', { options: { soRoot: '/so' }, plugins: [consumer] }, async ($, on) => {
+  world(on)
+  const result = await $.turn.complete(probe)
+  expect(JSON.parse(result.text)).toEqual({ version: 1, snapshot: null, beacons: [], profile: 'ausgewogen' })
+})
+test('main turn writes working, question-wait and ready; subagent completion cannot overwrite it', { options: { soRoot: '/so' } }, async ($, on) => {
+  const { writes } = world(on)
+  on('turn.complete', (_$, e) => ({ text: e.answer }))
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  await $.turn.start({ text: 'Los', turnId: 'turn-1' })
+  expect(writes.at(-1)?.zustand).toBe('arbeitet')
+  await $.turn.complete({ answer: 'Soll ich weitermachen?', turnId: 'turn-1', durationMs: 10, isAborted: false, reason: 'answer' })
+  expect(writes.at(-1)?.warte_grund).toBe('frage')
+  expect(writes.at(-1)?.heuristisch).toBe(true)
+  await $.turn.complete({ answer: 'Fertig.', agentId: 'worker', turnId: 'worker-turn', durationMs: 10, isAborted: false, reason: 'answer' })
+  expect(writes.at(-1)?.warte_grund).toBe('frage')
+  await $.turn.complete({ answer: 'Fertig.', turnId: 'turn-2', durationMs: 10, isAborted: false, reason: 'answer' })
+  expect(writes.at(-1)?.zustand).toBe('bereit')
+})
+test('status uses the measured sequence and selected profile', { options: { soRoot: '/so', strictness: 'locker' }, plugins: [consumer] }, async ($, on) => {
+  const { statuses } = world(on)
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  expect(statuses.at(-1)).toMatch(/^deep · W2\/5 · Impl-Core · 3 Agents · Gate ok \d\d:\d\d · 0 Peer · Vault aus · locker$/)
+  const result = JSON.parse((await $.turn.complete(probe)).text)
+  expect(result.snapshot.age_ms).toBe(0)
+  expect(result.profile).toBe('locker')
+})
+
+for (const failure of ['failed', 'invalid', 'missing'] as const) {
+  test(`first measurement exposes ${failure} instead of losing the reason`, { options: failure === 'missing' ? {} : { soRoot: '/so' } }, async ($, on) => {
+    const { statuses } = world(on, failure)
+    await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+    const status = statuses.at(-1) ?? ''
+    if (failure === 'missing') expect(status).toContain('nicht eingerichtet')
+    else {
+      expect(status).toContain('Messung fehlgeschlagen')
+      expect(status).toContain(failure === 'failed' ? 'collector-failed' : 'invalid-snapshot')
+      expect(status).not.toContain('nicht eingerichtet')
+    }
+  })
+}
+// Catches (GH#89): on native Windows only USERPROFILE is set and `--register-root` writes a drive path; the mod read
+// only HOME and accepted only a leading `/`, so the registered root was never used (a plugin list call would throw here).
+test('a drive-letter root registered under USERPROFILE is used without HOME', { options: {} }, async ($, on) => {
+  const { calls } = world(on, 'ok', { USERPROFILE: 'C:\\Users\\test' }, 'C:\\so\n')
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  expect(calls.collector[0]?.[1]).toBe('C:\\so/scripts/so-hud.mjs')
+})
+// Catches (GH#104): Git Bash sets HOME=/c/Users/x while beacon-io and `--register-root` write under os.homedir()
+// (USERPROFILE on Windows); the mod read HOME first and never saw the registered root or the beacons.
+test('the registered root is read under the helper\'s home, not a differing HOME', { options: {} }, async ($, on) => {
+  const { calls } = world(on, 'ok', { HOME: '/c/Users/git', USERPROFILE: 'C:\\Users\\test' }, 'C:\\so\n', 'C:\\Users\\test')
+  await $.session.start({ cwd: 'C:\\repo', surface: 'terminal', isInteractive: true })
+  // The kit resolves a non-POSIX path below the plugin folder on macOS/Linux, so the read is matched by its tail.
+  expect(calls.reads[0]).toMatch(/C:\\Users\\test\/\.config\/session-orchestrator\/hud\/so-root$/)
+})
+// Catches (GH#101): the fixed 3-second limit that ends in collector-failed on slower hosts; SO_HUD_TIMEOUT_MS raises it.
+for (const [raw, ms] of [['9000', 9000], [' 9000 ', 9000], ['   ', 3000], ['abc', 3000], ['1.5', 3000], ['999', 3000], ['60001', 3000]] as const) {
+  test(`SO_HUD_TIMEOUT_MS=${JSON.stringify(raw)} gives the collector ${ms} ms`, { options: { soRoot: '/so' } }, async ($, on) => {
+    const { calls } = world(on, 'ok', { HOME: '/home/test', SO_HUD_TIMEOUT_MS: raw })
+    await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+    expect(calls.timeouts[0]).toBe(ms)
+  })
+}
+// Catches (GH#100): the collision guard compared raw strings, so a native Windows file never fell under its root.
+for (const [file, root, pattern] of [
+  ['C:\\repo\\src\\a.ts', 'C:/repo', 'src/**'],
+  ['c:/repo/src/a.ts', 'C:\\repo\\', 'src\\a.ts'],
+  ['/c/repo/src/a.ts', 'C:/repo', 'C:\\repo\\src\\'],
+  ['\\\\srv\\share\\repo\\src\\a.ts', '//srv/share/repo', 'src/'],
+] as const) {
+  test(`collision found for ${file} under ${root} (${pattern})`, () => {
+    const peers = [{ session_id: 'peer', gleiches_working_copy: true, scope_paths: [comparablePath(pattern)] }]
+    expect(findCollisions({ filePath: comparablePath(file), repoRoot: comparablePath(root), ownSessionId: 'own', peers }).hits).toHaveLength(1)
+  })
+}
+test('another drive is no collision; POSIX paths are not respelled', () => {
+  const peers = [{ session_id: 'peer', gleiches_working_copy: true, scope_paths: ['src/**'] }]
+  expect(findCollisions({ filePath: comparablePath('D:\\repo\\src\\a.ts'), repoRoot: comparablePath('C:\\repo'), ownSessionId: 'own', peers }).hits).toHaveLength(0)
+  expect(comparablePath('/home/x/repo/')).toBe('/home/x/repo/')
+  expect(windowsPath('/repo/a/x\\y.ts')).toBe(false)
+})
+// Catches (GH#106): Git Bash prints `/c/x` after a `cd`, which a native Windows process cannot use as its folder.
+test('a folder printed by Git Bash becomes a drive path on a Windows host only', () => {
+  expect(hostFolder('/c/Users/x/repo', 'C:\\Users\\x')).toBe('C:/Users/x/repo')
+  expect(hostFolder('/tmp', 'C:\\Users\\x')).toBeNull()
+  expect(hostFolder('//srv/share/r', 'C:\\Users\\x')).toBe('//srv/share/r')
+  expect(hostFolder('/c/Users/x', '/home/x')).toBe('/c/Users/x')
+})
+// Catches (#1730): this mod passing --session-id to a Session Orchestrator from before #1730 — its collector exits 2 on
+// the unknown flag and every measurement failed for good.
+test('a collector without --session-id is measured without the flag, asked once', { options: { soRoot: '/so' } }, async ($, on) => {
+  const { statuses, calls, clock } = world(on, 'pre-1730')
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  expect(statuses.at(-1) ?? '').not.toContain('collector-failed')
+  expect(calls.collector.map(a => a.includes('--session-id'))).toEqual([true, false])
+  await clock.advance(16_000)
+  expect(calls.collector.length).toBeGreaterThan(2)
+  expect(calls.collector.slice(2).every(a => !a.includes('--session-id'))).toBe(true)
+})
+// Catches (F13): without a Session Orchestrator root, every 15-second refresh spawning `claude plugin list` (a miss was never cached).
+test('without a root, `claude plugin list` runs once per 5 minutes, not on every refresh', async ($, on) => {
+  const w = world(on, 'missing')
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  expect(w.calls.pluginList).toBe(1)
+  await w.clock.advance(15_000)
+  expect(w.calls.pluginList).toBe(1)
+  await w.clock.advance(285_000)
+  expect(w.calls.pluginList).toBe(2)
+})
+
+// ---- Profile band and /profile (#1552) --------------------------------------------
+const BAND_PROPS = { hasSurvey: false, isWorking: false, maxRows: 10, bodyColumns: 120, scroll: { offset: 0, bodyRows: 10 }, view: {} }
+const STRICTNESS_ROW = { label: 'Strictness profile', kind: 'choice', value: 'ausgewogen', options: ['locker', 'ausgewogen', 'streng'], isLocked: false }
+/**
+ * No Session Orchestrator root (F13); `denies` answers the config.set calls in order (null = written).
+ * `'reload'` stands for a set that reloads the plugin: it is recorded, `reloading` resolves, and the old
+ * instance never sees its answer. `'throws'` makes every set throw; `'no-row'` lists no strictness row of this plugin.
+ */
+function profileWorld(on: On, settings: unknown, denies: (string | null)[] | 'reload' | 'throws' | 'no-row' = []) {
+  world(on, 'missing')
+  let reached = () => {}
+  const reloading = new Promise<void>(resolve => { reached = resolve })
+  const sets: { key: string; value: unknown }[] = []
+  const toasts: string[] = []
+  const turns = { model: 0 }
+  on('command.register', (_$, e) => ({ value: { command: (e as unknown as { name: string }).name } }) as never)
+  on('settings.read', () => ({ value: settings }) as never)
+  // A foreign plugin's strictness row comes first: only this plugin's row may be written.
+  on('config.list', () => ({ value: [{ ...STRICTNESS_ROW, key: 'andere.strictness', provider: { plugin: 'andere', tier: 'user' } },
+    ...denies === 'no-row' ? [] : [{ ...STRICTNESS_ROW, key: 'so-hud.strictness', provider: { plugin: 'so-hud', tier: 'user' } }]] }) as never)
+  on('config.set', (_$, e) => {
+    sets.push({ key: e.key, value: e.value })
+    if (denies === 'throws') throw new Error('config write failed')
+    if (denies === 'reload') {
+      reached()
+      return new Promise(() => {}) as never
+    }
+    const deny = Array.isArray(denies) ? denies.shift() ?? null : null
+    return (deny === null ? { value: e.value } : { deny }) as never
+  })
+  on('ui.toast', (_$, e) => { toasts.push(e.text); return { value: undefined } })
+  on('command.run', () => { turns.model++; return { text: 'core' } as never })
+  on('ui.render', ($, e) => $.ui.resolve(e).Box({}) as never) // another mod's empty band beneath
+  return { sets, toasts, turns, reloading }
+}
+const bandArgs = (hasSurvey = false) => ({ plugin: 'so-hud', surface: 'terminal' as const, component: 'AbovePrompt' as const, props: { ...BAND_PROPS, hasSurvey } as never })
+
+test('first start without a chosen profile shows the band, without findings and without SO root; a survey keeps it away', async ($, on) => {
+  profileWorld(on, {})
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  const band = await $.ui.mount(bandArgs())
+  expect(await band.find({ text: /^Profil: ausgewogen/ })).toBeDefined()
+  for (const p of ['locker', 'ausgewogen', 'streng']) expect(await band.find({ key: `profil-${p}` })).toBeDefined()
+  expect(await band.find({ key: 'profil-schliessen' })).toBeUndefined()
+  expect(await (await $.ui.mount(bandArgs(true))).find({ text: /^Profil:/ })).toBeUndefined()
+})
+test('a choice writes this plugin\'s /config row and hides the band for good; a deny keeps the band', async ($, on) => {
+  const w = profileWorld(on, {}, ['Von der Richtlinie gesperrt', null])
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  const band = await $.ui.mount(bandArgs())
+  await band.press({ key: 'profil-locker' })
+  expect(w.sets).toEqual([{ key: 'so-hud.strictness', value: 'locker' }])
+  expect(w.toasts.at(-1)).toContain('Von der Richtlinie gesperrt')
+  expect(await band.find({ key: 'profil-locker' })).toBeDefined()
+  // The refused write put the choice flag back: the next session start still shows the band.
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  expect(await band.find({ key: 'profil-locker' })).toBeDefined()
+  await band.press({ key: 'profil-streng' })
+  expect(w.sets.at(-1)).toEqual({ key: 'so-hud.strictness', value: 'streng' })
+  expect(await band.find({ text: /^Profil:/ })).toBeUndefined()
+  // The next session start reads the stored choice: the band stays away.
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  expect(await band.find({ text: /^Profil:/ })).toBeUndefined()
+})
+// Catches (#1552): a choice that stored nothing leaving the flag it wrote first set, so the band never came back.
+for (const [name, mode] of [['no /config row of this plugin', 'no-row'], ['$.config.set throwing', 'throws']] as const) {
+  test(`a choice with ${name} puts the flag back: the next session start still shows the band`, async ($, on) => {
+    const w = profileWorld(on, {}, mode)
+    await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+    const band = await $.ui.mount(bandArgs())
+    await band.press({ key: 'profil-locker' })
+    expect(w.toasts.at(-1)).toContain('Profil nicht gespeichert')
+    expect(w.sets).toEqual(mode === 'throws' ? [{ key: 'so-hud.strictness', value: 'locker' }] : [])
+    await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+    expect(await band.find({ text: /^Profil:/ })).toBeDefined()
+  })
+}
+// Catches (#1552): "Schließen" on a first-run band only cleared /profile's flag, so the band stayed although closed.
+test('closing the first-run band hides it for this session; the next session start shows it again', async ($, on) => {
+  profileWorld(on, {})
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  const band = await $.ui.mount(bandArgs())
+  await $.command.run({ command: 'profile', args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 120 } })
+  await band.press({ key: 'profil-schliessen' })
+  expect(await band.find({ text: /^Profil:/ })).toBeUndefined()
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  expect(await band.find({ text: /^Profil:/ })).toBeDefined()
+})
+// Catches (#1552): the choice flag stored after $.config.set, which reloads the plugin — the old instance never
+// reached the store write, choosing the default profile left no setting to read, and the band came back.
+test('the choice is stored before the /config write that reloads the plugin', async ($, on) => {
+  const w = profileWorld(on, {}, 'reload')
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  const band = await $.ui.mount(bandArgs())
+  await band.press({ key: 'profil-ausgewogen' })
+  await w.reloading
+  expect(w.sets).toEqual([{ key: 'so-hud.strictness', value: 'ausgewogen' }])
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  expect(await band.find({ text: /^Profil:/ })).toBeUndefined()
+})
+test('/profile answers without a model turn and reopens the band after a choice made in /config', { options: { strictness: 'streng' } }, async ($, on) => {
+  const w = profileWorld(on, { pluginConfigs: { 'so-hud@session-orchestrator': { options: { strictness: 'streng' } } } })
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  const band = await $.ui.mount(bandArgs())
+  expect(await band.find({ text: /^Profil:/ })).toBeUndefined()
+  const result = await $.command.run({ command: 'profile', args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 120 } })
+  expect((result.text ?? '').split('\n').slice(0, 2)).toEqual(['Profil: streng', 'Regel-Fallen und Kollisionen abgelehnt.'])
+  expect(result.context ?? []).toHaveLength(0)
+  expect(w.turns.model).toBe(0)
+  await band.press({ key: 'profil-schliessen' })
+  expect(await band.find({ text: /^Profil:/ })).toBeUndefined()
+})

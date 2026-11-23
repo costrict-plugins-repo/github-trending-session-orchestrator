@@ -1,0 +1,444 @@
+#!/usr/bin/env node
+/**
+ * vault-backfill.mjs — GitLab group scanner + .vault.yaml backfill CLI (Issue #241).
+ *
+ * Scans GitLab groups for repos missing .vault.yaml and either previews (dry-run,
+ * default) or renders the canonical template content (--apply).
+ *
+ * CLI usage:
+ *   node scripts/vault-backfill.mjs [--groups <CSV>] [--dry-run] [--apply]
+ *     [--out-dir <path>] [--yes <manifest.json>] [--vault-dir <path>] [--verbose]
+ *
+ * Exit codes:
+ *   0 — success (clean run, dry or apply, even if some repos skipped)
+ *   1 — validation error (bad CLI flags, missing --groups AND no Session Config
+ *         gitlab-groups, malformed manifest, missing glab CLI)
+ *   2 — filesystem error (template missing, cannot write to out-dir)
+ *   3 — GitLab API error (auth failure, rate limit, group not found — when ALL
+ *         groups fail to resolve OR all repo-probes fail and nothing was processed)
+ *   4 — dry-run found nothing to backfill (informational; not an error)
+ *
+ * All logging → stderr. Structured JSON actions → stdout (one object per line).
+ * No external dependencies — Node stdlib only.
+ *
+ * Part of Vault-Docs Sub-Epic C (Issue #241).
+ */
+
+import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
+import { join, resolve, dirname, relative, isAbsolute, sep } from 'node:path';
+import { createInterface } from 'node:readline';
+
+import {
+  assertGlabExists, setVerbose as setGlabVerbose,
+  listGroupRepos, checkVaultYaml,
+} from './lib/vault-backfill/glab.mjs';
+
+import {
+  loadTemplate, slugToHumanName, pathToSlug, renderTemplate,
+} from './lib/vault-backfill/template.mjs';
+
+import { validateManifest, SLUG_RE } from './lib/vault-backfill/manifest.mjs';
+import { _parseVaultIntegration } from './lib/config/vault-integration.mjs';
+import { loadHostPaths, resolveVaultIntegrationHost } from './lib/config/host-paths.mjs';
+import { resolveVaultDir } from './lib/config.mjs';
+import { expandTilde } from './lib/common.mjs';
+
+// ── CLI argument parsing ──────────────────────────────────────────────────────
+
+const args = process.argv.slice(2);
+
+function getArg(name) {
+  const idx = args.indexOf(name);
+  return idx !== -1 ? args[idx + 1] : undefined;
+}
+
+const flagGroups  = getArg('--groups');
+const flagDryRun  = args.includes('--dry-run');
+const flagApply   = args.includes('--apply');
+const flagYes     = getArg('--yes');
+const flagVaultDir = getArg('--vault-dir');
+const flagOutDir  = getArg('--out-dir');
+const flagVerbose = args.includes('--verbose');
+
+// ── Logging + output ──────────────────────────────────────────────────────────
+
+function log(msg) {
+  process.stderr.write(`[vault-backfill] ${msg}\n`);
+}
+
+function emitAction(action, repoPath, extra = {}) {
+  process.stdout.write(JSON.stringify({ action, path: repoPath, ...extra }) + '\n');
+}
+
+function die(code, msg) {
+  process.stderr.write(`[vault-backfill] ERROR: ${msg}\n`);
+  process.exit(code);
+}
+
+// ── Validation ────────────────────────────────────────────────────────────────
+
+if (flagDryRun && flagApply) die(1, '--dry-run and --apply are mutually exclusive');
+
+const applyWrites = flagApply === true;
+
+/** Resolved staging output directory (used when --apply is set). */
+const outDir = resolve(flagOutDir ?? './.vault-backfill-staging');
+
+/** Whether any file writes failed (contributes to exit 2). */
+let hadWriteError = false;
+
+if (flagVerbose) setGlabVerbose(true);
+
+// ── Session Config reader ─────────────────────────────────────────────────────
+
+/**
+ * Read vault-integration.{gitlab-groups,vault-dir} from CLAUDE.md / AGENTS.md in
+ * CWD through the canonical Session Config parser (#1094), so every form it
+ * accepts (block, inline object, dash/bold bullet) reaches this CLI too.
+ *
+ * `vault-dir` resolves HOST-LOCALLY like every other vault writer:
+ * SO_VAULT_DIR > owner.yaml `vault-dirs:` cwd match > owner.yaml
+ * `paths.vault-dir` > the committed value (`resolveVaultDir`). The committed
+ * value alone would put `--apply` stubs into whatever vault the committed file
+ * names, even on a host whose owner.yaml points elsewhere. Not
+ * `parseSessionConfig`: it throws on an invalid value in any unrelated block.
+ *
+ * `enabled` is the switch the other vault writers obey (board-writer,
+ * narrative-mirror: `enabled !== true` → skip), after the same host-local
+ * lowering `parseSessionConfig` applies — env `SO_VAULT_INTEGRATION` >
+ * owner.yaml `vault-integration:` > committed (#1496: stubs were created with
+ * the integration off, from an owner.yaml `paths.vault-dir` alone).
+ *
+ * @returns {{'gitlab-groups': string[]|null, 'vault-dir': string|null, enabled: boolean,
+ *   'host-override': string|null}}
+ */
+function readVaultIntegrationConfig() {
+  const candidates = [join(process.cwd(), 'CLAUDE.md'), join(process.cwd(), 'AGENTS.md')];
+
+  let content = null;
+  for (const p of candidates) {
+    if (existsSync(p)) {
+      try { content = readFileSync(p, 'utf8'); break; } catch { /* try next */ }
+    }
+  }
+
+  const hostCtx = loadHostPaths();
+  const vi = resolveVaultIntegrationHost(_parseVaultIntegration(content ?? ''), hostCtx);
+  const vaultDir = resolveVaultDir(vi['vault-dir'], hostCtx).value ?? null;
+  return {
+    'gitlab-groups': vi['gitlab-groups'],
+    'vault-dir': vaultDir,
+    enabled: vi.enabled === true,
+    'host-override': vi['host-override'],
+  };
+}
+
+// ── Vault-dir folder stub ─────────────────────────────────────────────────────
+
+function createVaultFolderStub(vaultDir, slug) {
+  if (!vaultDir) return;
+  // `~/…` is the documented vault-dir shape; resolve() alone does not expand it
+  // and would put the stub under `<cwd>/~/…`.
+  const stubDir = join(resolve(expandTilde(vaultDir)), '01-projects', slug);
+  try {
+    if (!existsSync(stubDir)) {
+      if (applyWrites) {
+        mkdirSync(stubDir, { recursive: true });
+        log(`created vault folder stub: ${stubDir}`);
+      } else {
+        log(`[dry-run] would create vault folder stub: ${stubDir}`);
+      }
+    }
+  } catch (err) {
+    process.stderr.write(
+      `[vault-backfill] WARN: could not create vault stub for ${slug}: ${err.message}\n`,
+    );
+  }
+}
+
+// ── Process one repo ──────────────────────────────────────────────────────────
+
+/** Derive the complete parent namespace from a canonical GitLab project path. */
+function parentNamespace(repoPath) {
+  if (typeof repoPath !== 'string') return 'unknown';
+
+  const segments = repoPath.split('/');
+  if (
+    segments.length < 2 ||
+    segments.some((segment) => !segment || segment === '.' || segment === '..')
+  ) {
+    return 'unknown';
+  }
+
+  return segments.slice(0, -1).join('/');
+}
+
+function processRepo(entry, vaultDir, templateContent) {
+  const { path: repoPath, slug, tier, visibility, group, id } = entry;
+  const humanName = slugToHumanName(slug);
+  const owner = parentNamespace(repoPath);
+
+  let renderedContent;
+  try {
+    renderedContent = renderTemplate(
+      { humanName, slug, tier, gitlabPath: repoPath, owner },
+      templateContent,
+    );
+  } catch (err) {
+    process.stderr.write(
+      `[vault-backfill] WARN: template render failed for ${repoPath}: ${err.message}\n`,
+    );
+    emitAction('skipped-render-error', repoPath, { slug, tier, visibility, error: err.message });
+    return;
+  }
+
+  if (!applyWrites) {
+    // Dry-run: emit preview action only (no disk write)
+    emitAction('vault-yaml-rendered', repoPath, { slug, tier, visibility, group, content: renderedContent });
+    log(`[dry-run] ${repoPath}: would write .vault.yaml (slug=${slug}, tier=${tier})`);
+    createVaultFolderStub(vaultDir, slug);
+    return;
+  }
+
+  // Apply: write to staging directory at <out-dir>/<group>/<repo>/.vault.yaml
+  const writePath = resolve(outDir, repoPath, '.vault.yaml');
+  const writePathRelativeToOutDir = relative(outDir, writePath);
+  if (
+    writePathRelativeToOutDir === '..' ||
+    writePathRelativeToOutDir.startsWith(`..${sep}`) ||
+    isAbsolute(writePathRelativeToOutDir)
+  ) {
+    const error = 'refusing to write outside staging directory';
+    emitAction('write-failed', '', { error });
+    process.stderr.write(`[vault-backfill] ERROR: ${error}\n`);
+    hadWriteError = true;
+    return;
+  }
+
+  try {
+    mkdirSync(dirname(writePath), { recursive: true });
+    writeFileSync(writePath, renderedContent, 'utf8');
+    emitAction('wrote', writePath, { slug, id, tier, visibility, group });
+    log(`${repoPath}: wrote .vault.yaml → ${writePath}`);
+  } catch (err) {
+    emitAction('write-failed', writePath, { error: err.message, slug, group });
+    process.stderr.write(
+      `[vault-backfill] ERROR: cannot write ${writePath}: ${err.message}\n`,
+    );
+    hadWriteError = true;
+  }
+
+  createVaultFolderStub(vaultDir, slug);
+}
+
+// ── Scan groups ───────────────────────────────────────────────────────────────
+
+function scanGroups(groups) {
+  let failedGroups = 0;
+  const missing = [];
+
+  for (const group of groups) {
+    log(`scanning group: ${group}`);
+    const repos = listGroupRepos(group);
+    if (repos === null) { failedGroups++; continue; }
+
+    log(`  found ${repos.length} repo(s) in ${group}`);
+    for (const repo of repos) {
+      if (!repo.path) continue;
+      const status = checkVaultYaml(repo.path);
+      if (status === 'present') {
+        log(`  ${repo.path}: already has .vault.yaml — skipping`);
+        emitAction('skipped-has-vault-yaml', repo.path, { visibility: repo.visibility, createdAt: repo.createdAt });
+        continue;
+      }
+      missing.push({ ...repo, group });
+    }
+  }
+
+  const allGroupsFailed = failedGroups > 0 && failedGroups === groups.length;
+  return { repos: missing, apiError: failedGroups > 0, allGroupsFailed };
+}
+
+// ── Table printer ─────────────────────────────────────────────────────────────
+
+function printTable(repos) {
+  if (repos.length === 0) { process.stderr.write('\n  (no repos to backfill)\n'); return; }
+
+  const COL_REPO = Math.max(4, ...repos.map((r) => r.path.length));
+  const pad = (s, n) => String(s).padEnd(n);
+  const sep = `  ${'-'.repeat(COL_REPO + 26)}\n`;
+
+  process.stderr.write('\n');
+  process.stderr.write(`  ${pad('Repo', COL_REPO)}  ${pad('Date', 10)}  Visibility\n`);
+  process.stderr.write(sep);
+  for (const r of repos) {
+    process.stderr.write(`  ${pad(r.path, COL_REPO)}  ${pad(r.createdAt, 10)}  ${r.visibility}\n`);
+  }
+  process.stderr.write('\n');
+}
+
+// ── Interactive prompt ────────────────────────────────────────────────────────
+
+async function promptForRepo(rl, repoPath, suggestedSlug) {
+  const ask = (q) => new Promise((res) => rl.question(q, (a) => res(a.trim())));
+
+  process.stderr.write(`\n  Repo: ${repoPath}\n`);
+
+  let slug;
+  while (true) {
+    const input = await ask(`  Slug [${suggestedSlug}]: `);
+    slug = input || suggestedSlug;
+    if (SLUG_RE.test(slug)) break;
+    process.stderr.write(`  Invalid slug — must match [a-z0-9]+(-[a-z0-9]+)*\n`);
+  }
+
+  let tier;
+  while (true) {
+    const input = await ask(`  Tier (top/active/archived) [active]: `);
+    tier = input || 'active';
+    if (['top', 'active', 'archived'].includes(tier)) break;
+    process.stderr.write(`  Invalid tier — must be top|active|archived\n`);
+  }
+
+  const skip = await ask(`  Skip this repo? [y/N]: `);
+  if (skip.toLowerCase() === 'y') return null;
+  return { slug, tier };
+}
+
+// ── Headless (--yes) path ─────────────────────────────────────────────────────
+
+async function runHeadless(manifestPath, vaultDir) {
+  let raw;
+  try {
+    raw = JSON.parse(readFileSync(manifestPath, 'utf8'));
+  } catch (err) {
+    die(1, `cannot parse manifest '${manifestPath}': ${err.message}`);
+  }
+
+  const repos = validateManifest(raw, die);
+  const templateContent = loadTemplate(die);
+  const pending = repos.filter((r) => !r.skip);
+
+  log(`manifest: ${repos.length} entries, ${pending.length} to process`);
+  if (pending.length === 0) { log('nothing to backfill (all skip:true)'); process.exit(4); }
+
+  // When --yes manifest is provided, it is the authoritative scope — skip the
+  // GitLab API .vault.yaml presence check so the CLI works without live repo access.
+  for (const entry of pending) {
+    processRepo(
+      { ...entry, group: entry.path.split('/')[0] ?? '' },
+      vaultDir,
+      templateContent,
+    );
+  }
+}
+
+// ── Interactive path ──────────────────────────────────────────────────────────
+
+async function runInteractive(groups, vaultDir) {
+  const templateContent = loadTemplate(die);
+
+  log('scanning groups for repos missing .vault.yaml …');
+  const { repos: missing, apiError, allGroupsFailed } = scanGroups(groups);
+
+  if (apiError) log('WARN: one or more groups had API errors; results may be incomplete');
+
+  // Exit 3 only when ALL groups failed and nothing was processed at all
+  if (allGroupsFailed) {
+    die(3, 'all GitLab group scans failed — check auth (GITLAB_TOKEN) and group paths');
+  }
+
+  if (missing.length === 0) { log('all scanned repos already have .vault.yaml — nothing to backfill'); process.exit(4); }
+
+  printTable(missing);
+  log(`found ${missing.length} repo(s) without .vault.yaml`);
+
+  if (!applyWrites) {
+    log('(dry-run mode — use --apply to write .vault.yaml files)');
+    for (const repo of missing) {
+      processRepo({ ...repo, slug: pathToSlug(repo.path), tier: 'active' }, vaultDir, templateContent);
+    }
+    return;
+  }
+
+  // Interactive prompts
+  const rl = createInterface({ input: process.stdin, output: process.stderr, terminal: true });
+  const decisions = [];
+
+  for (const repo of missing) {
+    const decision = await promptForRepo(rl, repo.path, pathToSlug(repo.path));
+    if (decision === null) {
+      log(`${repo.path}: skipped by user`);
+      emitAction('skipped-by-user', repo.path, { visibility: repo.visibility });
+      continue;
+    }
+    decisions.push({ repo, ...decision });
+  }
+
+  if (decisions.length === 0) {
+    rl.close();
+    log('no repos selected — nothing to apply');
+    process.exit(0);
+  }
+
+  process.stderr.write(`\n  ${decisions.length} repo(s) will receive .vault.yaml. Apply? [y/N]: `);
+  const confirmed = await new Promise((resolve) => {
+    rl.question('', (a) => { rl.close(); resolve(a.trim().toLowerCase()); });
+  });
+
+  if (confirmed !== 'y') { log('aborted by user — no writes performed'); process.exit(0); }
+
+  for (const { repo, slug, tier } of decisions) {
+    processRepo({ ...repo, slug, tier }, vaultDir, templateContent);
+  }
+}
+
+// ── Main ──────────────────────────────────────────────────────────────────────
+
+async function main() {
+  const cfgConfig = readVaultIntegrationConfig();
+
+  let groups;
+  if (flagGroups) {
+    groups = flagGroups.split(',').map((g) => g.trim()).filter(Boolean);
+  } else if (cfgConfig['gitlab-groups']) {
+    groups = cfgConfig['gitlab-groups'];
+  }
+
+  // The configured vault-dir counts only while vault-integration is on; an
+  // explicit --vault-dir is this run's own request and still wins.
+  let vaultDir = flagVaultDir ?? null;
+  if (vaultDir === null && cfgConfig['vault-dir'] !== null) {
+    if (cfgConfig.enabled) {
+      vaultDir = cfgConfig['vault-dir'];
+    } else {
+      const why = cfgConfig['host-override'] ? `switched off by ${cfgConfig['host-override']}` : 'not enabled';
+      log(`vault-integration is ${why} — no vault folder stubs (pass --vault-dir to create them anyway)`);
+    }
+  }
+
+  if (!flagYes && (!groups || groups.length === 0)) {
+    die(1, 'no GitLab groups specified — pass --groups <CSV> or set vault-integration.gitlab-groups in CLAUDE.md');
+  }
+
+  if (flagYes) {
+    // Headless path: manifest is authoritative. No glab required (CI / air-gapped).
+    await runHeadless(flagYes, vaultDir);
+  } else {
+    // Interactive path: glab is required for group scanning + per-repo presence checks.
+    assertGlabExists(die);
+    await runInteractive(groups, vaultDir);
+  }
+
+  // Propagate write failures (EACCES, ENOSPC, etc.) as exit code 2
+  if (hadWriteError) {
+    process.stderr.write('[vault-backfill] ERROR: one or more .vault.yaml writes failed (see above)\n');
+    process.exit(2);
+  }
+}
+
+main().catch((err) => {
+  process.stderr.write(`[vault-backfill] unexpected error: ${err.message}\n`);
+  if (flagVerbose && err.stack) process.stderr.write(err.stack + '\n');
+  process.exit(2);
+});

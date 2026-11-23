@@ -1,0 +1,218 @@
+/**
+ * cross-repo.mjs — Parser for the `cross-repo:` sub-block in Session Config (#469, #478).
+ *
+ * Exports:
+ *   _parseCrossRepo(content)       — PURE, no side effects. Extracts cross-repo.projects from
+ *                                    the top-level `cross-repo:` block in markdown content.
+ *   getCrossRepoProjects(cwd?)     — async accessor: reads config file, parses, returns list.
+ *   resolveCrossRepoEntry(entry)   — PURE resolver for one flat `cross-repos` entry (#1922).
+ *
+ * Uses block-scanner (not _parseKV) because the dot in "cross-repo.projects" is not
+ * supported by the KV regex. Scans for a `cross-repo:` block and then reads `projects:`.
+ */
+
+// `readConfigFile` is imported from the dependency-free leaf config/io.mjs (a
+// sibling), NOT from config.mjs. This avoids the former length-2 cycle
+// config.mjs ⇄ config/cross-repo.mjs (config.mjs imports `_parseCrossRepo` from
+// here). We deliberately do NOT import `parseSessionConfig` — calling it from
+// `getCrossRepoProjects` would re-run `_parseCrossRepo` (double-parse). By calling
+// `_parseCrossRepo` directly on the raw content we parse exactly once. (issue #664)
+import { existsSync, statSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { isAbsolute, join, win32 } from 'node:path';
+import { expandTilde } from '../common.mjs';
+import { readConfigFile } from './io.mjs';
+import { loadHostPaths, resolveHostPath } from './host-paths.mjs';
+import { matchBlockHeader } from './block-header.mjs';
+import { preprocessBlockLines } from './block-preprocess.mjs';
+
+/**
+ * Expand a leading `~` / `~/` to the home directory and accept the result only
+ * when it is absolute. A relative value would otherwise resolve against the
+ * process cwd — a different root per caller — so it is rejected instead.
+ * An existing non-directory (a file) is rejected too (#1567): every sweep under
+ * it would find nothing. A path that does not exist yet is accepted, like the
+ * ~/Projects default — callers guard with existsSync, and falling back from an
+ * unmounted volume to ~/Projects would widen the confinement root.
+ *
+ * @param {string} raw — non-blank value from one precedence tier
+ * @param {string} source — tier name for the WARN (`env SO_PROJECTS_ROOT` / `owner.yaml paths.projects-root`)
+ * @returns {string|null} absolute path, or null when rejected
+ */
+function expandProjectsRoot(raw, source) {
+  const expanded = expandTilde(raw.trim());
+  if (!isAbsolute(expanded)) {
+    process.stderr.write(
+      `cross-repo: ignoring ${source}=${JSON.stringify(raw)} — not an absolute path after ~ expansion; falling back\n`,
+    );
+    return null;
+  }
+  let stat;
+  try {
+    stat = statSync(expanded, { throwIfNoEntry: false });
+  } catch {
+    stat = undefined; // unreadable (EACCES/ENOTDIR): treated like a missing path — never throw here
+  }
+  if (stat && !stat.isDirectory()) {
+    process.stderr.write(
+      `cross-repo: ignoring ${source}=${JSON.stringify(raw)} — exists but is not a directory; falling back\n`,
+    );
+    return null;
+  }
+  return expanded;
+}
+
+/**
+ * Resolve the cross-repo confinement root — the directory host-wide sweeps scan
+ * and outside which `cross-repo.projects` entries are dropped (#1562).
+ *
+ * Precedence (highest first):
+ *   1. env CROSS_REPO_CONFINEMENT_ROOT — test-only, never set in production;
+ *      returned verbatim when non-blank (no ~ expansion, no absolute check).
+ *   2. env SO_PROJECTS_ROOT            — host-local, via resolveHostPath.
+ *   3. owner.yaml paths.projects-root  — host-local, via resolveHostPath.
+ *   4. ~/Projects                      — default.
+ * Tiers 2 and 3 expand a leading `~`; a value that is still not absolute is
+ * ignored with one stderr WARN and the next tier is tried. owner.yaml is read
+ * only when tiers 1 and 2 yield nothing usable.
+ *
+ * @param {{ env?: Record<string, string|undefined>, ownerConfig?: object }} [ctx]
+ *   injection seam for tests, mirroring resolveHostPath; `ownerConfig` omitted →
+ *   owner.yaml is loaded from disk via loadHostPaths()
+ * @returns {string} confinement root
+ */
+export function getConfinementRoot({ env = process.env, ownerConfig } = {}) {
+  const v = env.CROSS_REPO_CONFINEMENT_ROOT;
+  if (v && v.trim()) return v;
+
+  const fromEnv = resolveHostPath('projects-root', undefined, { env, ownerConfig: undefined });
+  if (typeof fromEnv === 'string') {
+    const root = expandProjectsRoot(fromEnv, 'env SO_PROJECTS_ROOT');
+    if (root) return root;
+  }
+
+  const owner = ownerConfig ?? loadHostPaths({ env }).ownerConfig;
+  const fromOwner = resolveHostPath('projects-root', undefined, { env: {}, ownerConfig: owner });
+  if (typeof fromOwner === 'string') {
+    const root = expandProjectsRoot(fromOwner, 'owner.yaml paths.projects-root');
+    if (root) return root;
+  }
+
+  return join(homedir(), 'Projects');
+}
+
+// Allowlist: only characters that are safe in shell contexts and file paths.
+// Rejects entries containing shell metacharacters (;, $, `, |, &, >, <, (, ), space, etc.).
+const SAFE_PATH_RE = /^[A-Za-z0-9._~/-]+$/;
+
+/**
+ * Parse the `cross-repo:` block from markdown content and extract the `projects:` list.
+ *
+ * Behaviour-preserving lift of the IIFE that previously lived in config.mjs.
+ * Scans lines for `cross-repo:` block header, then reads the `projects:` key inside.
+ * Stops scanning at the next non-indented, non-empty line (next top-level YAML key).
+ *
+ * @param {string} content — full CLAUDE.md / AGENTS.md file content
+ * @returns {string[]} list of project paths, or [] when absent/empty/none/null
+ */
+export function _parseCrossRepo(content) {
+  const lines = preprocessBlockLines(content);
+  let inBlock = false;
+
+  for (const rawLine of lines) {
+    const line = rawLine.replace(/\r$/, '');
+
+    if (!inBlock) {
+      if (matchBlockHeader(line, 'cross-repo')) { inBlock = true; }
+      continue;
+    }
+
+    // Stop at next top-level (non-indented, non-empty) key
+    if (line.length > 0 && !/^\s/.test(line)) break;
+
+    const m = line.match(/^\s+projects:\s*(.*)/);
+    if (m) {
+      const raw = m[1].replace(/\s*#.*$/, '').trim();
+      if (!raw || raw === 'none' || raw === 'null') return [];
+      const stripped = raw.replace(/^\s*\[/, '').replace(/\]\s*$/, '').trim();
+      if (stripped === '') return [];
+      // SEAM(#477): per-entry shell-meta validation — reject entries with shell metacharacters.
+      return stripped.split(',').map(s => s.trim()).filter(s => {
+        if (s.length === 0) return false;
+        if (!SAFE_PATH_RE.test(s)) {
+          process.stderr.write(`cross-repo: rejected project entry with shell metacharacter: ${JSON.stringify(s)}\n`);
+          return false;
+        }
+        return true;
+      });
+    }
+  }
+
+  return [];
+}
+
+/**
+ * Load cross-repo.projects from Session Config (CLAUDE.md / AGENTS.md) in the
+ * given working directory (defaults to process.cwd()).
+ *
+ * Returns an empty array when the field is absent or the config file is not found.
+ * Never throws.
+ *
+ * @param {string} [cwd] — directory to search for CLAUDE.md / AGENTS.md
+ * @returns {Promise<string[]>}
+ */
+export async function getCrossRepoProjects(cwd = process.cwd()) {
+  try {
+    const mdContent = await readConfigFile(cwd);
+    // Direct call (not via parseSessionConfig) — avoids the double-parse and tightens
+    // the cycle surface to a single readConfigFile edge. See module-header note.
+    return _parseCrossRepo(mdContent);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Resolve one flat `cross-repos` entry by the one rule stated in
+ * docs/session-config-reference.md § cross-repos (#1922): an entry that starts
+ * with `/` or `~/` is a path used as written (a leading `~` expands to `home`);
+ * any other entry is a bare repository name under `~/Projects/<name>`. A missing
+ * folder is a hint, never an error — the caller prints `hint` and continues.
+ *
+ * Pure: no logging, no throw on a missing folder; the filesystem is touched only
+ * through the injected `exists`.
+ *
+ * Projects root: bare names resolve under `projectsRoot`, default
+ * `<home>/Projects`. Session start and `/plan` use the default; the dispatcher
+ * (`scripts/lib/dispatcher/enumerate.mjs`) passes its confinement root
+ * (getConfinementRoot(): SO_PROJECTS_ROOT > owner.yaml paths.projects-root >
+ * ~/Projects), so a name lands inside the directory its FS scan confines to.
+ * One rule, one configurable root.
+ *
+ * @param {string} entry — one raw list entry from Session Config `cross-repos`
+ * @param {{ home?: string, projectsRoot?: string, exists?: (path: string) => boolean }} [opts]
+ * @returns {{ entry: string, path: string, kind: 'path'|'name', exists: boolean, hint: string|null }}
+ * @throws {TypeError} when `entry` is not a non-blank string
+ */
+export function resolveCrossRepoEntry(
+  entry,
+  { home = homedir(), projectsRoot = join(home, 'Projects'), exists = existsSync } = {},
+) {
+  if (typeof entry !== 'string' || entry.trim() === '') {
+    throw new TypeError('resolveCrossRepoEntry: entry must be a non-blank string');
+  }
+  const value = entry.trim();
+  // A Windows drive path (`C:\…`, `C:/…`) is a path too — before this check the
+  // dispatcher resolved it with path.resolve(), so a bare-name reading would
+  // have turned it into `<projectsRoot>/C:\…` (W3-P3 finding, 2026-11-02).
+  const isPath = value.startsWith('/') || value.startsWith('~/') || win32.isAbsolute(value);
+  const path = value.startsWith('~/') ? join(home, value.slice(2)) : isPath ? value : join(projectsRoot, value);
+  const found = Boolean(exists(path));
+  return {
+    entry: value,
+    path,
+    kind: isPath ? 'path' : 'name',
+    exists: found,
+    hint: found ? null : `cross-repos: ${value} — no folder at ${path}, skipped`,
+  };
+}

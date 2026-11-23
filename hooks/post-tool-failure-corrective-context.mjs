@@ -1,0 +1,236 @@
+#!/usr/bin/env node
+/**
+ * post-tool-failure-corrective-context.mjs — PostToolUseFailure hook.
+ *
+ * Hook event: PostToolUseFailure (issue #342).
+ * Fires after a tool invocation exits with a non-zero status or produces an
+ * error payload. Appends a structured corrective-context note to the
+ * `corrective_context` array in `.orchestrator/current-session.json` so the
+ * coordinator and downstream skills can inspect recent tool failures without
+ * re-reading the full event log.
+ *
+ * Decision flow:
+ *   1. shouldRunHook gate — exit 0 immediately when the hook is disabled.
+ *   2. Read JSON payload from stdin: { tool_name, tool_input, error, exit_code }.
+ *   3. Build a compact note: { timestamp, tool_name, error_summary, exit_code }.
+ *      error_summary is capped at 256 chars to keep the session file lean.
+ *   4. Atomic read-modify-write of .orchestrator/current-session.json:
+ *      append to `corrective_context` array (create if absent), keep last 20
+ *      entries to bound file growth.
+ *   5. Write to stderr only (stdout must remain clean — hook is informational).
+ *
+ * Exit codes: 0 always (informational, never blocking).
+ *
+ * hooks.json wiring is managed separately (W3-C4 scope).
+ */
+
+import path from 'node:path';
+import { isShellCommandTool } from '../scripts/lib/io.mjs';
+
+import { shouldRunHook } from './_lib/profile-gate.mjs';
+import { isMainModule } from '../scripts/lib/is-main-module.mjs';
+
+import { getProjectDir } from '../scripts/lib/platform.mjs';
+import { atomicMutateJson } from './_lib/atomic-json.mjs';
+import { resolveOwnLockRoot } from './_lib/hook-root.mjs';
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/** Maximum number of corrective context entries retained per session. */
+const MAX_ENTRIES = 20;
+
+/** Maximum length of error_summary field (chars). */
+const MAX_ERROR_SUMMARY_CHARS = 256;
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Read stdin to EOF (best-effort). Returns parsed JSON or null on failure.
+ * Uses a 5 s timeout consistent with Claude Code hook contract.
+ *
+ * @returns {Promise<object|null>}
+ */
+function readStdinJson() {
+  return new Promise((resolve) => {
+    if (process.stdin.readableEnded || process.stdin.closed) {
+      resolve(null);
+      return;
+    }
+    const chunks = [];
+    const timer = setTimeout(() => { resolve(null); }, 5_000);
+    process.stdin.setEncoding('utf8');
+    process.stdin.on('data', (c) => chunks.push(c));
+    process.stdin.on('end', () => {
+      clearTimeout(timer);
+      const raw = chunks.join('').trim();
+      if (!raw) { resolve(null); return; }
+      try { resolve(JSON.parse(raw)); } catch { resolve(null); }
+    });
+    process.stdin.on('error', () => { clearTimeout(timer); resolve(null); });
+    process.stdin.resume();
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
+
+/**
+ * Derive a short cause-hint and suggestion based on the tool name and
+ * error text. All strings are kept short to stay within the ~500-char
+ * additionalContext budget.
+ *
+ * @param {string|null} toolName
+ * @param {string|null} errorSummary
+ * @returns {{ cause: string, suggestion: string }}
+ */
+function deriveHints(toolName, errorSummary) {
+  const err = (errorSummary ?? '').toLowerCase();
+
+  if (isShellCommandTool(toolName)) {
+    if (err.includes('permission denied') || err.includes('eacces')) {
+      return {
+        cause: 'insufficient file permissions',
+        suggestion: 'check file mode with `ls -la` and adjust with `chmod` if needed',
+      };
+    }
+    if (err.includes('command not found') || err.includes('enoent')) {
+      return {
+        cause: 'command or binary not on PATH',
+        suggestion: 'verify the binary is installed and `which <cmd>` resolves it',
+      };
+    }
+    if (err.includes('timeout') || err.includes('timed out')) {
+      return {
+        cause: 'command exceeded time limit',
+        suggestion: 'increase the timeout parameter or break the command into smaller steps',
+      };
+    }
+    return {
+      cause: 'shell command exited non-zero',
+      suggestion: 'inspect the error output above, fix the root cause, and retry',
+    };
+  }
+
+  if (toolName === 'Edit' || toolName === 'Write') {
+    if (err.includes('no such file') || err.includes('enoent')) {
+      return {
+        cause: 'target file or parent directory does not exist',
+        suggestion: 'create the missing directory with `mkdir -p` before writing',
+      };
+    }
+    if (err.includes('old_string not found') || err.includes('not unique')) {
+      return {
+        cause: 'old_string did not match any text in the file',
+        suggestion: 're-read the file to confirm the exact text, then retry with a wider context window',
+      };
+    }
+    return {
+      cause: 'file edit failed',
+      suggestion: 're-read the file to verify its current state, then retry',
+    };
+  }
+
+  if (toolName === 'Read') {
+    return {
+      cause: 'file could not be read (missing or unreadable)',
+      suggestion: 'verify the path exists and is accessible before retrying',
+    };
+  }
+
+  if (toolName === 'Glob' || toolName === 'Grep') {
+    return {
+      cause: 'search returned an error (bad pattern or missing directory)',
+      suggestion: 'check the pattern syntax and confirm the search root exists',
+    };
+  }
+
+  // Fallback for unknown tools.
+  return {
+    cause: 'tool invocation failed',
+    suggestion: 'check the error details above and retry with corrected parameters',
+  };
+}
+
+async function main() {
+  const input = await readStdinJson();
+
+  // Extract fields from the hook payload. All optional — missing fields are
+  // represented as null in the stored note.
+  const toolName = typeof input?.tool_name === 'string' ? input.tool_name : null;
+  const exitCode = typeof input?.exit_code === 'number' ? input.exit_code : null;
+
+  const rawError =
+    typeof input?.error === 'string'
+      ? input.error
+      : (input?.error !== null && input?.error !== undefined ? String(input.error) : null);
+
+  const errorSummary = rawError !== null
+    ? rawError.slice(0, MAX_ERROR_SUMMARY_CHARS)
+    : null;
+
+  const note = {
+    timestamp: new Date().toISOString(),
+    tool_name: toolName,
+    error_summary: errorSummary,
+    exit_code: exitCode,
+  };
+
+  // #1605 B5 — annotate THIS session's current-session.json where
+  // on-session-start.mjs put it (the entered worktree after a /clear there),
+  // found by the lock carrying the raw payload id; launch dir otherwise.
+  const sessionFile = path.join(resolveOwnLockRoot(input, getProjectDir()), '.orchestrator', 'current-session.json');
+
+  const result = await atomicMutateJson(sessionFile, {}, (current) => {
+    const existing = Array.isArray(current.corrective_context)
+      ? current.corrective_context
+      : [];
+    // Append the new note and cap at MAX_ENTRIES (keep most-recent).
+    const updated = [...existing, note].slice(-MAX_ENTRIES);
+    return { ...current, corrective_context: updated };
+  }, 'ptf');
+  // additionalContext below is derived from `note` in-memory, independent of
+  // whether the write landed — a non-ENOENT read/parse failure only means
+  // this turn's note is not persisted to current-session.json.
+  if (!result.ok) {
+    console.error(`post-tool-failure-corrective-context: atomicMutateJson skipped write (${result.reason})`);
+  }
+
+  // Surface corrective context to Claude via additionalContext on the next turn.
+  // PostToolUseFailure hookSpecificOutput shape per CC docs:
+  //   { hookSpecificOutput: { hookEventName: "PostToolUseFailure", additionalContext: "<string>" } }
+  // Keep the message under ~500 chars so it stays readable.
+  const { cause, suggestion } = deriveHints(toolName, errorSummary);
+  const toolLabel = toolName ?? 'unknown tool';
+  const exitLabel = exitCode !== null ? ` (exit ${exitCode})` : '';
+  // Strip control chars (newlines, ANSI escapes) before forwarding to additionalContext —
+  // SEC-016 (Log Injection): tool errors may contain attacker-controlled bytes.
+  const safeSummary = errorSummary
+    ? errorSummary.replace(/[\r\n]/g, ' ').split('\x1b').join(' ').slice(0, 120)
+    : '';
+  const summaryLabel = safeSummary ? ` Error: ${safeSummary}` : '';
+  const additionalContext =
+    `Tool failure: ${toolLabel}${exitLabel}.${summaryLabel} ` +
+    `Common cause: ${cause}. Try: ${suggestion}.`;
+
+  process.stdout.write(JSON.stringify({
+    hookSpecificOutput: {
+      hookEventName: 'PostToolUseFailure',
+      additionalContext: additionalContext.slice(0, 500),
+    },
+  }));
+}
+
+// Entry guard (#1393): run only as the node script the harness execs — a bare
+// `import()` must run no handler and must not exit the importing process.
+if (isMainModule(import.meta.url)) {
+  // Exit 0 immediately when disabled via SO_HOOK_PROFILE / SO_DISABLED_HOOKS.
+  if (!shouldRunHook('post-tool-failure-corrective-context')) process.exit(0);
+
+  // Exit 0 always — informational hook must never block Claude.
+  main().catch(() => {}).finally(() => process.exit(0));
+}

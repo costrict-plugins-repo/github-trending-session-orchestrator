@@ -1,0 +1,673 @@
+/**
+ * telemetry/schema.mjs — usage-ping v1 schema, whitelist projection, roster
+ * filter, and payload builder for anonymous usage telemetry (Epic #841, S2 /
+ * GitLab #843; PRD docs/prd/2026-07-20-anonymous-usage-telemetry.md §3-FA2).
+ *
+ * Privacy is the raison d'être of this module. It mirrors the data-minimization
+ * pattern of scripts/lib/eval/schema.mjs (SUBMISSION_FIELDS + projectSubmission):
+ * a FROZEN field whitelist plus a data-driven projection so nothing outside the
+ * whitelist can ever reach the wire — no paths, repo names, prompts, args, git
+ * remotes, or hostnames. Skill/command names are additionally projected against
+ * the shipped plugin roster: any name not in the roster becomes the opaque token
+ * "other", so custom/third-party names never leave the machine.
+ *
+ * ── USAGE-PING RECORD (schema_version: 1, record_kind: "usage-ping") ─────────
+ *   record_kind      'usage-ping'
+ *   schema_version   1
+ *   anon_id          set downstream by ensureAnonId (anon-id.mjs) — NOT here
+ *   sent_at          ISO 8601 string (passed in as `now`)
+ *   plugin_version   package.json version at SO_PLUGIN_ROOT, or 'unknown'
+ *   platform         claude|codex|cursor|pi (+ 'other' fallback)
+ *   os               normalizeOs(process.platform) — closed set, else 'other'
+ *   arch             normalizeArch(process.arch) — closed set, else 'other'
+ *   node_major       integer major version of the running Node
+ *   ci               boolean — running under CI
+ *   fleet            boolean — operator fleet mode (owner.yaml telemetry.enabled)
+ *   session_type     housekeeping|feature|deep (+ 'other' fallback)
+ *   duration_bucket  '<15m'|'15-60m'|'1-3h'|'>3h'
+ *   skills           roster-filtered, deduped, sorted string[] (≤100)
+ *   commands         roster-filtered, deduped, sorted string[] (≤100)
+ *
+ * The builder returns the record WITHOUT anon_id — the caller sets it via
+ * ensureAnonId so the ID-rotation concern stays isolated in anon-id.mjs.
+ *
+ * This module reads files (package.json, the roster surface dirs) but writes
+ * none and holds no mutable runtime state.
+ */
+
+import { getPlatform, getPluginRoot } from '../platform.mjs';
+import { enumerateSurface } from '../sunset/walker.mjs';
+import { readPluginVersionFromPackageJson } from '../bootstrap-lock-freshness.mjs';
+import { VALID_SESSION_PROFILES } from '../session-schema/constants.mjs';
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/** Current usage-ping schema version. Additive-only within a version. */
+export const USAGE_PING_SCHEMA_VERSION = 1;
+
+/**
+ * FROZEN whitelist of the ONLY fields a usage-ping may carry. projectUsagePing is
+ * fully data-driven from this list: a field absent here is dropped. Widening this
+ * list is the intended fake-regression tripwire — adding a leaky field (e.g.
+ * 'repo') turns the data-minimization projection test RED.
+ */
+export const USAGE_PING_FIELDS = Object.freeze([
+  'record_kind',
+  'schema_version',
+  'anon_id',
+  'sent_at',
+  'plugin_version',
+  'platform',
+  'os',
+  'arch',
+  'node_major',
+  'ci',
+  'fleet',
+  'session_type',
+  'duration_bucket',
+  'skills',
+  'commands',
+]);
+
+/**
+ * ADDITIVE optional fields (schema v1, GitLab #1234). Deliberately a SECOND
+ * list rather than an extension of USAGE_PING_FIELDS above, for two reasons:
+ *
+ *  1. USAGE_PING_FIELDS is the REQUIRED v1 contract — `tests/telemetry/parity.mjs`
+ *     asserts, field by field, that the server independently REQUIRES every
+ *     member. An optional field is by definition not required, so putting it in
+ *     that list would force the parity guard to be weakened for all 15 fields to
+ *     accommodate one.
+ *  2. The frozen-list tripwire (`projectUsagePing` drops anything unlisted)
+ *     stays intact: the projection whitelist is the UNION of both lists, so a
+ *     leaky field still has to be added to a reviewed list before it can reach
+ *     the wire.
+ *
+ * Server tolerance: `server/ingest/validate.mjs` accepts unknown top-level
+ * fields and preserves them verbatim in `raw_json` (see its module docblock), so
+ * every member here round-trips through a server that predates it.
+ */
+export const USAGE_PING_OPTIONAL_FIELDS = Object.freeze([
+  'fleet_self_declared',
+  'session_record',
+  'session_profile',
+  'ledger_complete',
+]);
+
+/**
+ * The full projection whitelist: required v1 fields + additive optional fields.
+ * `projectUsagePing` is driven from THIS, so neither list alone can leak a field.
+ */
+const USAGE_PING_PROJECTED_FIELDS = Object.freeze([...USAGE_PING_FIELDS, ...USAGE_PING_OPTIONAL_FIELDS]);
+
+/**
+ * `session_record` provenance tokens — WHICH source the session facts
+ * (`session_type`, `duration_bucket`) in this ping came from.
+ *
+ *  - `ledger`  — `.orchestrator/metrics/sessions.jsonl` had a matching record.
+ *  - `derived` — no ledger record; the facts were reconstructed from
+ *                `events.jsonl` (`orchestrator.session.started` + last event).
+ *  - `absent`  — neither source produced a session type. `session_type` is then
+ *                `'unknown'` and `duration_bucket` is NOT a measurement.
+ *
+ * Measured 2026-09-06 (d8 audit): this repo has NO sessions.jsonl, so 100 % of
+ * its pings took the `absent` path and were indistinguishable on the wire from
+ * a genuinely-measured `other` / `<15m` session — 32 such pings on the server.
+ */
+export const SESSION_RECORD_SOURCES = Object.freeze(['ledger', 'derived', 'absent']);
+
+/*
+ * `ledger_complete` — a SECOND, ORTHOGONAL axis beside `session_record`
+ * (GitLab #1416), deliberately NOT a fourth provenance token.
+ *
+ * `deriveSessionFromEvents` (telemetry/sync.mjs) returns a three-state verdict on
+ * the events ledger it read FROM: `true` (every rotation archive present),
+ * `false` (at least one measured gap — a deleted/missing archive), and `null`
+ * (no verdict was produced at all: the read threw, or there was no source). That
+ * verdict decided nothing on the wire, so a derived record reconstructed from a
+ * holey ledger was indistinguishable from one reconstructed from a whole one.
+ *
+ * Why a boolean and not a `derived-partial` token: `SESSION_RECORD_SOURCES` is a
+ * frozen enum mirrored in prose and in the server's `raw_json` consumers, and
+ * completeness is a property of the SOURCE READ, not of WHICH source was used —
+ * widening the provenance enum would make the two facts inseparable and force
+ * every reader of `session_record === 'derived'` to learn a second spelling.
+ *
+ * THE THIRD STATE IS OMISSION: only a real boolean is written. `null` (nothing
+ * measured) omits the key, exactly like `session_profile` — "we did not look" is
+ * never sent as a measured `false`. On the `ledger` branch the field is not set
+ * at ALL: that path never reads the events ledger, so it has no verdict to give.
+ */
+
+/** Exact duration-bucket tokens (ASCII, stable wire values). */
+export const DURATION_BUCKETS = Object.freeze(['<15m', '15-60m', '1-3h', '>3h']);
+
+/** Roster-projection guardrails. */
+const ROSTER_OTHER = 'other';
+const MAX_NAME_LENGTH = 64;
+const MAX_NAMES = 100;
+
+/**
+ * The two list bounds that are genuinely SHARED with the ingest server
+ * (`server/ingest/validate.mjs` `INGEST_LIST_BOUNDS` — MAX_LIST_ITEMS /
+ * MAX_LIST_ITEM_LEN). Exported so `tests/telemetry/parity.test.mjs` can compare
+ * the two trees instead of trusting two hand-typed numbers: a client that caps
+ * higher than the server emits pings the server 400s.
+ *
+ * The server's other five bounds (MAX_ANON_ID, MAX_SENT_AT, MAX_PLUGIN_VERSION,
+ * MAX_SESSION_TYPE, MAX_SESSION_PROFILE) are SERVER-ONLY BY DESIGN — they bound
+ * inputs from any client, including foreign or tampered ones, and have no client
+ * counterpart to keep in lockstep. Do not mirror them here.
+ */
+export const SHARED_LIST_BOUNDS = Object.freeze({
+  maxItems: MAX_NAMES,
+  maxItemLength: MAX_NAME_LENGTH,
+});
+
+/** Enum fallbacks. */
+const VALID_PLATFORMS = Object.freeze(['claude', 'codex', 'cursor', 'pi']);
+// DELIBERATE ASYMMETRY, not a drift: this is the TELEMETRY type set and omits
+// `'unknown'`, which session-schema/constants.mjs VALID_SESSION_TYPES carries.
+// There `unknown` is a storable ledger value; here it is a NORMALIZER FALLBACK
+// (SESSION_TYPE_UNKNOWN below) that must never be reachable from the input set,
+// or "we could not tell" would be indistinguishable from a measured type. Not
+// unified with constants.mjs for exactly that reason.
+const VALID_SESSION_TYPES = Object.freeze(['housekeeping', 'feature', 'deep']);
+const PLATFORM_OTHER = 'other';
+const SESSION_TYPE_OTHER = 'other';
+/**
+ * The type was never measured — distinct from `'other'`, which means "measured,
+ * but not one of the three known modes". Conflating the two is the defect this
+ * token fixes: before it existed, a ping built with NO session record silently
+ * reported `'other'`, so "we could not tell" and "we looked and it was unusual"
+ * were the same wire value.
+ *
+ * NOT an enum widening server-side: `session_type` is validated as a bounded
+ * STRING (`server/ingest/validate.mjs` `requireString` + `MAX_SESSION_TYPE`),
+ * never against a closed set, so `'unknown'` is accepted by today's server.
+ */
+const SESSION_TYPE_UNKNOWN = 'unknown';
+
+/**
+ * CLOSED whitelist of PUBLIC session-profile names that may reach the wire.
+ *
+ * RE-EXPORT, not a definition (GitLab #1252): the SSOT is
+ * `scripts/lib/session-schema/constants.mjs` `VALID_SESSION_PROFILES`, whose
+ * docblock carries the reproduced leak and the whitelist-over-regex rationale.
+ *
+ * Kept as a pure COMPATIBILITY SHIM, and measured as one: since 2026-09-07 no
+ * module in this repo imports the name from here (`rg -n VALID_SESSION_PROFILES
+ * scripts server hooks skills tests` — the two telemetry tests that used to now
+ * address constants.mjs). It stays because removing an export is a MAJOR change
+ * and this is a patch line; a deep importer outside the repo may still hold it.
+ * `tests/telemetry/schema.test.mjs` pins it with an IDENTITY assertion
+ * (`toBe`, not `toEqual`) so the shim can never quietly become a second
+ * definition of the whitelist.
+ *
+ * Adding a profile is a reviewed edit in constants.mjs AND in the server's
+ * mirror (`server/ingest/validate.mjs` `SESSION_PROFILES`) — the same two-tree
+ * contract `ACCEPTED_VERSIONS` already uses server-side.
+ */
+export { VALID_SESSION_PROFILES };
+
+/**
+ * Closed sets for os/arch client-side normalization. A value outside the set —
+ * including a future Node os/arch string — degrades to 'other', so the client
+ * never sends a value the server's enum would reject with a 400. These MUST
+ * mirror the server's OS/ARCH enums (server/validate.mjs); a loong64 client
+ * therefore sends 'loong64' (in-set → accepted with a signal), while a
+ * hypothetical unknown value degrades safely.
+ */
+const OS_VALUES = Object.freeze(['aix', 'darwin', 'freebsd', 'linux', 'openbsd', 'sunos', 'win32', 'android']);
+const ARCH_VALUES = Object.freeze([
+  'arm', 'arm64', 'ia32', 'loong64', 'mips', 'mipsel', 'ppc', 'ppc64', 'riscv64', 's390', 's390x', 'x64',
+]);
+const OS_OTHER = 'other';
+const ARCH_OTHER = 'other';
+
+/** Prefix under which skills are recorded in skill-invocations.jsonl. */
+const SKILL_PREFIX = 'session-orchestrator:';
+
+const MS_PER_SECOND = 1000;
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+function isPlainObject(v) {
+  return v !== null && typeof v === 'object' && !Array.isArray(v);
+}
+
+function isNonEmptyString(v) {
+  return typeof v === 'string' && v.trim().length > 0;
+}
+
+// ---------------------------------------------------------------------------
+// Whitelist projection (Data-Minimization)
+// ---------------------------------------------------------------------------
+
+/**
+ * Project an arbitrary object onto the usage-ping whitelist (USAGE_PING_FIELDS
+ * PLUS USAGE_PING_OPTIONAL_FIELDS).
+ * Fully data-driven: any key not on the whitelist — paths, repo names, prompts,
+ * args, hostnames, rogue extras — is dropped. Array fields (skills, commands) are
+ * copied as NEW arrays so no caller reference leaks into the projection.
+ *
+ * @param {object} input
+ * @returns {object} whitelist-safe projection
+ */
+export function projectUsagePing(input) {
+  if (!isPlainObject(input)) return {};
+  const out = {};
+  for (const key of USAGE_PING_PROJECTED_FIELDS) {
+    if (key in input) {
+      const v = input[key];
+      out[key] = Array.isArray(v) ? [...v] : v;
+    }
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Roster loader
+// ---------------------------------------------------------------------------
+
+/**
+ * Load the shipped plugin roster (skills + commands) from the on-disk surface.
+ * Uses enumerateSurface() against SO_PLUGIN_ROOT (never process.cwd()) so the
+ * roster reflects the INSTALLED plugin, not the operator's working directory.
+ *
+ * skills are returned prefixed with 'session-orchestrator:' (matching the names
+ * recorded in skill-invocations.jsonl); commands are bare.
+ *
+ * Fail-closed: if the surface directory is missing (e.g. a partial npm install)
+ * or enumeration throws, this returns EMPTY sets and a stderr WARN — an empty
+ * roster means every name projects to "other", never a leak.
+ *
+ * @param {{pluginRoot?: string}} [opts]
+ * @returns {{skills: Set<string>, commands: Set<string>}}
+ */
+export function loadRoster({ pluginRoot } = {}) {
+  const root = (typeof pluginRoot === 'string' && pluginRoot.trim() !== '')
+    ? pluginRoot
+    : getPluginRoot();
+
+  if (!isNonEmptyString(root)) {
+    process.stderr.write(
+      "[telemetry] WARN: plugin root unresolved — roster empty, all skill/command names project to 'other'\n",
+    );
+    return { skills: new Set(), commands: new Set() };
+  }
+
+  try {
+    const surface = enumerateSurface(root);
+    const skills = new Set((surface.skills ?? []).map((name) => `${SKILL_PREFIX}${name}`));
+    const commands = new Set(surface.commands ?? []);
+    if (skills.size === 0 && commands.size === 0) {
+      process.stderr.write(
+        `[telemetry] WARN: roster surface empty at ${root} — all skill/command names project to 'other'\n`,
+      );
+    }
+    return { skills, commands };
+  } catch (err) {
+    process.stderr.write(
+      `[telemetry] WARN: roster enumeration failed (${err?.message ?? err}) — all names project to 'other'\n`,
+    );
+    return { skills: new Set(), commands: new Set() };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Roster name filter
+// ---------------------------------------------------------------------------
+
+/**
+ * Project a list of raw names onto the roster: a name present in `rosterSet` is
+ * kept verbatim; anything else (off-roster, non-string, or longer than
+ * MAX_NAME_LENGTH chars) becomes the opaque token "other". The result is
+ * deduplicated and sorted, "other" appears at most once, and the list is capped
+ * at MAX_NAMES entries.
+ *
+ * @param {string[]} names
+ * @param {Set<string>} rosterSet
+ * @returns {string[]} deduped, sorted, roster-safe names (≤ MAX_NAMES)
+ */
+export function filterRosterNames(names, rosterSet) {
+  const roster = rosterSet instanceof Set ? rosterSet : new Set();
+  const raw = Array.isArray(names) ? names : [];
+  const mapped = [];
+  for (const name of raw) {
+    if (typeof name !== 'string' || name.length > MAX_NAME_LENGTH) {
+      mapped.push(ROSTER_OTHER);
+      continue;
+    }
+    mapped.push(roster.has(name) ? name : ROSTER_OTHER);
+  }
+  const deduped = [...new Set(mapped)].sort();
+  return deduped.slice(0, MAX_NAMES);
+}
+
+/**
+ * Classify a single raw invocation name into the skills or commands bucket.
+ *
+ * The Skill tool surfaces slash-commands that have NO backing `skills/` directory
+ * under the same plugin-prefixed name form as real skills (e.g.
+ * `session-orchestrator:session` for `commands/session.md`). `roster.skills` holds
+ * PREFIXED names, `roster.commands` holds BARE ones — so a prefixed command name
+ * matches neither set and used to be bucketed to 'other' (GitLab #1189: commands
+ * was `[]` in 345/345 usage pings).
+ *
+ * Decision order (skill roster wins on a spelling collision such as
+ * `memory-cleanup`, which is both a skill dir and a command file):
+ *   1. name in rosterSkills                     → {kind:'skill',   name}  (verbatim)
+ *   2. name is PREFIXED and its bare form is in rosterCommands
+ *                                               → {kind:'command', bare}
+ *   3. otherwise                                → {kind:'skill',   name}  (verbatim)
+ *
+ * Case 2 REQUIRES the plugin prefix (session-reviewer W2 finding, 2026-09-02).
+ * Without that requirement, a BARE third-party or personal skill name that
+ * happens to collide with one of our shipped command names (`test`, `close`,
+ * `go`, `release`, `portfolio` are all plausible foreign skill names) would be
+ * recorded as OUR command — a data-integrity defect, and the same rule made
+ * `memory-cleanup` reach BOTH buckets in one ping (bare → commands, prefixed →
+ * skills), double-counting a single surface. Requiring the prefix removes both:
+ * a bare arrival can only ever be a skill-path name, so an unknown one becomes
+ * 'other'. Cost: the one genuine bare `memory-cleanup` record is recorded as
+ * 'other' rather than as the command.
+ *
+ * Case 3 keeps foreign/third-party names on the SKILLS path only, where
+ * filterRosterNames projects them to the opaque token 'other' — an unclassified
+ * name is never duplicated into `commands`, preserving the privacy invariant.
+ *
+ * @param {unknown} name raw invocation name
+ * @param {Set<string>} rosterSkills prefixed shipped-skill names
+ * @param {Set<string>} rosterCommands bare shipped-command names
+ * @returns {{kind: 'skill'|'command', name: unknown}}
+ */
+export function classifyInvocationName(name, rosterSkills, rosterCommands) {
+  const skills = rosterSkills instanceof Set ? rosterSkills : new Set();
+  const commands = rosterCommands instanceof Set ? rosterCommands : new Set();
+  if (typeof name !== 'string') return { kind: 'skill', name };
+  if (skills.has(name)) return { kind: 'skill', name };
+  if (!name.startsWith(SKILL_PREFIX)) return { kind: 'skill', name };
+  const bare = name.slice(SKILL_PREFIX.length);
+  if (commands.has(bare)) return { kind: 'command', name: bare };
+  return { kind: 'skill', name };
+}
+
+// ---------------------------------------------------------------------------
+// Duration bucketing
+// ---------------------------------------------------------------------------
+
+/**
+ * Map a session duration to a coarse bucket. Boundaries (seconds):
+ *   <900        → '<15m'
+ *   [900, 3600) → '15-60m'
+ *   [3600, 10800] → '1-3h'   (exactly 1h and exactly 3h both land here)
+ *   >10800      → '>3h'
+ *
+ * Fail-safe: an unparsable, missing, or negative duration returns the most
+ * conservative bucket '<15m' (never throws).
+ *
+ * @param {string} startedAtISO
+ * @param {string} completedAtISO
+ * @returns {'<15m'|'15-60m'|'1-3h'|'>3h'}
+ */
+export function deriveDurationBucket(startedAtISO, completedAtISO) {
+  const start = typeof startedAtISO === 'string' ? Date.parse(startedAtISO) : NaN;
+  const end = typeof completedAtISO === 'string' ? Date.parse(completedAtISO) : NaN;
+  if (Number.isNaN(start) || Number.isNaN(end)) return '<15m';
+
+  const seconds = (end - start) / MS_PER_SECOND;
+  if (!Number.isFinite(seconds) || seconds < 0) return '<15m';
+  if (seconds < 900) return '<15m';
+  if (seconds < 3600) return '15-60m';
+  if (seconds <= 10800) return '1-3h';
+  return '>3h';
+}
+
+// ---------------------------------------------------------------------------
+// Field derivation helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Plugin version from package.json at SO_PLUGIN_ROOT; 'unknown' on any failure.
+ * Single-sourced through readPluginVersionFromPackageJson (bootstrap-lock-freshness.mjs),
+ * whose null return (missing/unparseable package.json or non-string version) maps to 'unknown'.
+ */
+function resolvePluginVersion() {
+  const root = getPluginRoot();
+  if (!isNonEmptyString(root)) return 'unknown';
+  return readPluginVersionFromPackageJson(root) ?? 'unknown';
+}
+
+/** Normalize the detected platform to the closed enum (+ 'other' fallback). */
+function normalizePlatform(platform) {
+  return VALID_PLATFORMS.includes(platform) ? platform : PLATFORM_OTHER;
+}
+
+/** Normalize the session type to the closed enum (+ 'other' fallback). */
+function normalizeSessionType(sessionType) {
+  if (VALID_SESSION_TYPES.includes(sessionType)) return sessionType;
+  // ABSENT ≠ UNRECOGNISED. A missing/blank value means nothing was measured
+  // (`unknown`); a present-but-unlisted value means something WAS measured and
+  // is not one of the three modes (`other`). The old single-branch version
+  // returned `other` for both, which is how 394 pings from a host with no
+  // sessions.jsonl arrived looking like measured `other` sessions (d8, 2026-09-06).
+  return isNonEmptyString(sessionType) ? SESSION_TYPE_OTHER : SESSION_TYPE_UNKNOWN;
+}
+
+/**
+ * Normalize a session PROFILE against the closed VALID_SESSION_PROFILES
+ * whitelist. Anything else — absent, blank, or an unlisted repo-authored value —
+ * returns `null`, and the caller OMITS the field.
+ *
+ * DELIBERATELY NOT MIRRORING normalizeSessionType's two-token report. That helper
+ * can distinguish ABSENT (`'unknown'`) from UNRECOGNISED (`'other'`) because both
+ * of its answers are public constants. Here the unrecognised VALUE is precisely
+ * what must not travel, and there is no third token that carries the distinction
+ * without carrying the string: an `'other'` profile would say "this host ran a
+ * profile we do not ship" — a fact of no product use, bought with a new wire
+ * value. So both cases collapse to omission, and the wire cannot tell them apart
+ * BY DESIGN. The local `session-profile` key is untouched either way.
+ *
+ * @param {unknown} profile
+ * @returns {string|null} a whitelisted profile name, or null (⇒ field omitted).
+ */
+export function normalizeSessionProfile(profile) {
+  if (!isNonEmptyString(profile)) return null;
+  const trimmed = profile.trim();
+  return VALID_SESSION_PROFILES.includes(trimmed) ? trimmed : null;
+}
+
+/**
+ * Normalize an OS identifier (process.platform) against the closed OS_VALUES set.
+ * An in-set value is kept verbatim; anything else degrades to 'other' — mirrors
+ * normalizePlatform / normalizeSessionType so the client never emits a raw value
+ * the server enum would 400 on.
+ * @param {unknown} os
+ * @returns {string}
+ */
+export function normalizeOs(os) {
+  return OS_VALUES.includes(os) ? os : OS_OTHER;
+}
+
+/**
+ * Normalize a CPU arch identifier (process.arch) against the closed ARCH_VALUES
+ * set. In-set kept verbatim (e.g. 'loong64' survives); anything else → 'other'.
+ * @param {unknown} arch
+ * @returns {string}
+ */
+export function normalizeArch(arch) {
+  return ARCH_VALUES.includes(arch) ? arch : ARCH_OTHER;
+}
+
+/**
+ * CI detection from the env: a non-empty CI value that is not '0' and not (case-
+ * insensitively) 'false' counts as running under CI.
+ * @param {NodeJS.ProcessEnv} env
+ * @returns {boolean}
+ */
+function deriveCi(env) {
+  const raw = env?.CI;
+  if (typeof raw !== 'string') return false;
+  const v = raw.trim();
+  if (v === '' || v === '0' || v.toLowerCase() === 'false') return false;
+  return true;
+}
+
+/** Distinct non-empty string values of `field` across a list of records. */
+function distinctField(records, field) {
+  const seen = new Set();
+  for (const rec of records) {
+    if (!isPlainObject(rec)) continue;
+    const value = rec[field];
+    if (isNonEmptyString(value)) seen.add(value);
+  }
+  return [...seen];
+}
+
+// ---------------------------------------------------------------------------
+// Payload builder
+// ---------------------------------------------------------------------------
+
+/**
+ * Build a usage-ping record from local telemetry inputs. The returned record is
+ * whitelist-clean but does NOT carry `anon_id` — the caller sets it via
+ * ensureAnonId (anon-id.mjs), keeping ID rotation isolated there.
+ *
+ * The distinct `.skill` and `.command` values of `skillInvocations` go through a
+ * single classifyInvocationName pass that routes each name to skills or commands
+ * (the `.command` field carries nothing today; it is honored so a future direct
+ * command-telemetry stream feeds in without a signature change). Both buckets are
+ * then roster-filtered — off-roster names become "other" — deduped, sorted, and
+ * capped. No frequencies are recorded (v1 decision).
+ *
+ * @param {{
+ *   sessionRecord: object,
+ *   skillInvocations: object[],
+ *   ownerConfig?: object,
+ *   env?: NodeJS.ProcessEnv,
+ *   now?: string,
+ *   roster?: {skills: Set<string>, commands: Set<string>}
+ * }} args
+ * @returns {object} usage-ping record (without anon_id)
+ */
+export function buildUsagePing({
+  sessionRecord,
+  skillInvocations,
+  ownerConfig,
+  env = process.env,
+  now = new Date().toISOString(),
+  roster,
+  consentState,
+  sessionRecordSource,
+  sessionProfile,
+  ledgerComplete,
+} = {}) {
+  const session = isPlainObject(sessionRecord) ? sessionRecord : {};
+  const invocations = Array.isArray(skillInvocations) ? skillInvocations : [];
+  const rst = roster ?? loadRoster();
+  const rosterSkills = rst?.skills instanceof Set ? rst.skills : new Set();
+  const rosterCommands = rst?.commands instanceof Set ? rst.commands : new Set();
+
+  // ONE classification pass over the union of both producer fields: today only
+  // `.skill` is written by hooks/skill-invocation-telemetry.mjs, `.command` is
+  // kept for the forward-compat producer documented above.
+  //
+  // `.command` records carry the BARE name, and classifyInvocationName requires
+  // the plugin prefix before it will route anything to the commands bucket (see
+  // its doc comment). So a `.command` name is normalized to the prefixed form
+  // first — the field itself is the "this is one of ours" signal that a bare
+  // `.skill` arrival lacks. Without this the forward-compat producer would be
+  // wired but dead: every record it writes would silently become 'other'.
+  const skillNames = [];
+  const commandNames = [];
+  const rawNames = [
+    ...distinctField(invocations, 'skill'),
+    ...distinctField(invocations, 'command').map((n) => (n.startsWith(SKILL_PREFIX) ? n : `${SKILL_PREFIX}${n}`)),
+  ];
+  for (const raw of rawNames) {
+    const { kind, name } = classifyInvocationName(raw, rosterSkills, rosterCommands);
+    (kind === 'command' ? commandNames : skillNames).push(name);
+  }
+
+  // ── fleet: a statement about the OPERATOR, derived from the RESOLVED consent
+  // state, not from a raw owner.yaml read ────────────────────────────────────
+  // The old expression was `ownerConfig?.telemetry?.enabled === true` — a
+  // statement about a FILE. Measured 2026-09-06 (d8): the operator's second Mac
+  // has consent granted but no `telemetry:` block in owner.yaml, so 394 of 490
+  // server records (80,4 %) counted the operator as an external user and every
+  // week's `fleet_vs_external` was wrong.
+  //
+  // `resolveConsent()` already answers this question correctly: it returns
+  // `enabled-fleet` for the owner.yaml opt-in AND `enabled-env` for
+  // `SO_TELEMETRY=1`, both of which are operator-side postures. Callers that
+  // pass `consentState` get that answer; the ownerConfig fallback below keeps
+  // the two-argument callers (and the CLI preview) behaviourally identical.
+  //
+  // CEILING, named because the client cannot close it: this is still
+  // SELF-DECLARED — a sandbox or a host whose owner.yaml is unreachable declares
+  // `false` however honest it is. The authoritative classification is
+  // server-side (`SO_INGEST_FLEET_ANON_IDS`, server/ingest/config.mjs).
+  // `session_profile` (STATE.md frontmatter `session-profile`) is bounded by the
+  // CLOSED VALID_SESSION_PROFILES whitelist — it was the one free-text value on
+  // the wire until 2026-09-06, and a repo-authored one at that (see the
+  // whitelist's own docblock for the reproduced leak). It is still deliberately
+  // NOT routed through normalizeSessionType: that helper degrades anything
+  // outside ['housekeeping','feature','deep'] to 'other', which is exactly the
+  // silent loss the profile exists to prevent. The contract is
+  // `session_type: "deep"` PLUS `session_profile: "ultradeep"` — never
+  // `session_type: "ultradeep"`, and never a profile flattened to 'other'.
+  //
+  // ABSENT IS NOT EMPTY: with no profile — and with an UNLISTED one — the KEY IS
+  // OMITTED, matching every other optional ping field. `projectUsagePing` copies
+  // only keys that are `in` the input, so an omitted key never reaches the wire
+  // as `null`, and an unlisted profile never reaches it at all.
+  //
+  // SOURCE PRECEDENCE is resolved BEFORE normalization (explicit argument beats
+  // the session record), so an unlisted explicit profile is dropped rather than
+  // silently replaced by the record's value.
+  const rawProfile =
+    isNonEmptyString(sessionProfile) ? sessionProfile
+      : isNonEmptyString(session.session_profile) ? session.session_profile
+        : null;
+  const profile = normalizeSessionProfile(rawProfile);
+
+  const fleetSelfDeclared =
+    consentState === undefined || consentState === null
+      ? ownerConfig?.telemetry?.enabled === true
+      : consentState === 'enabled-fleet' || consentState === 'enabled-env';
+
+  return {
+    record_kind: 'usage-ping',
+    schema_version: USAGE_PING_SCHEMA_VERSION,
+    sent_at: now,
+    plugin_version: resolvePluginVersion(),
+    platform: normalizePlatform(getPlatform()),
+    os: normalizeOs(process.platform),
+    arch: normalizeArch(process.arch),
+    node_major: parseInt(process.versions.node, 10),
+    ci: deriveCi(env),
+    fleet: fleetSelfDeclared,
+    // DEPRECATED alias of `fleet_self_declared`, kept for one schema generation
+    // (removal: 2027-03-06 — see docs/telemetry.md § Schema evolution) so the
+    // server's existing `fleet` column stays comparable across the rename.
+    fleet_self_declared: fleetSelfDeclared,
+    session_type: normalizeSessionType(session.session_type),
+    ...(profile !== null ? { session_profile: profile } : {}),
+    duration_bucket: deriveDurationBucket(session.started_at, session.completed_at),
+    session_record: SESSION_RECORD_SOURCES.includes(sessionRecordSource)
+      ? sessionRecordSource
+      : 'absent',
+    // ONLY a real boolean travels (#1416). `null`/`undefined` — the read never
+    // happened, or this path never read the events ledger at all — OMITS the
+    // key, the same absent-is-not-empty contract `session_profile` uses above.
+    // Writing `false` there would turn "we did not look" into a measured gap.
+    ...(typeof ledgerComplete === 'boolean' ? { ledger_complete: ledgerComplete } : {}),
+    skills: filterRosterNames(skillNames, rosterSkills),
+    commands: filterRosterNames(commandNames, rosterCommands),
+  };
+}

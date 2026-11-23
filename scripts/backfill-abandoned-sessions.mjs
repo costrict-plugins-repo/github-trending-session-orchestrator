@@ -1,0 +1,908 @@
+#!/usr/bin/env node
+/**
+ * backfill-abandoned-sessions.mjs — one-time historical migration CLI (#724 C1).
+ *
+ * Scans `.orchestrator/metrics/events.jsonl` — and every rotated archive
+ * beside it (#1414) — for every distinct
+ * `orchestrator.session.started` UUID that has no counterpart in
+ * `.orchestrator/metrics/sessions.jsonl`, bridges each to its semantic id via
+ * `orchestrator.session.lock.acquired` where available, and synthesizes a
+ * `status: 'abandoned'` stub through the shared backfill core
+ * (`scripts/lib/session-close-backfill.mjs`).
+ *
+ * SAFETY: `--dry-run` is the DEFAULT — nothing is written unless `--apply` is
+ * passed. Dry-run is idempotent (creates no marker files, appends nothing) so
+ * you can safely preview counts, then apply once against a copy or the live
+ * store at the operator's discretion.
+ *
+ *   node scripts/backfill-abandoned-sessions.mjs [--dry-run|--apply] [--json]
+ *                                                [--repo-root PATH]
+ *                                                [--assume-dead-before ISO]
+ *
+ * DEAD-BY-AGE RELAXATION (#731): every CLI run happens FROM an active
+ * session, so `.orchestrator/session.lock` is ALWAYS live at run-time — the
+ * foreign-live-lock guard in the shared core (session-close-backfill.mjs)
+ * would otherwise block every historical candidate unconditionally. This CLI
+ * therefore ALWAYS passes `relaxDeadByAge: true`, so a candidate whose last
+ * known event is older than the lock's own default TTL
+ * (`session-lock.mjs` `DEFAULT_TTL_HOURS`) bypasses the current lock. The
+ * optional `--assume-dead-before <ISO>` flag additionally bypasses the guard
+ * for any candidate whose last known event predates the given cutoff,
+ * regardless of the TTL window. This relaxation is scoped to THIS CLI only —
+ * `hooks/on-session-end.mjs` never passes it (see the comment there).
+ *
+ * Exit codes (cli-design.md):
+ *   0 — completed (dry-run or apply)
+ *   1 — user/input error (bad args, invalid --assume-dead-before)
+ *   2 — system error (unreadable events file, etc.)
+ */
+
+import fs from 'node:fs';
+import path from 'node:path';
+import { parseArgs } from 'node:util';
+
+import { backfillAbandonedSession, isUuid } from './lib/session-close-backfill.mjs';
+import { BACKFILL_COMPLETED_EVENT, NO_RUN_ACTION } from './lib/session-schema/work-evidence.mjs';
+import { SCAN_CHUNK_BYTES, emitEvent, eventsFilePath, listEventSourcesNewestFirst, tombstoneGap } from './lib/events.mjs';
+import { ARCHIVE_DIR_NAME } from './lib/events-schema.mjs';
+import { getProjectDir, resolveEventsLedgerRoot } from './lib/platform.mjs';
+import { isMainModule } from './lib/is-main-module.mjs';
+import { DEFAULT_TTL_HOURS, FUTURE_HEARTBEAT_TOLERANCE_MS, isLockLive, readLock } from './lib/session-lock.mjs';
+import { activeDir, isRegistryEntryFresh, readRegistry } from './lib/session-registry.mjs';
+import { readProcessLocalSessionIds } from './lib/session-identity/own-session.mjs';
+
+const LOCK_ACQUIRED = 'orchestrator.session.lock.acquired';
+const SESSION_STARTED = 'orchestrator.session.started';
+const SESSION_ENDED = 'orchestrator.session.ended';
+
+/**
+ * Events-ledger window for the #1401 census (`scripts/lib/events-retention-banner.mjs`):
+ * `null` — {@link planSessions} takes every `session.started` ever written as a
+ * candidate, so no day count bounds it (`DEFAULT_TTL_HOURS` is a minimum AGE,
+ * not a window). A pruned history yields fewer candidates; the run summary says
+ * so as `history_gaps` (#1498).
+ */
+export const REQUIRED_EVENTS_WINDOW_DAYS = null;
+
+/**
+ * Default cap on how many candidates may reach the (expensive) shared core in a
+ * single run. Only the SessionStart path passes a limit; the CLI stays uncapped.
+ * See `backfillOnSessionStart` for the latency rationale.
+ */
+export const SESSION_START_LIMIT = 25;
+
+/**
+ * Total wall-clock budget, per SessionStart run, for scanning the ROTATED
+ * ledger on behalf of candidates whose events left the active file (#1498).
+ * ONE deadline shared by every candidate; a candidate it leaves unread is
+ * `skipped-history-unread` and retried by the next start — recorded ones drop
+ * out through the sessions.jsonl pre-filter, so the backlog drains.
+ *
+ * Named ceiling (BV-004): at ≈0.55-0.8 ms per MB per candidate (measured
+ * 2026-10-02, see `gatherSessionEvents` in `session-close-backfill.mjs`) a full
+ * default ledger (6 × 10 MB) fits ~10-15 scans per start. Measured the same
+ * day over 58 MB with 25 archived candidates (dry run, load ~5): unbudgeted
+ * 1.41 s; budget 0 — planning and active-file reads only — 0.55 s; budget 500
+ * 0.83-0.84 s, 10 candidates answered and 15 deferred. A single scan longer
+ * than the budget — a ledger past ~600 MB — never completes here; the CLI path
+ * is unbudgeted and still records it. Revisit if `skipped-history-unread`
+ * appears on more than a few consecutive starts of one repo.
+ */
+export const SESSION_START_ARCHIVE_SCAN_BUDGET_MS = 500;
+
+/**
+ * Read a JSONL file into parsed objects; MISSING (ENOENT) → `[]` silently,
+ * UNREADABLE (EACCES/EISDIR/…) → `[]` with a stderr WARN (#1188); malformed
+ * lines skipped.
+ */
+function readJsonl(filePath) {
+  let raw;
+  try {
+    raw = fs.readFileSync(filePath, 'utf8');
+  } catch (err) {
+    // #1188 — ENOENT and EACCES/EISDIR are different facts: a missing ledger is
+    // the ordinary fresh-repo case; an UNREADABLE one previously read as "no
+    // records" and made every downstream count silently wrong. Same split as
+    // readLockDetailed (session-lock.mjs § absent vs unreadable).
+    if (!err || err.code !== 'ENOENT') {
+      process.stderr.write(
+        `⚠ backfill-abandoned-sessions: cannot read ${filePath} ` +
+          `(${err?.code ?? '?'}: ${err?.message ?? String(err)}) — ` +
+          'treating as EMPTY, counts below are floors\n',
+      );
+    }
+    // CEILING (BV-004): still [] rather than throw — this runs on the
+    // SessionStart path (SESSION_START_LIMIT), where a permissions fault must
+    // not crash the session start. REVISIT if the warn rate in events.jsonl
+    // shows masked corruption.
+    return [];
+  }
+  const out = [];
+  for (const line of raw.split('\n')) {
+    const t = line.trim();
+    if (!t) continue;
+    try {
+      out.push(JSON.parse(t));
+    } catch {
+      /* skip malformed */
+    }
+  }
+  return out;
+}
+
+/**
+ * Enumerate distinct sessions worth evaluating: every unique
+ * session.started UUID, each bridged to its semantic id via lock.acquired
+ * where one exists. Preserves first-seen order.
+ *
+ * THIS VERY PROCESS is excluded (#1376). The shared core's own
+ * `skipped-own-live-lock` branch used to carry that job alone, but it is now
+ * defeasible: `ownSessionIsEnding` lets the SessionEnd hook record its own
+ * session, so the CLI must not depend on a branch whose meaning the caller
+ * chooses. The exclusion needs THREE conjuncts, and dropping any one of them
+ * breaks it in a different direction:
+ *   1. the candidate names the lock (by either id, including the #863 (d)
+ *      lock shape that stores the semantic id in `session_id`),
+ *   2. the lock is LIVE — a stale lock names a session nobody is running, and
+ *      reconstructing it is exactly this CLI's job, and
+ *   3. a PROCESS-LOCAL id (hook payload / harness env, never the repo-global
+ *      lock — see `readProcessLocalSessionIds`) matches the lock, which is
+ *      what distinguishes THIS process from a PEER's running session in the
+ *      same working copy. Without it the repo-global lock would vouch for
+ *      itself and a peer's live session would read as "me".
+ * A peer's live session that HOLDS the lock is still rejected by the core's
+ * own/foreign live-lock guards. The lock is not the only liveness signal any
+ * more (#1748): `runningIds` adds sessions that run lockless by design — the
+ * caller's own ids and fresh host-registry entries (see `runMigration`).
+ *
+ * @param {{ repoRoot: string, runningIds?: Iterable<string> }} args
+ *   `runningIds` — extra ids known to be running, excluded by raw OR semantic id.
+ * @returns {Array<{ sessionId: string, semanticSessionId: string|null, noRun?: true }>}
+ *   `noRun` — an earlier backfill emitted `skipped-no-run` for this raw id (#1975).
+ */
+export function planSessions({ repoRoot, runningIds = [] }) {
+  return planWithGaps({ repoRoot, runningIds }).plan;
+}
+
+/**
+ * {@link planSessions} plus the count of rotation tombstones whose archive is
+ * not one of the sources read (#1498). Pruned history used to shrink the plan
+ * silently; non-zero `historyGaps` says the candidate count is a floor.
+ *
+ * The check is `tombstoneGap` (`scripts/lib/events.mjs`), the one shared with
+ * `readEventsWithRotations` rule 1:
+ * resolved by BASENAME against this ledger's own `_archive/` (#1411), and a
+ * file that exists but is not a source (renamed out of `ARCHIVE_NAME_RE`)
+ * counts as a gap too — existence is not reading (#1423).
+ *
+ * @param {{ repoRoot: string, runningIds?: Iterable<string> }} args
+ * @returns {{ plan: Array<{ sessionId: string, semanticSessionId: string|null }>, historyGaps: number }}
+ */
+function planWithGaps({ repoRoot, runningIds: extraRunningIds = [] }) {
+  const eventsPath = eventsFilePath(repoRoot); // #1514: the repo's one ledger
+
+  // Two independent UUID -> semantic bridges (#1167). `lock.acquired` is the
+  // original one, but a session that LOST the lock-acquire race never emits it;
+  // its `session.ended` event carries `semantic_session_id` all the same (since
+  // #1068 AC1) and was never read here. Without that second bridge the
+  // candidate resolved semantic=null and the shared core minted a SYNTHETIC id,
+  // writing a duplicate stub beside the record the SessionEnd hook had already
+  // written under the real semantic id (measured 2026-09-02 @ c3ab480: 8 pairs).
+  // lock.acquired keeps precedence — it is the older, mode-carrying attestation.
+  const semanticFromLock = new Map();
+  const semanticFromEnded = new Map();
+  const seen = new Set();
+  // #1975: raw ids an earlier backfill already judged no-run (the SessionEnd
+  // hook or a previous run of this path emitted the outcome). Without this
+  // mark every no-run session stays a candidate forever and spends the
+  // SessionStart limit on the same verdict again.
+  // A later `session.started` of the same raw id clears the mark (below).
+  const noRunIds = new Set();
+  /** Distinct `session.started` ids in FIRST-SEEN (chronological) order. */
+  const startedIds = [];
+
+  // #1414 — the whole history, OLDEST SOURCE FIRST, streamed line by line. The
+  // previous `readJsonl` of the active file alone missed every session whose
+  // `session.started` had been rotated into `_archive/`; reading the same
+  // sources through `readEventsWithRotations` instead would have loaded up to
+  // ~60 MB into memory on a path that runs at SESSION START
+  // (`hooks/on-session-start.mjs` → `backfillOnSessionStart`). Reversing the
+  // newest-first source list keeps first-seen order chronological, exactly as
+  // the single-file read produced it.
+  const sources = listEventSourcesNewestFirst({ filePath: eventsPath });
+  const read = new Set(sources.map((s) => s.path));
+  const archiveDir = path.join(path.dirname(eventsPath), ARCHIVE_DIR_NAME);
+  let historyGaps = 0;
+  for (const source of [...sources].reverse()) {
+    forEachJsonlRecord(source.path, (ev) => {
+      if (!ev || typeof ev !== 'object') return;
+      if (tombstoneGap(ev, archiveDir, read) !== null) historyGaps += 1;
+      if (typeof ev.session_id === 'string' && typeof ev.semantic_session_id === 'string') {
+        if (ev.event === LOCK_ACQUIRED) semanticFromLock.set(ev.session_id, ev.semantic_session_id);
+        else if (ev.event === SESSION_ENDED) {
+          semanticFromEnded.set(ev.session_id, ev.semantic_session_id);
+        }
+      }
+      if (ev.event === BACKFILL_COMPLETED_EVENT && ev.action === NO_RUN_ACTION && typeof ev.session_id === 'string') {
+        noRunIds.add(ev.session_id);
+      }
+      if (ev.event !== SESSION_STARTED || typeof ev.session_id !== 'string') return;
+      // A start AFTER the verdict (`claude --resume` re-uses the raw id) opens
+      // work the verdict never saw: the session is a candidate again (#926 —
+      // the crash case this path exists for). Before the `seen` check, since
+      // the resumed id was seen at its first start.
+      noRunIds.delete(ev.session_id);
+      if (seen.has(ev.session_id)) return;
+      seen.add(ev.session_id);
+      startedIds.push(ev.session_id);
+    });
+  }
+
+  // Resolved AFTER the pass, never during it: a `lock.acquired` / `session.ended`
+  // bridge may sit later in the stream (or in a later source) than the
+  // `session.started` it names, and deciding mid-stream would mint a synthetic
+  // id for a session whose semantic id was two lines further on.
+  const semanticByUuid = new Map([...semanticFromEnded, ...semanticFromLock]);
+
+  // #1748: the lock alone misses sessions that run WITHOUT one by design (#1635
+  // lead yield, #1651 released lock kept released, a lost acquire), so the
+  // caller's own ids and fresh registry entries join the lock-based set.
+  // Ceilings: (a) sweepZombies() drops a registry entry after 60 min without a
+  // heartbeat (refreshed every turn end), so a lockless session idle longer
+  // reads as dead again; (b) semantic labels are minted host-wide, so a label
+  // shared with a live session in ANOTHER repo only DELAYS a dead candidate's
+  // stub to a later start — late, never wrong.
+  const runningIds = new Set([...readRunningSessionIds(repoRoot), ...extraRunningIds]);
+
+  const plan = [];
+  for (const sessionId of startedIds) {
+    const semanticSessionId = semanticByUuid.get(sessionId) ?? null;
+    if (runningIds.has(sessionId)
+      || (semanticSessionId !== null && runningIds.has(semanticSessionId))) continue;
+    plan.push({ sessionId, semanticSessionId, ...(noRunIds.has(sessionId) ? { noRun: true } : {}) });
+  }
+  return { plan, historyGaps };
+}
+
+/**
+ * Stream one JSONL file, handing every PARSED record to `onRecord` in file
+ * order — without ever holding the file in memory (#1414).
+ *
+ * MISSING (ENOENT) → silent no-op; UNREADABLE → a stderr WARN, same split as
+ * {@link readJsonl} (#1188: a missing ledger is the fresh-repo case, an
+ * unreadable one used to read as "no records" and made every count below
+ * silently wrong). Malformed lines are skipped, as in the full-read path.
+ *
+ * A line split across a chunk boundary is CARRIED as a BUFFER, so neither a
+ * record nor a multibyte character is ever cut in half — the 0x0A byte cannot
+ * occur inside a UTF-8 continuation sequence.
+ *
+ * @param {string} filePath
+ * @param {(record: object) => void} onRecord
+ */
+function forEachJsonlRecord(filePath, onRecord) {
+  const emit = (buf) => {
+    const text = buf.toString('utf8').trim();
+    if (!text) return;
+    try {
+      onRecord(JSON.parse(text));
+    } catch {
+      /* skip malformed */
+    }
+  };
+
+  let fd;
+  try {
+    fd = fs.openSync(filePath, 'r');
+  } catch (err) {
+    if (!err || err.code !== 'ENOENT') {
+      process.stderr.write(
+        `⚠ backfill-abandoned-sessions: cannot read ${filePath} ` +
+          `(${err?.code ?? '?'}: ${err?.message ?? String(err)}) — ` +
+          'treating as EMPTY, counts below are floors\n',
+      );
+    }
+    return;
+  }
+  try {
+    const stats = fs.fstatSync(fd);
+    // Windows opens a directory "as a file" with size 0; surface it through the
+    // same warning POSIX reaches via EISDIR on the first read.
+    if (!stats.isFile()) {
+      throw Object.assign(new Error('EISDIR: illegal operation on a directory, read'), { code: 'EISDIR' });
+    }
+    const size = stats.size;
+    const buf = Buffer.alloc(SCAN_CHUNK_BYTES);
+    let pos = 0;
+    let carry = Buffer.alloc(0);
+    while (pos < size) {
+      const n = fs.readSync(fd, buf, 0, SCAN_CHUNK_BYTES, pos);
+      if (n <= 0) break;
+      pos += n;
+      const block =
+        carry.length > 0
+          ? Buffer.concat([carry, buf.subarray(0, n)])
+          : Buffer.from(buf.subarray(0, n));
+      let start = 0;
+      let idx = block.indexOf(0x0a, start);
+      while (idx !== -1) {
+        emit(block.subarray(start, idx));
+        start = idx + 1;
+        idx = block.indexOf(0x0a, start);
+      }
+      carry = block.subarray(start);
+    }
+    if (carry.length > 0) emit(carry);
+  } catch (err) {
+    process.stderr.write(
+      `⚠ backfill-abandoned-sessions: cannot read ${filePath} ` +
+        `(${err?.code ?? '?'}: ${err?.message ?? String(err)}) — ` +
+        'treating as EMPTY, counts below are floors\n',
+    );
+  } finally {
+    try {
+      fs.closeSync(fd);
+    } catch {
+      /* best-effort */
+    }
+  }
+}
+
+/**
+ * The id(s) naming the session THIS process is, when that session holds the
+ * live lock — else the empty set (#1376). Lock-based only; lockless running
+ * sessions come from {@link readRegistryRunningIds} and the caller's own ids
+ * (#1748). Never throws: an unreadable lock,
+ * an absent one, or an env without any process-local id all degrade to "no
+ * exclusion", which is the pre-#1376 behaviour.
+ *
+ * @param {string} repoRoot
+ * @returns {Set<string>}
+ */
+function readRunningSessionIds(repoRoot) {
+  const ids = new Set();
+  try {
+    const lock = readLock({ repoRoot });
+    if (!lock || !isLockLive(lock)) return ids;
+    const lockIds = [lock.session_id, lock.semantic_session_id]
+      .filter((id) => typeof id === 'string' && id.length > 0);
+    const processLocal = new Set(readProcessLocalSessionIds());
+    // Conjunct 3 — only a PROCESS-LOCAL witness may promote the repo-global
+    // lock to "this is me". Membership is tested against the lock's ids, not
+    // the other way round, so an env var that happens to name some other
+    // session never widens the exclusion.
+    if (!lockIds.some((id) => processLocal.has(id))) return ids;
+    for (const id of lockIds) ids.add(id);
+  } catch {
+    /* readLock is no-throw by contract; the contract is not ours to trust */
+  }
+  return ids;
+}
+
+/**
+ * Ids of sessions the HOST registry shows as running (#1748) — the
+ * lock-independent liveness source for peers that run lockless by design.
+ * Fresh = heartbeat within the lock TTL, so a lockless session counts as
+ * running exactly as long as a lock would have. Never throws.
+ *
+ * Fail-closed, because a doubt must never become a stub: `null` when the
+ * registry directory exists but cannot be listed — the caller then stamps
+ * nothing, since a lockless live peer is indistinguishable from a dead one. An
+ * ABSENT directory (ENOENT) means nobody registered and yields the empty set.
+ * An entry file that is unreadable or invalid has no readable heartbeat: its
+ * mtime stands in, and its name (`<session_id>.json`) is the id it protects.
+ * So does a valid entry whose heartbeat measures no age (unparseable, or
+ * beyond the future tolerance after a clock stepped back), as in
+ * `sweepZombies()` (#1505.1).
+ * Ceiling: a peer registered under a different `SO_SESSION_REGISTRY_DIR` /
+ * config home is invisible here; revisit when session-close-backfill.log shows
+ * a lockless live session stamped that way.
+ *
+ * @returns {Promise<Set<string>|null>}
+ */
+async function readRegistryRunningIds() {
+  const dir = activeDir();
+  let names;
+  try {
+    names = await fs.promises.readdir(dir);
+  } catch (err) {
+    return err?.code === 'ENOENT' ? new Set() : null;
+  }
+  const ids = new Set();
+  const now = Date.now();
+  const freshnessMin = DEFAULT_TTL_HOURS * 60;
+  try {
+    const readable = new Set();
+    for (const entry of await readRegistry()) {
+      const beat = Date.parse(entry.last_heartbeat);
+      if (Number.isNaN(beat) || beat > now + FUTURE_HEARTBEAT_TOLERANCE_MS) continue;
+      readable.add(entry.session_id);
+      if (!isRegistryEntryFresh(entry, { freshnessMin, now })) continue;
+      for (const id of [entry.session_id, entry.semantic_session_id]) {
+        if (typeof id === 'string' && id.length > 0) ids.add(id);
+      }
+    }
+    for (const name of names) {
+      if (!name.endsWith('.json')) continue;
+      const id = name.slice(0, -'.json'.length);
+      if (readable.has(id)) continue;
+      try {
+        const { mtimeMs } = await fs.promises.stat(path.join(dir, name));
+        if (now - mtimeMs <= freshnessMin * 60_000) ids.add(id);
+      } catch (err) {
+        // Gone since the listing = deregistered; any other failure = unknown, keep it.
+        if (err?.code !== 'ENOENT') ids.add(id);
+      }
+    }
+  } catch {
+    return null;
+  }
+  return ids;
+}
+
+/**
+ * Cheap pre-filter (#926): the set of session ids ALREADY present in
+ * sessions.jsonl.
+ *
+ * WHY THIS EXISTS — latency. `backfillAbandonedSession` re-reads the whole
+ * events.jsonl on every call whose id cannot be resolved without it. On a
+ * mature store that is O(candidates x events-file): measured 1.26 s for 187
+ * candidates over a 1.77 MB events.jsonl, of which 183 were already recorded
+ * and therefore pure waste. Reading the (much smaller) sessions.jsonl ONCE up
+ * front lets us skip those without entering the core at all.
+ *
+ * This is a pure latency optimisation with NO behavioural change: it reproduces
+ * exactly the core's own early-dedupe branch (same `recordId` derivation, same
+ * defensive UUID check) and reports the same `skipped-already-recorded` key.
+ * Candidates whose id CANNOT be resolved cheaply (a bare UUID with no
+ * lock.acquired bridge — the synthetic-id mint needs events) are never
+ * pre-filtered; they still go through the core untouched.
+ *
+ * @param {string} repoRoot
+ * @returns {Set<string>}
+ */
+function readRecordedIds(repoRoot) {
+  // #1592: the SAME ledger the core dedupes and writes against (main checkout
+  // of a linked worktree) — a worktree-local read let already-recorded
+  // candidates through and spent the SessionStart latency cap on them.
+  const records = readJsonl(path.join(resolveEventsLedgerRoot(repoRoot), '.orchestrator', 'metrics', 'sessions.jsonl'));
+  const ids = new Set();
+  for (const r of records) {
+    if (!r) continue;
+    if (typeof r.session_id === 'string') ids.add(r.session_id);
+    // #1167 — a backfilled record now stamps the harness UUID it was
+    // reconstructed from. Indexing it lets a bare-UUID candidate be recognised
+    // as already-recorded even though the record itself is keyed semantically —
+    // the join that was structurally impossible while the field was absent
+    // (0 of 286 records carried it, measured 2026-09-02 @ c3ab480).
+    if (typeof r.raw_session_id === 'string') ids.add(r.raw_session_id);
+  }
+  return ids;
+}
+
+/**
+ * Resolve the sessions.jsonl record id for a planned candidate WITHOUT reading
+ * events.jsonl. Mirrors the core's own two-phase resolution: a known semantic
+ * id, or a `sessionId` that is already semantic. Returns null when the id can
+ * only be resolved from events (bare UUID → lock bridge or synthetic mint).
+ */
+function cheapRecordId({ sessionId, semanticSessionId }) {
+  if (semanticSessionId) return semanticSessionId;
+  if (sessionId && !isUuid(sessionId)) return sessionId;
+  return null;
+}
+
+/**
+ * Run the migration over every planned session.
+ *
+ * `relaxDeadByAge: true` is ALWAYS passed to the shared core (#731) — see the
+ * module docblock for why. `assumeDeadBeforeMs` is forwarded as-is (null when
+ * `--assume-dead-before` was not given).
+ *
+ * @param {object} args
+ * @param {string}  args.repoRoot
+ * @param {boolean} args.apply
+ * @param {number|null} [args.assumeDeadBeforeMs]
+ * @param {number|null} [args.limit=null]
+ *   #926 — cap on how many candidates may reach the shared core. Pre-filtered
+ *   (already-recorded) candidates do NOT count against it, since they cost
+ *   nothing. On hitting the cap the run stops early and sets
+ *   `summary.truncated = true`; the remainder is picked up by the next run.
+ *   `null` (CLI default) means uncapped.
+ * @param {boolean} [args.newestFirst=false]
+ *   #926 — walk the plan most-recent-first. Load-bearing whenever `limit` is
+ *   set: a bare-UUID candidate with no lock.acquired bridge cannot be
+ *   pre-filtered (its synthetic id is only derivable from events), so it always
+ *   spends a core call just to be told "already recorded". In first-seen order
+ *   those ancient candidates exhaust the whole budget before the run ever
+ *   reaches the genuinely-abandoned recent ones. Measured on a copy of this
+ *   repo's live store: first-seen order → backfilled 0, truncated true.
+ * @param {number|null} [args.archiveScanBudgetMs=null]
+ *   #1498 — total budget for rotated-ledger scans across the whole run, turned
+ *   into ONE deadline before the first candidate. Candidates it leaves unread
+ *   count as `skipped.skipped-history-unread`. `null` (CLI default) = unbounded.
+ * @param {Array<string|null|undefined>} [args.ownSessionIds=[]]
+ *   #1748 — the caller's OWN in-memory session ids (SessionStart hook). Excluded
+ *   from the plan even without a lock; null/empty values are ignored.
+ * @returns {Promise<object>} aggregate summary
+ */
+export async function runMigration({
+  repoRoot,
+  apply,
+  assumeDeadBeforeMs = null,
+  limit = null,
+  newestFirst = false,
+  archiveScanBudgetMs = null,
+  ownSessionIds = [],
+}) {
+  const registryIds = await readRegistryRunningIds();
+  const runningIds = new Set(registryIds ?? []);
+  for (const id of Array.isArray(ownSessionIds) ? ownSessionIds : []) {
+    if (typeof id === 'string' && id.length > 0) runningIds.add(id);
+  }
+  const { plan: planned, historyGaps } = planWithGaps({ repoRoot, runningIds });
+  const plan = newestFirst ? [...planned].reverse() : planned;
+  const summary = {
+    repoRoot,
+    mode: apply ? 'apply' : 'dry-run',
+    total: plan.length,
+    // #1498: rotated archives the ledger names but no longer holds. Non-zero ⇒
+    // sessions they recorded are not candidates and `total` is a floor.
+    history_gaps: historyGaps,
+    backfilled: 0,
+    would_backfill: 0,
+    dead_by_age: 0,
+    errors: 0,
+    skipped: {},
+  };
+
+  if (registryIds === null) summary.registry_unreadable = true;
+
+  // Pre-filter pass — costs ONE sessions.jsonl read for the whole run.
+  const recordedIds = readRecordedIds(repoRoot);
+  let considered = 0;
+
+  // Dry-run has no incremental sessions.jsonl write, so two started-UUIDs that
+  // bridge to the SAME semantic id (a session that cleared/compacted mid-run)
+  // would both report 'would-backfill' and over-count. Track projected ids
+  // here so the dry-run total matches what --apply actually writes.
+  const projected = new Set();
+
+  const archiveScanDeadlineMs = Number.isFinite(archiveScanBudgetMs)
+    ? Date.now() + archiveScanBudgetMs
+    : null;
+
+  for (const item of plan) {
+    // -- #1975: already judged no-run → skip WITHOUT entering the core --------
+    if (item.noRun === true) {
+      summary.skipped[NO_RUN_ACTION] = (summary.skipped[NO_RUN_ACTION] ?? 0) + 1;
+      continue;
+    }
+    // -- Cheap pre-filter: already recorded → skip WITHOUT entering the core --
+    const known = cheapRecordId(item);
+    if (
+      (known !== null && recordedIds.has(known)) ||
+      (isUuid(item.sessionId) && recordedIds.has(item.sessionId))
+    ) {
+      summary.skipped['skipped-already-recorded'] =
+        (summary.skipped['skipped-already-recorded'] ?? 0) + 1;
+      continue;
+    }
+
+    // -- #1748: without the registry a lockless live peer reads as dead, so no
+    // unrecorded candidate is stamped — in dry-run too, which must project
+    // what --apply writes. The next start retries. Ceiling: a registry that
+    // stays unreadable keeps this off with no signal beyond the summary.
+    if (summary.registry_unreadable) {
+      summary.skipped['skipped-registry-unreadable'] =
+        (summary.skipped['skipped-registry-unreadable'] ?? 0) + 1;
+      continue;
+    }
+
+    // -- Latency cap (#926, SessionStart path only) --------------------------
+    if (typeof limit === 'number' && considered >= limit) {
+      summary.truncated = true;
+      break;
+    }
+    considered += 1;
+
+    const res = await backfillAbandonedSession({
+      repoRoot,
+      sessionId: item.sessionId,
+      semanticSessionId: item.semanticSessionId,
+      dryRun: !apply,
+      relaxDeadByAge: true,
+      assumeDeadBeforeMs,
+      archiveScanDeadlineMs,
+    });
+    switch (res.action) {
+      case 'backfilled':
+        summary.backfilled += 1;
+        if (res.deadByAge) summary.dead_by_age += 1;
+        await emitBackfillCompleted(repoRoot, item, res);
+        // Keep the pre-filter snapshot in step with what we just wrote, so a
+        // second candidate bridging to the SAME semantic id is skipped cheaply
+        // instead of re-entering the core (which would reach the same verdict).
+        if (typeof res.sessionId === 'string') recordedIds.add(res.sessionId);
+        break;
+      case 'would-backfill':
+        if (projected.has(res.sessionId)) {
+          summary.skipped['skipped-already-recorded'] =
+            (summary.skipped['skipped-already-recorded'] ?? 0) + 1;
+        } else {
+          projected.add(res.sessionId);
+          summary.would_backfill += 1;
+          if (res.deadByAge) summary.dead_by_age += 1;
+        }
+        break;
+      case NO_RUN_ACTION:
+        summary.skipped[NO_RUN_ACTION] = (summary.skipped[NO_RUN_ACTION] ?? 0) + 1;
+        // The mark the next run's plan reads (above); dry-run appends nothing.
+        if (apply) await emitBackfillCompleted(repoRoot, item, res);
+        break;
+      case 'error':
+        summary.errors += 1;
+        break;
+      default:
+        summary.skipped[res.action] = (summary.skipped[res.action] ?? 0) + 1;
+    }
+  }
+  return summary;
+}
+
+/**
+ * Emit `orchestrator.session.backfill_completed` for a record THIS path wrote
+ * (#1167). Mirrors the payload of `hooks/on-session-end.mjs::emitBackfillOutcome`
+ * so both writers are queryable with one filter.
+ *
+ * Until now the startup/CLI path wrote records SILENTLY: only the SessionEnd
+ * hook emitted the event, so nothing in the event stream distinguished "the
+ * backfill never ran" from "the backfill ran here". Best-effort by contract —
+ * observability must never fail a migration run.
+ *
+ * @param {string} repoRoot
+ * @param {{sessionId: string, semanticSessionId: string|null}} item
+ * @param {{action: string, sessionId?: string, supersedes?: string, error?: string}} res
+ */
+async function emitBackfillCompleted(repoRoot, item, res) {
+  try {
+    await emitEvent(
+      BACKFILL_COMPLETED_EVENT,
+      {
+        kind: 'abandoned',
+        action: typeof res?.action === 'string' ? res.action : 'unknown',
+        ...(typeof item?.sessionId === 'string' ? { session_id: item.sessionId } : {}),
+        ...(typeof item?.semanticSessionId === 'string'
+          ? { semantic_session_id: item.semanticSessionId }
+          : {}),
+        ...(typeof res?.sessionId === 'string' ? { record_id: res.sessionId } : {}),
+        ...(typeof res?.supersedes === 'string' ? { supersedes: res.supersedes } : {}),
+        ...(typeof res?.error === 'string' ? { reason: res.error } : {}),
+      },
+      { repoRoot },
+    );
+  } catch { /* observability is best-effort */ }
+}
+
+/**
+ * SessionStart entry point (#926) — decouple the backfill from the /close path.
+ *
+ * THE BUG THIS FIXES: `hooks/on-session-end.mjs` calls the backfill correctly,
+ * but SessionEnd only fires on a REGULAR close. A session killed by Ctrl-C, a
+ * timeout, or a crash leaves no ledger entry at all, and the backfill then waits
+ * for the NEXT clean close — which may never come. Observed on this repo:
+ * sessions.jsonl 18.9 h behind events.jsonl with 8 commits and 0 records.
+ * Running at SessionStart closes the loop: the PREVIOUS abandoned session is
+ * reconstructed by the NEXT session's start, whatever killed it.
+ *
+ * ── SAFETY (the two ways this could do damage) ───────────────────────────────
+ *  (1) NEVER record the CURRENTLY-STARTING session as abandoned. Two
+ *      independent defences:
+ *        a. STRUCTURAL — the caller invokes this BEFORE emitting
+ *           `orchestrator.session.started`, so this session is not yet in
+ *           events.jsonl and therefore not a candidate at all (`planSessions`
+ *           enumerates started-events only).
+ *        b. GUARD — on a clear/compact/resume re-fire, an EARLIER
+ *           `session.started` for the same logical session IS present. The
+ *           caller's `ownSessionIds` exclude it from the plan by raw or
+ *           semantic id, lock or no lock (#1748); a live own lock is still
+ *           rejected by the core's `skipped-own-live-lock` branch (#863).
+ *  (2) NEVER record a RUNNING FOREIGN session as abandoned. The core evaluates
+ *      lock ownership against the CANDIDATE (not the running process): a
+ *      candidate that holds a live lock returns `skipped-own-live-lock` BEFORE
+ *      the dead-by-age relaxation is ever consulted. Verified against a fixture
+ *      where the live lock holder is >4 h stale and thus relaxation-eligible.
+ *
+ *  (3) NEVER record a running LOCKLESS session (#1748: lead yield #1635,
+ *      released lock #1651, lost acquire). The host registry is read as a
+ *      second liveness source: an entry whose heartbeat is within the lock TTL
+ *      (`DEFAULT_TTL_HOURS`) excludes its session from the plan. A registry
+ *      that exists but cannot be listed stamps nothing
+ *      (`summary.registry_unreadable`).
+ *
+ * Residual risk, stated explicitly: a lockless session whose registry entry is
+ * gone (`sweepZombies` removes it after 60 min without a heartbeat) or older
+ * than the lock TTL reads as dead — the same TTL the lock model uses, rather
+ * than a second notion of liveness.
+ *
+ * Never throws — a backfill failure must NEVER block a session start.
+ *
+ * @param {object} args
+ * @param {string} args.repoRoot
+ * @param {number|null} [args.limit=SESSION_START_LIMIT]
+ * @param {number|null} [args.archiveScanBudgetMs=SESSION_START_ARCHIVE_SCAN_BUDGET_MS]
+ * @param {Array<string|null|undefined>} [args.ownSessionIds=[]] the hook's own
+ *   in-memory ids (raw + semantic) — never re-read from current-session.json,
+ *   which is repo-global and peer-writable (#1746).
+ * @returns {Promise<object|null>} the summary, or null when disabled/failed
+ */
+export async function backfillOnSessionStart({
+  repoRoot,
+  limit = SESSION_START_LIMIT,
+  archiveScanBudgetMs = SESSION_START_ARCHIVE_SCAN_BUDGET_MS,
+  ownSessionIds = [],
+} = {}) {
+  try {
+    // Escape hatch for operators who never want ledger writes at session start.
+    if (process.env.SO_DISABLE_STARTUP_BACKFILL === '1') return null;
+    if (typeof repoRoot !== 'string' || repoRoot.length === 0) return null;
+    // newestFirst is mandatory here — see runMigration's param docs for the
+    // measured failure (budget burned on ancient already-recorded candidates).
+    const summary = await runMigration({
+      repoRoot, apply: true, limit, newestFirst: true, archiveScanBudgetMs, ownSessionIds,
+    });
+    // The telemetry flush rides the SAME start-time trigger, for the same reason
+    // the backfill does — see flushTelemetryOnSessionStart.
+    await flushTelemetryOnSessionStart(repoRoot);
+    return summary;
+  } catch {
+    // Swallowed by contract — see the docblock. The hook is informational-only.
+    return null;
+  }
+}
+
+/** POST budget for the start-time telemetry drain (ms). Deliberately tighter than
+ *  the close-time budget: a session START must not wait on the network. Expiry is
+ *  LOSSLESS — flush() routes a timed-out batch into the offline queue. */
+const STARTUP_FLUSH_TIMEOUT_MS = 1500;
+
+/**
+ * SECOND FLUSH TRIGGER (GitLab #1234) — drain the PREVIOUS session's telemetry
+ * queue at the NEXT session's start.
+ *
+ * THE BUG THIS FIXES: the mechanical flush (#1138) lives only in
+ * `hooks/on-session-end.mjs`, which fires on a REGULAR close. Measured 2026-09-06
+ * over 90 fleet days, the real close rate is 21,3 % (429 clean closes / 2.016
+ * distinct `session.started` ids) — so roughly four sessions in five never reach
+ * the only code path that sends. This is the exact argument
+ * `backfillOnSessionStart` already makes for the ledger, applied to the ping:
+ * SessionStart is the trigger that survives whatever killed the last session.
+ *
+ * Three properties make this safe to run on the hot start path:
+ *  - LAZY IMPORT. `sync.mjs` is pulled in at CALL time, not module load. Loading
+ *    it statically would put the whole telemetry subtree onto the SessionStart
+ *    hook's import graph — the graph `tests/hooks/on-stop.test.mjs` guards for
+ *    bare specifiers, and the cost would be paid on every start whether or not
+ *    telemetry is even consented to.
+ *  - GATED, ALWAYS. `flush()` opens with `resolveConsent()`; with no consent it
+ *    returns before any network, queue write, or anon-ID mint.
+ *  - NEVER THROWS, NEVER BLOCKS A START. Every failure is swallowed, and the POST
+ *    is bounded at STARTUP_FLUSH_TIMEOUT_MS; a timeout queues the batch rather
+ *    than losing it.
+ *
+ * @param {string} repoRoot
+ * @returns {Promise<void>}
+ */
+async function flushTelemetryOnSessionStart(repoRoot) {
+  try {
+    const { flush } = await import('./lib/telemetry/sync.mjs');
+    await flush({
+      // ledger-root: metricsDir for the telemetry flush; buildBatch resolves each ledger in it
+      metricsDir: path.join(repoRoot, '.orchestrator', 'metrics'),
+      timeoutMs: STARTUP_FLUSH_TIMEOUT_MS,
+    });
+  } catch { /* fire-and-forget by contract */ }
+}
+
+function renderHuman(summary) {
+  const lines = [];
+  lines.push(`Backfill abandoned sessions — ${summary.mode}`);
+  lines.push(`  repo:            ${summary.repoRoot}`);
+  lines.push(`  sessions seen:   ${summary.total}`);
+  if (summary.history_gaps > 0) {
+    lines.push(`  history gaps:    ${summary.history_gaps} rotated archive(s) no longer readable — sessions seen is a floor`);
+  }
+  if (summary.mode === 'apply') {
+    lines.push(`  backfilled:      ${summary.backfilled}`);
+  } else {
+    lines.push(`  would backfill:  ${summary.would_backfill}`);
+  }
+  if (summary.dead_by_age > 0) {
+    lines.push(`  dead-by-age:     ${summary.dead_by_age} (relaxed past a live foreign session.lock)`);
+  }
+  lines.push(`  errors:          ${summary.errors}`);
+  const skips = Object.entries(summary.skipped);
+  if (skips.length > 0) {
+    lines.push('  skipped:');
+    for (const [reason, n] of skips) lines.push(`    ${reason}: ${n}`);
+  }
+  return lines.join('\n') + '\n';
+}
+
+async function main() {
+  let parsed;
+  try {
+    parsed = parseArgs({
+      args: process.argv.slice(2),
+      options: {
+        apply: { type: 'boolean', default: false },
+        'dry-run': { type: 'boolean', default: false },
+        json: { type: 'boolean', default: false },
+        'repo-root': { type: 'string' },
+        'assume-dead-before': { type: 'string' },
+        help: { type: 'boolean', short: 'h', default: false },
+      },
+      allowPositionals: false,
+    });
+  } catch (err) {
+    process.stderr.write(`backfill-abandoned-sessions: ${err.message}\n`);
+    process.exit(1);
+  }
+
+  const { values } = parsed;
+
+  if (values.help) {
+    process.stdout.write(
+      'Usage: node scripts/backfill-abandoned-sessions.mjs [--dry-run|--apply] [--json]\n' +
+        '                                                     [--repo-root PATH]\n' +
+        '                                                     [--assume-dead-before ISO]\n' +
+        '  --dry-run             preview only (DEFAULT — nothing is written)\n' +
+        '  --apply               synthesize + append abandoned-session stubs\n' +
+        '  --json                emit the summary as JSON to stdout\n' +
+        '  --repo-root           override the project root (default: resolved project dir)\n' +
+        '  --assume-dead-before  ISO-8601 cutoff; a candidate whose last known event\n' +
+        '                        predates it bypasses a live foreign session.lock\n' +
+        'Exit codes: 0 ok, 1 arg error, 2 system error\n'
+    );
+    process.exit(0);
+  }
+
+  // --apply is an explicit opt-in; absent it (or with --dry-run) we never write.
+  const apply = values.apply === true && values['dry-run'] !== true;
+  const repoRoot = path.resolve(values['repo-root'] || getProjectDir());
+
+  let assumeDeadBeforeMs = null;
+  if (typeof values['assume-dead-before'] === 'string' && values['assume-dead-before'].length > 0) {
+    const ms = Date.parse(values['assume-dead-before']);
+    if (Number.isNaN(ms)) {
+      process.stderr.write(
+        `backfill-abandoned-sessions: --assume-dead-before is not a valid ISO-8601 timestamp: "${values['assume-dead-before']}"\n`
+      );
+      process.exit(1);
+    }
+    assumeDeadBeforeMs = ms;
+  }
+
+  let summary;
+  try {
+    summary = await runMigration({ repoRoot, apply, assumeDeadBeforeMs });
+  } catch (err) {
+    process.stderr.write(`backfill-abandoned-sessions: ${err?.message ?? String(err)}\n`);
+    process.exit(2);
+  }
+
+  if (values.json) {
+    process.stdout.write(JSON.stringify(summary) + '\n');
+  } else {
+    process.stdout.write(renderHuman(summary));
+  }
+  process.exit(0);
+}
+
+const isDirectRun = isMainModule(import.meta.url);
+if (isDirectRun) {
+  main().catch((err) => {
+    process.stderr.write(`backfill-abandoned-sessions: unexpected error: ${err?.stack ?? err}\n`);
+    process.exit(2);
+  });
+}

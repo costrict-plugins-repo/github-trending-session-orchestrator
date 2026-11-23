@@ -1,0 +1,47 @@
+#!/usr/bin/env node
+/** Opt-in native MCP configuration for an installed Windows plugin. */
+import { copyFileSync, existsSync, readFileSync, realpathSync } from 'node:fs';
+import path from 'node:path';
+import { envelopeToError, writeJsonAtomicSync } from './lib/io.mjs';
+import { isMainModule } from './lib/is-main-module.mjs';
+
+export function configureNativeMcp(pluginRoot, { node = process.execPath, platform = process.platform } = {}) {
+  if (platform !== 'win32') throw new Error('This setup is for native Windows only.');
+  const root = realpathSync(pluginRoot);
+  if (existsSync(path.join(root, '.git'))) throw new Error('Refusing to configure a Git checkout.');
+  const segments = root.split(path.sep);
+  const inCache = segments.some((segment, index) =>
+    segment === 'plugins' && segments[index + 1] === 'cache' && index + 2 < segments.length);
+  if (!inCache) throw new Error('Expected an installed plugin inside plugins/cache.');
+  const pkg = JSON.parse(readFileSync(path.join(root, 'package.json'), 'utf8'));
+  if (pkg.name !== 'session-orchestrator') throw new Error('Expected a session-orchestrator plugin directory.');
+  const server = path.join(root, 'scripts', 'mcp-server.mjs');
+  if (!existsSync(server)) throw new Error('Native MCP server is missing; install the updated package first.');
+  const file = path.join(root, 'mcp', 'servers.json');
+  const raw = readFileSync(file, 'utf8');
+  const config = JSON.parse(raw);
+  const current = config.mcpServers?.['session-orchestrator'];
+  if (!current || typeof current !== 'object') throw new Error('Expected session-orchestrator MCP configuration.');
+  if (current.command === node && current.args?.length === 1 && current.args[0] === server) {
+    return { changed: false, file };
+  }
+  const backup = `${file}.before-windows-setup`;
+  if (existsSync(backup)) throw new Error(`Backup already exists: ${backup}; inspect it before reconfiguring.`);
+  config.mcpServers['session-orchestrator'] = { ...current, command: node, args: [server] };
+  copyFileSync(file, backup);
+  // Shared writer: the win32 rename retry matters here most — an open editor or
+  // a running MCP host holding mcp/servers.json made a bare renameSync fail (#1865).
+  const written = writeJsonAtomicSync(file, config, { tmpPrefix: 'servers.json.windows-setup' });
+  if (!written.ok) throw envelopeToError(written);
+  return { changed: true, file, backup };
+}
+
+if (isMainModule(import.meta.url)) {
+  try {
+    if (process.argv.length !== 3) throw new Error('Usage: node scripts/windows-setup.mjs <installed-plugin-directory>');
+    process.stdout.write(`${JSON.stringify(configureNativeMcp(process.argv[2]))}\n`);
+  } catch (error) {
+    process.stderr.write(`${error.message}\n`);
+    process.exitCode = 1;
+  }
+}

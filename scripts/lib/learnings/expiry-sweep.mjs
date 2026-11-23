@@ -1,0 +1,1009 @@
+/**
+ * learnings/expiry-sweep.mjs — mechanical archive-safe writers for learnings.jsonl.
+ *
+ * Epic #723 B4 (`sweepExpiredLearnings`) + issue #1017 (`pruneLearnings`).
+ *
+ * Fleet audit found expired-resident learnings accumulating in 6+ repos
+ * (Vault: 70% expired) because nothing MECHANICALLY moves expired entries out
+ * of the active store — `memory-cleanup-soft-limit` and the `evolve`
+ * confidence-decay pass both operate on the live store but never relocate
+ * anything. This module is the missing mechanical sweep: it partitions
+ * `learnings.jsonl` into KEEP (still active, or too-recently expired to move
+ * yet) and ARCHIVE (expired past the grace window), appends the archive
+ * candidates to an append-only sidecar, then rewrites the store with only the
+ * KEEP set.
+ *
+ * #1017 — the SAME pipeline, one predicate apart. `/evolve`'s prune step
+ * ("remove entries where `expires_at` < now OR `confidence` <= 0", then
+ * consolidate duplicates, then rewrite the store) was specified as coordinator
+ * PROSE doing a read-modify-`>`-rewrite by hand, with no archive append at
+ * all. Measured consequence on the live corpus: 11 of 13 `learning-id`
+ * provenance pointers in rendered `.claude/rules/*.md` resolved to NOTHING —
+ * the ids were in neither the store, the archive, nor any `.bak-*` snapshot
+ * (85% dead pointers). {@link pruneLearnings} is that path routed through this
+ * file's pipeline instead: the two callers differ ONLY in how they partition
+ * (time-driven vs decision-driven); the crash-safe ordering, the KEEP-batch
+ * probe, and the `.bak` snapshot are one shared code path, never two.
+ *
+ * Design constraints (deliberate, do not "simplify" away):
+ *   - NEVER deletes data. Archive is append-only; the store rewrite is the
+ *     ONLY destructive step, and it reuses `rewriteLearnings()` from io.mjs
+ *     (#721), which itself snapshots a `.bak-<ISO>` backup before the atomic
+ *     rename — the same safety net that protects every other bulk rewrite.
+ *     A store line that does not parse is carried through the rewrite
+ *     verbatim (#1489): neither partition can judge it, and the rewrite is
+ *     built from parsed records, so leaving it out deleted it with no archive
+ *     record. Refusing the rewrite instead would stall the session-end sweep
+ *     on every close until someone repaired the line by hand.
+ *   - Grace period (default 14 days): an entry that JUST expired stays in the
+ *     active store for `graceDays` more days. This absorbs two things: (a)
+ *     TTL edge-noise near the boundary, and (b) a window for /evolve's
+ *     confidence-reinforcement pass to re-stamp `expires_at` before the entry
+ *     is moved out from under it. Without the grace window, a recurring
+ *     learning could ping-pong between store and archive on every sweep.
+ *   - Crash-safe ordering: the archive APPEND happens before the store
+ *     REWRITE. A crash between the two steps leaves the entry in BOTH places
+ *     (harmless — the archive is append-only and never de-duplicated on
+ *     read) rather than in NEITHER (data loss, if the rewrite completed but
+ *     the archive append had not yet happened).
+ *   - KEEP-batch validated BEFORE the archive append: a `rewriteLearnings(...,
+ *     { dryRun: true })` probe validates the KEEP set (throws on an
+ *     invalid-but-parseable record) with zero disk writes. Without this
+ *     probe, an invalid KEEP record would survive `readLearnings()` only to
+ *     blow up the REAL rewrite AFTER the archive append had already landed —
+ *     on a repeated `--apply` run that duplicates the archive append every
+ *     time while the store is never actually pruned.
+ *   - Read/normalize is delegated to `readLearnings()`; the destructive
+ *     rewrite is delegated to `rewriteLearnings()`. This file does not
+ *     implement its own JSONL writer for the store — see io.mjs #721
+ *     (the incident that destroyed 107 live learnings via a bespoke writer
+ *     with no backup/dry-run safety net).
+ *
+ * #1500 — {@link dropMalformedLines}, the one sanctioned removal of an
+ * unparseable store line: the lines the two writers above keep verbatim.
+ *
+ * Sibling-module import convention (learnings.mjs barrel doc): import
+ * directly from `./io.mjs`, never from `../learnings.mjs`, to preserve the
+ * acyclic dependency graph.
+ */
+
+import { constants as fsConstants, existsSync } from 'node:fs';
+import { mkdir, appendFile, copyFile } from 'node:fs/promises';
+import path from 'node:path';
+import {
+  appendInboxReceipts,
+  readLearnings,
+  readLearningsSnapshot,
+  rewriteLearnings,
+  withLearningsLock,
+} from './io.mjs';
+import { redactHomeDir } from '../common.mjs';
+import { assertStoreRoleUsable, isCanonicalStore, resolveStoreRole } from './store-role.mjs';
+
+/**
+ * Thrown by {@link pruneLearnings} when `expectedGeneration` no longer matches
+ * the store (#1486): the caller's next generation was derived from a store
+ * state that has since changed, so every record added after that derivation
+ * would read as caller-dropped and be archived `pruned`. Nothing is written.
+ */
+export class StoreGenerationMismatchError extends Error {
+  /**
+   * @param {string} filePath
+   * @param {string} expected - token the caller derived its generation from
+   * @param {string} actual - token of the store as read under the lock
+   */
+  constructor(filePath, expected, actual) {
+    // The tokens live on the object, never in the message: callers print the
+    // message, and the CURRENT token copied onto the stale sidecar's line 1 is
+    // exactly what gets that sidecar past this check — measured, the copy
+    // archived the peer's record `pruned`, exit 0.
+    super(`store-generation-mismatch: ${filePath} changed since the next generation was derived — nothing written`);
+    this.name = 'StoreGenerationMismatchError';
+    this.code = 'store-generation-mismatch';
+    this.filePath = filePath;
+    this.expected = expected;
+    this.actual = actual;
+  }
+}
+
+/**
+ * Thrown by {@link dropMalformedLines} when a requested line may not be
+ * dropped. Nothing is written. Two reasons:
+ *   - `not-unparseable`: a record, a blank line, or past the end. The message
+ *     names where the unparseable lines are NOW — every rewrite moves them to
+ *     the end, so a number from an earlier WARN is often stale (#1500 F3).
+ *   - `holds-a-record`: the line still carries a readable record (behind a
+ *     BOM, or fused after a torn one) and `acceptEmbedded` was not given.
+ */
+export class MalformedLineRefusedError extends Error {
+  /**
+   * @param {string} filePath
+   * @param {number[]} lines - the requested lines that may not be dropped
+   * @param {{ reason?: 'not-unparseable'|'holds-a-record', unparseable?: number[] }} [opts]
+   *   `unparseable`: the store's unparseable lines as read (for `not-unparseable`)
+   */
+  constructor(filePath, lines, { reason = 'not-unparseable', unparseable = [] } = {}) {
+    const where = `line ${lines.join(', ')} of ${redactHomeDir(filePath)}`;
+    const now =
+      unparseable.length === 0
+        ? 'none'
+        : unparseable.slice(0, 10).join(', ') + (unparseable.length > 10 ? `, +${unparseable.length - 10} more` : '');
+    super(
+      reason === 'holds-a-record'
+        ? `drop-malformed refused: ${where} still holds a readable record (see bom / embedded_record ` +
+            `in the dry run) — dropping it loses that record; nothing written. Pass --accept-embedded ` +
+            `to drop it anyway (the pre-drop snapshot keeps the line)`
+        : `drop-malformed refused: ${where} is not an unparseable line (a record, a blank line, or ` +
+            `past the end) — nothing written; unparseable lines now: ${now}`
+    );
+    this.name = 'MalformedLineRefusedError';
+    this.code = 'malformed-line-refused';
+    this.reason = reason;
+    this.lines = lines;
+  }
+}
+
+/**
+ * Composite-key separator for the in-memory consolidation Map.
+ *
+ * Built via `String.fromCharCode(0)` rather than a literal NUL byte in this file.
+ * A single NUL makes a tracked text file classify as BINARY, and grep/ugrep then
+ * skip it SILENTLY — exit 1, no output, no warning. That removed an entire deny
+ * path from a security census once (see the recorded anti-pattern rule on NUL
+ * bytes and grep-based audits). The separator byte is unchanged at runtime.
+ */
+const KEY_SEP = String.fromCharCode(0);
+
+const MS_PER_DAY = 86_400_000;
+const DEFAULT_GRACE_DAYS = 14;
+
+/**
+ * Canonical, key-order-independent JSON for a record — the identity of LAST
+ * RESORT, used only when a record carries no usable `id`.
+ *
+ * `JSON.stringify` is not sufficient here: two reads of the same record can
+ * differ in key ORDER (the store and the `--entries` sidecar are separate
+ * files, written by separate passes), and an order-sensitive fingerprint would
+ * read those as two different records.
+ *
+ * @param {unknown} value
+ * @returns {string}
+ */
+function stableStringify(value) {
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`;
+  if (value !== null && typeof value === 'object') {
+    return `{${Object.keys(value)
+      .sort()
+      .map((k) => `${JSON.stringify(k)}:${stableStringify(value[k])}`)
+      .join(',')}}`;
+  }
+  // `undefined` has no JSON form — normalize it to the same token as null so a
+  // present-but-undefined key cannot make a record unfingerprintable.
+  return JSON.stringify(value) ?? 'null';
+}
+
+/**
+ * Reconciliation identity for {@link pruneLearnings} step (3): the `id` when
+ * the record carries a usable one, else a content fingerprint.
+ *
+ * The fallback is load-bearing, not a nicety. `id` IS a required schema field,
+ * but `validateLearning` only checks key PRESENCE — `id: ''`, `id: null` and
+ * `id: undefined` all pass it, and `readLearnings()` never rejects anything —
+ * so an id-less record can and does reach disk. Such a record can never appear
+ * in `keep` (which is built from `next` alone), so leaving it unreconciled
+ * meant the store rewrite dropped it with no archive line: gone from BOTH
+ * places, which is the exact #1017 data loss this module exists to prevent.
+ *
+ * @param {object} entry
+ * @returns {string}
+ */
+function reconcileKey(entry) {
+  const id = entry?.id;
+  return typeof id === 'string' && id.length > 0
+    ? `id${KEY_SEP}${id}`
+    : `sig${KEY_SEP}${stableStringify(entry)}`;
+}
+
+/**
+ * Closed vocabulary for `_archive_reason` (#1017). Every record that leaves
+ * the active store carries exactly one of these, so the archive answers WHY a
+ * `learning-id` stopped resolving — not merely THAT it did.
+ *
+ *   expired    — `expires_at` elapsed (past the grace window, for the sweep).
+ *   pruned     — dropped by a decision: confidence decayed to <= 0, or the
+ *                caller removed it from the next store generation.
+ *   superseded — a duplicate `(type, subject)` lost to a higher-confidence
+ *                twin. Carries `_superseded_by: <winning id>`.
+ *   merged     — folded into another record. Carries `_merged_into: <id>`.
+ *
+ * `superseded` / `merged` REQUIRE their tombstone pointer — an archive record
+ * that says "this was replaced" without naming the replacement recreates the
+ * dangling-pointer defect one level down. {@link normalizeArchiveVerdict}
+ * fails closed on a missing pointer, before anything touches disk.
+ */
+export const ARCHIVE_REASONS = Object.freeze(['expired', 'pruned', 'superseded', 'merged']);
+
+/**
+ * Value of the additive `skipped` result field when an APPLY ran on a host
+ * whose learnings-store role is `inbox` (#1516).
+ */
+export const SKIPPED_STORE_ROLE_INBOX = 'store-role-inbox';
+
+/**
+ * True when an apply against `filePath` must not archive or rewrite (#1516):
+ * the canonical store on an `inbox`-role host. There `rewriteLearnings()`
+ * never touches the live store, so an archive append would record learnings
+ * that are still live. Dry runs are unaffected — they write nothing and keep
+ * reporting what a writer host would do.
+ *
+ * @param {unknown} filePath
+ * @returns {boolean}
+ */
+function isInboxRoleStore(filePath) {
+  return typeof filePath === 'string' && isCanonicalStore(filePath) && resolveStoreRole({ storePath: filePath }).role === 'inbox';
+}
+
+/** Reason -> the tombstone field that reason MUST carry. */
+const TOMBSTONE_FIELD = Object.freeze({
+  superseded: '_superseded_by',
+  merged: '_merged_into',
+});
+
+/** Reason -> the camelCase caller-facing alias for its tombstone pointer. */
+const TOMBSTONE_ALIAS = Object.freeze({
+  superseded: 'supersededBy',
+  merged: 'mergedInto',
+});
+
+/**
+ * Normalize an archive verdict into `{reason, tombstone}` and fail closed on
+ * an unknown reason or a missing tombstone pointer.
+ *
+ * Accepts a bare reason string (`'pruned'`) or an object
+ * (`{reason: 'superseded', supersededBy: '<id>'}`; the underscore form
+ * `_superseded_by` is accepted too, so a caller may pass the on-disk shape).
+ *
+ * Callers MUST normalize while building the archive batch — i.e. BEFORE the
+ * first disk write — so a bad verdict aborts with the store and the archive
+ * both untouched.
+ *
+ * @param {string|{reason: string, supersededBy?: string, mergedInto?: string}} raw
+ * @returns {{reason: string, tombstone: object|null}}
+ */
+function normalizeArchiveVerdict(raw) {
+  const v = typeof raw === 'string' ? { reason: raw } : (raw ?? {});
+  const { reason } = v;
+  if (!ARCHIVE_REASONS.includes(reason)) {
+    throw new Error(
+      `archive reason must be one of ${ARCHIVE_REASONS.join('|')}, got: ${JSON.stringify(reason)}`
+    );
+  }
+  const field = TOMBSTONE_FIELD[reason];
+  if (!field) return { reason, tombstone: null };
+  const target = v[TOMBSTONE_ALIAS[reason]] ?? v[field];
+  if (typeof target !== 'string' || target.length === 0) {
+    throw new Error(`archive reason "${reason}" requires a non-empty ${field} pointer`);
+  }
+  return { reason, tombstone: { [field]: target } };
+}
+
+/** Stamp an archive record with its provenance tail. */
+function tagArchiveRecord(entry, { reason, tombstone }, nowIso) {
+  return { ...entry, _archived_at: nowIso, _archive_reason: reason, ...(tombstone ?? {}) };
+}
+
+/** `{expired: 2, superseded: 1}` roll-up over a normalized archive batch. */
+function countByReason(batch) {
+  const out = {};
+  for (const { verdict } of batch) {
+    out[verdict.reason] = (out[verdict.reason] ?? 0) + 1;
+  }
+  return out;
+}
+
+/**
+ * Result field for the store's unparseable lines: `{malformed: n}` when the
+ * read held `n > 0`, else `{}` — so the pinned zero-case result shape (the
+ * CLI's `--json` contract) is unchanged, and an absent field always means a
+ * read that found none. A non-zero count also goes to stderr, because a
+ * caller that forwards only its own fields (the session-end tail runner, the
+ * CLI's human-readable line) would otherwise drop it on the floor.
+ *
+ * @param {string} filePath
+ * @param {string[]} malformed - raw text of the lines that did not parse
+ * @param {number[]} lineNumbers - their 1-based store lines (`malformedLineNumbers`)
+ * @returns {{malformed?: number}}
+ */
+function malformedField(filePath, malformed, lineNumbers) {
+  if (malformed.length === 0) return {};
+  warnUnparseableLines(filePath, malformed, lineNumbers);
+  return { malformed: malformed.length };
+}
+
+/**
+ * Store + line set already WARNed about in this process. One `/close` reads the
+ * same store twice in one process — the planner's dry run, then the apply — and
+ * printed the identical WARN twice. Grows by one key per distinct store+line
+ * set, so it stays tiny; revisit if a long-lived process ever sweeps many stores.
+ * @type {Set<string>}
+ */
+const warnedUnparseable = new Set();
+
+/**
+ * Print the one stderr WARN for a store's unparseable lines — at most once per
+ * store and identical line set per process. The policy it states is the store
+ * policy since #1489: such lines are kept verbatim at the end of every rewrite,
+ * never archived, and never a reason to refuse a write.
+ *
+ * @param {string} filePath
+ * @param {string[]} malformed - raw text of the lines that did not parse
+ * @param {number[]} [lineNumbers] - their 1-based store lines; at most ten listed
+ *
+ * The text names no dry-run state: one WARN per process is shared by the
+ * planner's dry run and the apply that follows it in a /close, so a dry-run
+ * qualifier would be printed for — and contradict — the applied rewrite.
+ */
+export function warnUnparseableLines(filePath, malformed, lineNumbers = []) {
+  if (malformed.length === 0) return;
+  const key = `${path.resolve(filePath)}\0${malformed.join('\n')}`;
+  if (warnedUnparseable.has(key)) return;
+  warnedUnparseable.add(key);
+  const more = lineNumbers.length > 10 ? `, +${lineNumbers.length - 10} more` : '';
+  const where = lineNumbers.length > 0 ? ` (line(s) ${lineNumbers.slice(0, 10).join(', ')}${more})` : '';
+  console.error(
+    // The store path is absolute and lands in every /close transcript (#1490).
+    `[learnings] WARN: ${malformed.length} unparseable line(s) in ${redactHomeDir(filePath)}${where} kept verbatim, ` +
+      `never archived; report them to the operator — ` +
+      `never hand-edit the store. Once the operator decides, remove one with ` +
+      `\`node scripts/sweep-expired-learnings.mjs --drop-malformed --line N --file ${redactHomeDir(filePath)}\` ` +
+      `(dry run; it prints the --generation its --apply needs)`
+  );
+}
+
+/** Resolve the `now` parameter (Date | epoch ms | undefined) to epoch ms. */
+function resolveNowMs(now) {
+  if (now instanceof Date) return now.getTime();
+  if (typeof now === 'number') return now;
+  return Date.now();
+}
+
+/**
+ * THE shared write pipeline — the only place in this module that touches disk.
+ * Both public entry points funnel through it, so the crash-safe ordering, the
+ * KEEP-batch probe, and the `.bak` snapshot cannot drift apart between the
+ * time-driven and the decision-driven caller (#1017).
+ *
+ * Order is load-bearing (see the module header): probe the KEEP batch with
+ * zero disk writes, THEN append the archive, THEN rewrite the store.
+ *
+ * @param {object} opts
+ * @param {string} opts.filePath
+ * @param {string} opts.archivePath
+ * @param {object[]} opts.keep — the next store generation
+ * @param {{entry: object, verdict: {reason: string, tombstone: object|null}}[]} opts.archiveBatch
+ * @param {string[]} opts.malformed — unparseable store lines, written back
+ *   verbatim after `keep` (see the module header)
+ * @param {number[]} opts.malformedLineNumbers — their 1-based store lines (WARN only)
+ * @param {number} opts.nowMs
+ * @param {boolean} opts.dryRun
+ * @returns {Promise<{kept: number, archived: number, byReason: Record<string, number>,
+ *   malformedField: {malformed?: number}, skipped?: string}>}
+ */
+async function archiveThenRewrite({
+  filePath,
+  archivePath,
+  keep,
+  archiveBatch,
+  malformed,
+  malformedLineNumbers,
+  nowMs,
+  dryRun,
+}) {
+  if (!dryRun && isInboxRoleStore(filePath)) {
+    // Inbox role (#1516): no archive line — the live store keeps every record,
+    // so archiving one would duplicate a live learning. The rewrite still runs:
+    // on this role it only appends the batch's NEW ids to the inbox (e.g. the
+    // session's fresh learnings from apply-session-learnings) and drops every
+    // update, removal and consolidation.
+    await rewriteLearnings(filePath, keep, { dryRun: false, malformedLines: malformed });
+    return {
+      kept: keep.length,
+      archived: 0,
+      byReason: {},
+      malformedField: malformedField(filePath, malformed, malformedLineNumbers),
+      skipped: SKIPPED_STORE_ROLE_INBOX,
+    };
+  }
+  const byReason = countByReason(archiveBatch);
+  const result = {
+    kept: keep.length,
+    archived: archiveBatch.length,
+    byReason,
+    malformedField: malformedField(filePath, malformed, malformedLineNumbers),
+  };
+  if (dryRun) return result;
+
+  // Validate the KEEP batch BEFORE the archive append (dry-run rewrite: throws
+  // on a bad record, writes nothing). Without this, an invalid-but-parseable
+  // KEEP record survives readLearnings() but blows up rewriteLearnings() later
+  // — AFTER the archive append already landed. On a repeated --apply run that
+  // duplicates the archive append every time (never de-duplicated on read)
+  // while the store is never actually pruned. Validating first means a bad
+  // record throws here, before anything on disk has been touched.
+  await rewriteLearnings(filePath, keep, { dryRun: true, malformedLines: malformed });
+
+  // Crash-safe ordering: archive append FIRST. A duplicate re-append after a
+  // crash is harmless (append-only, never de-duplicated on read); the reverse
+  // order risks losing an archive-worthy entry if the process dies after the
+  // store rewrite but before the archive write.
+  if (archiveBatch.length > 0) {
+    const nowIso = new Date(nowMs).toISOString();
+    const body =
+      archiveBatch
+        .map(({ entry, verdict }) => JSON.stringify(tagArchiveRecord(entry, verdict, nowIso)))
+        .join('\n') + '\n';
+    await mkdir(path.dirname(archivePath), { recursive: true });
+    await appendFile(archivePath, body, 'utf8');
+    // Inbox receipts (#1516) for archived ids that came from the inbox: the
+    // archive is not synced to the inbox host, so without a receipt the record
+    // turns visible there again. Written AFTER the archive append (a crash
+    // cannot leave a receipt for a record that is neither live nor archived)
+    // and BEFORE the rewrite. A crash between the archive append and this
+    // receipt still leaves an archived inbox record without one; the next
+    // writer rewriteLearnings() heals it (io.mjs `unreceiptedArchivedIds`).
+    // Both callers hold the store lock here, as appendInboxReceipts requires.
+    await appendInboxReceipts(
+      filePath,
+      archiveBatch.map(({ entry }) => entry?.id)
+    );
+  }
+
+  // Re-validates (cheap, idempotent) and snapshots a `.bak-<ISO>` backup of
+  // the current store before the atomic rename (io.mjs #721). The KEEP batch
+  // already passed the dry-run probe above, so this call cannot throw here.
+  await rewriteLearnings(filePath, keep, { dryRun: false, malformedLines: malformed });
+
+  return result;
+}
+
+/**
+ * Sweep expired learnings out of `filePath` into `archivePath`.
+ *
+ * Partition rule (relative to `now`):
+ *   - KEEP:    `expires_at` unparseable/absent, OR not yet expired, OR expired
+ *              but within `graceDays` of expiry (grace window).
+ *   - ARCHIVE: `expires_at` parseable AND expired AND
+ *              `expiresMs + graceDays*86400000 < now` (grace window elapsed).
+ *
+ * @param {object} opts
+ * @param {string} opts.filePath - absolute/relative path to the active learnings.jsonl
+ * @param {string} opts.archivePath - absolute/relative path to the append-only archive sidecar
+ * @param {Date|number} [opts.now] - injectable clock; defaults to `Date.now()`
+ * @param {boolean} [opts.dryRun=true] - when true, computes counts but writes nothing
+ * @param {number} [opts.graceDays=14] - days past expiry before an entry is archived
+ * @returns {Promise<{scanned: number, kept: number, archived: number, dryRun: boolean, archivePath: string,
+ *   malformed?: number}>} `malformed` is present only when the store held
+ *   unparseable lines: their count. They are kept verbatim at the end of the
+ *   rewritten store, never archived, and not counted in `scanned`/`kept`.
+ *   Never throws on a missing store — returns the zeroed shape instead. An
+ *   apply on an `inbox`-role host (#1516) reads and writes nothing and returns
+ *   the zeroed shape plus `skipped: 'store-role-inbox'`. Both
+ *   `filePath` and `archivePath` are required; a missing/invalid `filePath`
+ *   throws a plain `Error` (programmer error, not a runtime data condition).
+ * @throws {LearningsStoreRoleError} an apply on the canonical store while the
+ *   host's store role is invalid (#1516) — nothing archived or rewritten
+ */
+export async function sweepExpiredLearnings(opts = {}) {
+  const { filePath, dryRun = true } = opts;
+  // Fail-closed (#1516): an apply under an invalid store role refuses before
+  // the archive append — archived-but-live records would follow otherwise.
+  if (!dryRun && typeof filePath === 'string') assertStoreRoleUsable(filePath);
+  // The read → rewrite runs under the store lock (#1447 point 8). A run that
+  // cannot write takes no lock: a dry run, an absent store (zeroed shape, see
+  // below), or an unusable `filePath` (the body owns that error).
+  // An inbox-role apply (#1516) writes nothing either — no lock.
+  if (dryRun || typeof filePath !== 'string' || !existsSync(filePath) || isInboxRoleStore(filePath)) {
+    return sweepExpiredLearningsUnlocked(opts);
+  }
+  return withLearningsLock(filePath, () => sweepExpiredLearningsUnlocked(opts));
+}
+
+/**
+ * Body of {@link sweepExpiredLearnings}; the caller holds the store lock or
+ * runs a pass that cannot write.
+ */
+async function sweepExpiredLearningsUnlocked({
+  filePath,
+  archivePath,
+  now,
+  dryRun = true,
+  graceDays = DEFAULT_GRACE_DAYS,
+} = {}) {
+  if (typeof filePath !== 'string' || filePath.length === 0) {
+    throw new Error('sweepExpiredLearnings: filePath is required');
+  }
+  if (typeof archivePath !== 'string' || archivePath.length === 0) {
+    throw new Error('sweepExpiredLearnings: archivePath is required');
+  }
+
+  if (!dryRun && isInboxRoleStore(filePath)) {
+    // Inbox role (#1516): an expiry sweep is a pure removal, which this host
+    // never performs on the live store — the writer host sweeps. Zeroed counts
+    // so no caller reads "archived N"; `skipped` names why.
+    return { scanned: 0, kept: 0, archived: 0, dryRun, archivePath, skipped: SKIPPED_STORE_ROLE_INBOX };
+  }
+
+  if (!existsSync(filePath)) {
+    return { scanned: 0, kept: 0, archived: 0, dryRun, archivePath };
+  }
+
+  const nowMs = resolveNowMs(now);
+  const graceMs =
+    (Number.isFinite(graceDays) && graceDays >= 0 ? graceDays : DEFAULT_GRACE_DAYS) * MS_PER_DAY;
+
+  const { entries, malformed, malformedLineNumbers } = await readLearnings(filePath);
+
+  const keep = [];
+  const archiveBatch = [];
+  const expiredVerdict = normalizeArchiveVerdict('expired');
+
+  for (const entry of entries) {
+    const expiresMs = typeof entry?.expires_at === 'string' ? Date.parse(entry.expires_at) : NaN;
+    const isExpired = Number.isFinite(expiresMs) && expiresMs <= nowMs;
+    if (!isExpired) {
+      keep.push(entry);
+      continue;
+    }
+    // Expired — but does it clear the grace window?
+    if (expiresMs + graceMs < nowMs) {
+      archiveBatch.push({ entry, verdict: expiredVerdict });
+    } else {
+      keep.push(entry);
+    }
+  }
+
+  const { kept, archived, malformedField: malformedCount } = await archiveThenRewrite({
+    filePath,
+    archivePath,
+    keep,
+    archiveBatch,
+    malformed,
+    malformedLineNumbers,
+    nowMs,
+    dryRun,
+  });
+
+  // Result shape is pinned by the CLI (`scripts/sweep-expired-learnings.mjs`)
+  // and its JSON contract — deliberately WITHOUT `byReason`, which only the
+  // multi-reason prune path below can populate meaningfully.
+  return { scanned: entries.length, kept, archived, dryRun, archivePath, ...malformedCount };
+}
+
+/**
+ * Decision-driven sibling of {@link sweepExpiredLearnings} — the archive-safe
+ * replacement for `/evolve`'s prune + consolidate + rewrite steps (#1017).
+ *
+ * Same pipeline, different predicate. Every record that leaves the store is
+ * appended to the archive with a reason from {@link ARCHIVE_REASONS} first;
+ * the store rewrite goes through `rewriteLearnings()` (validation + `.bak`
+ * snapshot + atomic rename), never a `>` redirect.
+ *
+ * Three ways a record leaves the store, each routed to its own reason:
+ *   1. **prune predicate** — `expires_at` elapsed (`expired`) or
+ *      `confidence <= 0` (`pruned`). This is `/evolve` SKILL.md Step 3.5(6) /
+ *      Step 4.4(3) verbatim, minus the deletion.
+ *   2. **consolidation** — duplicate `(type, subject)` with a NON-EMPTY
+ *      subject: the highest-confidence record wins, the losers are archived
+ *      `superseded` with `_superseded_by: <winner id>`. Null/empty-subject
+ *      records are NEVER collapsed (issue #284) — each is keyed by its `id`.
+ *   3. **caller drop** — a record present on disk but absent from `entries`
+ *      (the caller's next store generation). This is the mechanical guarantee
+ *      that makes the prose-driven caller safe by construction: whatever an
+ *      LLM-authored next generation omits is tombstoned automatically rather
+ *      than silently deleted. Reconciliation is by `id`, falling back to a
+ *      content fingerprint for a record with no usable one, and it COUNTS
+ *      rather than tests membership — see {@link reconcileKey}. Deliberate
+ *      ceiling: an id-less record the caller MUTATED (rather than dropped)
+ *      fingerprints as a drop, so it is tombstoned while the mutated copy
+ *      stays in the store — a duplicate archive line, never a loss. Revisit if
+ *      a caller ever needs to mutate id-less records in bulk; the fix is to
+ *      stamp an `id` at the read funnel, not to loosen this loop.
+ *
+ * **No `graceDays` here, by design.** The grace window exists for two reasons
+ * (see the module header): TTL edge-noise, and "a window for /evolve's
+ * confidence-reinforcement pass to re-stamp `expires_at` before the entry is
+ * moved out from under it". On THIS path reason 2 is structurally already
+ * satisfied: `/evolve` applies its reinforcement (+0.15 and a fresh
+ * `expires_at`) in the SAME run, strictly before the prune step — so an entry
+ * still expired at prune time is one the analyzer just declined to reinforce,
+ * not one that is about to be. Carrying a grace window here would instead
+ * CHANGE `/evolve`'s documented prune semantics (entries the operator expects
+ * gone would linger). The ping-pong hazard the grace window guards against on
+ * the sweep is also cheap here: this path archives rather than deletes, so a
+ * later re-derivation costs a duplicate archive line, not data.
+ *
+ * @param {object} opts
+ * @param {string} opts.filePath - active learnings.jsonl
+ * @param {string} opts.archivePath - append-only archive sidecar
+ * @param {object[]} [opts.entries] - the caller's next store generation (post
+ *   confidence-update / append). Defaults to the on-disk set, i.e. a pure
+ *   prune+consolidate pass.
+ * @param {Date|number} [opts.now] - injectable clock
+ * @param {boolean} [opts.dryRun=true]
+ * @param {string|Function} [opts.dropReason='pruned'] - verdict for case 3
+ *   above: a reason string, or `(entry) => reason|{reason, supersededBy, mergedInto}`
+ *   for per-record routing (this is the seam a later `merged` producer uses).
+ * @param {string} [opts.expectedGeneration] - generation token
+ *   (`readLearningsSnapshot().generation`) of the store state `entries` was
+ *   derived from (#1486). Compared against the store as read here — under the
+ *   lock on apply — and a mismatch throws {@link StoreGenerationMismatchError}
+ *   before anything is written. Required whenever `entries` was derived in an
+ *   earlier read, outside the lock (the `/evolve` sidecar); a caller that
+ *   reads and prunes inside one `withLearningsLock` section may omit it.
+ * @returns {Promise<{scanned: number, kept: number, archived: number,
+ *   byReason: Record<string, number>, dryRun: boolean, archivePath: string,
+ *   malformed?: number}>} `malformed` as in {@link sweepExpiredLearnings}: the
+ *   store's unparseable lines, kept verbatim — no caller generation can carry
+ *   them, so they are never read as caller drops. On an `inbox`-role host
+ *   (#1516) an apply archives nothing (`archived: 0`, `byReason: {}`) and adds
+ *   `skipped: 'store-role-inbox'`; its rewrite only appends the next
+ *   generation's new ids to `learnings-inbox.jsonl`.
+ * @throws {StoreGenerationMismatchError} when `expectedGeneration` is stale
+ * @throws {LearningsStoreRoleError} an apply on the canonical store while the
+ *   host's store role is invalid (#1516) — nothing archived or rewritten
+ */
+export async function pruneLearnings(opts = {}) {
+  const { filePath, dryRun = true } = opts;
+  // Fail-closed (#1516): refuse before the archive append, see sweepExpiredLearnings.
+  if (!dryRun && typeof filePath === 'string') assertStoreRoleUsable(filePath);
+  // The read → archive → rewrite runs under the store lock (#1447 point 8): an
+  // append landing after the read below would otherwise vanish in the rename
+  // with no archive line. A dry run writes nothing and takes no lock; an
+  // unusable `filePath` goes straight to the body, which owns that error.
+  if (dryRun || typeof filePath !== 'string' || filePath.length === 0) {
+    return pruneLearningsUnlocked(opts);
+  }
+  return withLearningsLock(filePath, () => pruneLearningsUnlocked(opts));
+}
+
+/**
+ * Body of {@link pruneLearnings}; the caller holds the store lock or runs a
+ * dry run.
+ */
+async function pruneLearningsUnlocked({
+  filePath,
+  archivePath,
+  entries,
+  now,
+  dryRun = true,
+  dropReason = 'pruned',
+  expectedGeneration,
+} = {}) {
+  if (typeof filePath !== 'string' || filePath.length === 0) {
+    throw new Error('pruneLearnings: filePath is required');
+  }
+  if (typeof archivePath !== 'string' || archivePath.length === 0) {
+    throw new Error('pruneLearnings: archivePath is required');
+  }
+  if (entries !== undefined && !Array.isArray(entries)) {
+    throw new Error('pruneLearnings: entries must be an array when provided');
+  }
+  if (
+    expectedGeneration !== undefined &&
+    (typeof expectedGeneration !== 'string' || expectedGeneration.length === 0)
+  ) {
+    throw new Error('pruneLearnings: expectedGeneration must be a non-empty string when provided');
+  }
+
+  const nowMs = resolveNowMs(now);
+  // Token and records come from ONE read, so the comparison judges exactly the
+  // records loop (3) reconciles against.
+  const { entries: current, malformed, malformedLineNumbers, generation } = await readLearningsSnapshot(filePath);
+  if (expectedGeneration !== undefined && generation !== expectedGeneration) {
+    throw new StoreGenerationMismatchError(filePath, expectedGeneration, generation);
+  }
+  const next = entries ?? current;
+
+  if (next.length === 0 && current.length === 0) {
+    // Nothing to write — the malformed lines, if any, stay where they are.
+    return {
+      scanned: 0,
+      kept: 0,
+      archived: 0,
+      byReason: {},
+      dryRun,
+      archivePath,
+      ...malformedField(filePath, malformed, malformedLineNumbers),
+    };
+  }
+
+  const resolveDrop = (entry) =>
+    normalizeArchiveVerdict(typeof dropReason === 'function' ? dropReason(entry) : dropReason);
+
+  const archiveBatch = [];
+  const survivors = [];
+
+  // (1) prune predicate — SKILL.md Step 3.5(6) / 4.4(3), routed by cause.
+  for (const entry of next) {
+    const expiresMs = typeof entry?.expires_at === 'string' ? Date.parse(entry.expires_at) : NaN;
+    if (Number.isFinite(expiresMs) && expiresMs < nowMs) {
+      archiveBatch.push({ entry, verdict: normalizeArchiveVerdict('expired') });
+      continue;
+    }
+    if (typeof entry?.confidence === 'number' && entry.confidence <= 0) {
+      archiveBatch.push({ entry, verdict: normalizeArchiveVerdict('pruned') });
+      continue;
+    }
+    survivors.push(entry);
+  }
+
+  // (2) consolidation — highest confidence wins per (type, non-empty subject).
+  const winners = new Map();
+  for (const entry of survivors) {
+    const subject = typeof entry?.subject === 'string' ? entry.subject.trim() : '';
+    if (subject.length === 0) continue; // #284: never collapse null/empty subjects
+    const key = `${entry?.type}${KEY_SEP}${subject}`;
+    const incumbent = winners.get(key);
+    const score = typeof entry?.confidence === 'number' ? entry.confidence : -Infinity;
+    const incumbentScore =
+      incumbent && typeof incumbent.confidence === 'number' ? incumbent.confidence : -Infinity;
+    if (!incumbent || score > incumbentScore) winners.set(key, entry);
+  }
+  const keep = [];
+  for (const entry of survivors) {
+    const subject = typeof entry?.subject === 'string' ? entry.subject.trim() : '';
+    if (subject.length === 0) {
+      keep.push(entry);
+      continue;
+    }
+    const winner = winners.get(`${entry?.type}${KEY_SEP}${subject}`);
+    if (winner === entry) {
+      keep.push(entry);
+      continue;
+    }
+    archiveBatch.push({
+      entry,
+      verdict: normalizeArchiveVerdict({ reason: 'superseded', supersededBy: String(winner?.id) }),
+    });
+  }
+
+  // (3) caller drops — on disk but absent from the next generation.
+  //
+  // Identity is {@link reconcileKey}: the `id` when the record has a usable
+  // one, else a content fingerprint. NOTHING is skipped here — a record this
+  // loop passes over is a record the store rewrite deletes without a tombstone,
+  // because `keep` is built from `next` alone (loops 1-2) and an on-disk record
+  // absent from `next` has no other way in. This loop IS the rescue; an early
+  // `continue` in it is a silent delete, not a no-op.
+  //
+  // COUNTS, not membership: `next` may legitimately carry fewer copies of a key
+  // than the store does (identical id-less records; a duplicate `id` on disk
+  // reconciled against one entry in `next`). Set-membership would skip every
+  // copy while `keep` holds only one — dropping the surplus with no archive
+  // line, the same hole one level down. A multiset archives exactly the surplus.
+  const nextKeyCounts = new Map();
+  for (const entry of next) {
+    const key = reconcileKey(entry);
+    nextKeyCounts.set(key, (nextKeyCounts.get(key) ?? 0) + 1);
+  }
+  let dropped = 0;
+  for (const entry of current) {
+    const key = reconcileKey(entry);
+    const remaining = nextKeyCounts.get(key) ?? 0;
+    if (remaining > 0) {
+      nextKeyCounts.set(key, remaining - 1);
+      continue;
+    }
+    archiveBatch.push({ entry, verdict: resolveDrop(entry) });
+    dropped += 1;
+  }
+
+  const { kept, archived, byReason, malformedField: malformedCount, skipped } = await archiveThenRewrite({
+    filePath,
+    archivePath,
+    keep,
+    archiveBatch,
+    malformed,
+    malformedLineNumbers,
+    nowMs,
+    dryRun,
+  });
+
+  return {
+    scanned: next.length + dropped,
+    kept,
+    archived,
+    byReason,
+    dryRun,
+    archivePath,
+    ...malformedCount,
+    ...(skipped ? { skipped } : {}),
+  };
+}
+
+/** Characters of a dropped line shown in the dry-run preview. */
+const DROP_PREVIEW_CHARS = 80;
+
+/** U+FEFF — built, not typed: a literal BOM in source fails validate-plugin's unicode-safety check. */
+const BOM = String.fromCharCode(0xfeff);
+
+/**
+ * The readable record an unparseable line may still carry (#1500 F1) — the
+ * line counts as malformed, yet dropping it would delete a learning:
+ *   - `bom`: the line is a JSON object behind a UTF-8 BOM (an editor's save);
+ *   - `embedded_record`: a `{` after the line's start (after the BOM, if any)
+ *     begins a suffix that parses as a JSON object — the #1489 fusion shape, a
+ *     torn record with the next complete record appended to it. The smallest
+ *     such offset wins; `id` is the record's id, or null.
+ *
+ * Ceiling (BV-004): one JSON.parse of the suffix per `{`, so quadratic in the
+ * line length — a few ms for the KB-sized lines a store holds; revisit if an
+ * unparseable line ever passes ~1 MB.
+ *
+ * @param {string} text - one unparseable store line
+ * @returns {{bom: boolean, embedded_record: {offset: number, id: string|null}|null}}
+ */
+function inspectMalformedLine(text) {
+  const asObject = (s) => {
+    try {
+      const v = JSON.parse(s);
+      return v !== null && typeof v === 'object' && !Array.isArray(v) ? v : null;
+    } catch {
+      return null;
+    }
+  };
+  const hasBom = text.startsWith(BOM);
+  const bom = hasBom && asObject(text.slice(1)) !== null;
+  let embedded = null;
+  for (let i = text.indexOf('{', hasBom ? 2 : 1); i !== -1; i = text.indexOf('{', i + 1)) {
+    const record = asObject(text.slice(i));
+    if (record !== null) {
+      embedded = { offset: i, id: typeof record.id === 'string' ? record.id : null };
+      break;
+    }
+  }
+  return { bom, embedded_record: embedded };
+}
+
+/**
+ * Where {@link dropMalformedLines} snapshots the store before its rewrite:
+ * `<stem>.pre-drop-malformed.jsonl.bak-<ISO>` beside it. The name is chosen
+ * twice over: `.orchestrator/metrics/*.jsonl.bak-*` gitignores it (here; in a
+ * consumer repo once bootstrap's `#store-lock-ignore` snippet has run), and it
+ * does NOT start with `<store>.bak`, so the keep-3 rotation of
+ * `rewriteLearnings()` never prunes it — the line's text outlives any number
+ * of later closes.
+ *
+ * @param {string} filePath
+ * @param {number} nowMs
+ * @returns {string}
+ */
+function dropSnapshotPath(filePath, nowMs) {
+  const base = path.basename(filePath);
+  const stem = base.endsWith('.jsonl') ? base.slice(0, -'.jsonl'.length) : base;
+  const ts = new Date(nowMs).toISOString().replace(/[:.]/g, '-');
+  return path.join(path.dirname(filePath), `${stem}.pre-drop-malformed.jsonl.bak-${ts}`);
+}
+
+/**
+ * Remove unparseable lines from a learnings store — the ONE sanctioned way
+ * (#1500). Every rewrite keeps such lines verbatim (#1489) and the WARN forbids
+ * hand edits, so without this the only removal was a library call.
+ *
+ * `lines` are 1-based store lines as the WARN or a dry run of this function
+ * reported them. Line numbers move: every rewrite puts the unparseable lines at
+ * the END of the store, so after the next /close sweep a number can name a
+ * different unparseable line. Hence an apply needs `expectedGeneration` — the
+ * `generation` a dry run returned — and the store read, the generation check,
+ * the line check, the snapshot and the rewrite all run under ONE store lock;
+ * read outside it, a record a peer appended meanwhile is lost to the rewrite.
+ *
+ * The rewrite goes through `rewriteLearnings()` (validation, `.bak-<ISO>`,
+ * atomic rename) after a full copy of the store to {@link dropSnapshotPath}.
+ *
+ * An unparseable line can still carry a readable record — fused after a torn
+ * one, or behind a BOM ({@link inspectMalformedLine}). The dry run flags it;
+ * an apply refuses such a line unless `acceptEmbedded` is set (#1500 F1): an
+ * 80-character preview hid a record at offset 250, and the apply deleted it.
+ *
+ * @param {object} opts
+ * @param {string} opts.filePath - the learnings store
+ * @param {number[]} opts.lines - 1-based lines to drop; each must be unparseable in the store as read
+ * @param {string} [opts.expectedGeneration] - generation the line numbers were read from;
+ *   REQUIRED to apply, checked on a dry run when given
+ * @param {boolean} [opts.acceptEmbedded=false] - apply even to a line that still holds a readable record
+ * @param {boolean} [opts.dryRun=true] - check and validate, write nothing
+ * @param {Date|number} [opts.now] - injectable clock (snapshot name)
+ * @returns {Promise<{generation: string, dropped: {line: number, chars: number, preview: string,
+ *   bom: boolean, embedded_record: {offset: number, id: string|null}|null}[], records: number,
+ *   remainingMalformed: number, recordBearing: number, dryRun: boolean, snapshot: string|null}>}
+ *   `generation` is the store's as read; `chars` the line's full length, `preview` its first
+ *   {@link DROP_PREVIEW_CHARS} characters with the home dir as `~`; `recordBearing` counts the
+ *   dropped lines that held a readable record. On an `inbox`-role host (#1516)
+ *   an apply writes nothing: it returns the dry-run result (`dryRun: true`,
+ *   `snapshot: null`) plus `skipped: 'store-role-inbox'`
+ * @throws {StoreGenerationMismatchError} the store is not at `expectedGeneration` — nothing written
+ * @throws {LearningsStoreRoleError} an apply on the canonical store while the
+ *   host's store role is invalid (#1516) — nothing written
+ * @throws {MalformedLineRefusedError} a line is not unparseable, or (apply without
+ *   `acceptEmbedded`) still holds a readable record — nothing written
+ */
+export async function dropMalformedLines({
+  filePath,
+  lines,
+  expectedGeneration,
+  acceptEmbedded = false,
+  dryRun = true,
+  now,
+} = {}) {
+  if (typeof filePath !== 'string' || filePath.length === 0) {
+    throw new Error('dropMalformedLines: filePath is required');
+  }
+  if (!Array.isArray(lines) || lines.length === 0 || !lines.every((n) => Number.isInteger(n) && n > 0)) {
+    throw new Error('dropMalformedLines: lines must be a non-empty array of positive integers');
+  }
+  if (!dryRun && (typeof expectedGeneration !== 'string' || expectedGeneration.length === 0)) {
+    throw new Error('dropMalformedLines: expectedGeneration is required to apply');
+  }
+  // Fail-closed (#1516): refuse before the snapshot and the rewrite.
+  if (!dryRun) assertStoreRoleUsable(filePath);
+  if (!dryRun && isInboxRoleStore(filePath)) {
+    // Inbox role (#1516): the live store is never rewritten on this host, so
+    // no snapshot and no rewrite. The checks still run (dry), so a stale
+    // generation or a wrong line still throws; the result says nothing moved.
+    const probe = await dropMalformedLinesUnlocked({
+      filePath, lines, expectedGeneration, acceptEmbedded, dryRun: true, now,
+    });
+    return { ...probe, skipped: SKIPPED_STORE_ROLE_INBOX };
+  }
+  const run = () => dropMalformedLinesUnlocked({ filePath, lines, expectedGeneration, acceptEmbedded, dryRun, now });
+  // An absent store has no line to drop — the body refuses without a lock.
+  return dryRun || !existsSync(filePath) ? run() : withLearningsLock(filePath, run);
+}
+
+/**
+ * Body of {@link dropMalformedLines}; the caller holds the store lock or runs
+ * a pass that cannot write.
+ */
+async function dropMalformedLinesUnlocked({ filePath, lines, expectedGeneration, acceptEmbedded, dryRun, now }) {
+  const snap = await readLearningsSnapshot(filePath);
+  if (expectedGeneration !== undefined && snap.generation !== expectedGeneration) {
+    throw new StoreGenerationMismatchError(filePath, expectedGeneration, snap.generation);
+  }
+  const wanted = [...new Set(lines)].sort((a, b) => a - b);
+  const notMalformed = wanted.filter((n) => !snap.malformedLineNumbers.includes(n));
+  if (notMalformed.length > 0) {
+    throw new MalformedLineRefusedError(filePath, notMalformed, { unparseable: snap.malformedLineNumbers });
+  }
+
+  const drop = new Set(wanted);
+  const keepMalformed = snap.malformed.filter((_, i) => !drop.has(snap.malformedLineNumbers[i]));
+  const dropped = wanted.map((line) => {
+    const text = snap.malformed[snap.malformedLineNumbers.indexOf(line)];
+    const cut = text.length > DROP_PREVIEW_CHARS ? `${text.slice(0, DROP_PREVIEW_CHARS)}…` : text;
+    return { line, chars: text.length, preview: redactHomeDir(cut), ...inspectMalformedLine(text) };
+  });
+  const recordBearing = dropped.filter((d) => d.bom || d.embedded_record !== null);
+  if (!dryRun && !acceptEmbedded && recordBearing.length > 0) {
+    throw new MalformedLineRefusedError(filePath, recordBearing.map((d) => d.line), { reason: 'holds-a-record' });
+  }
+  // Validate the next generation before anything touches disk, dry run too:
+  // a record the tolerant gate rejects throws here, before the snapshot.
+  await rewriteLearnings(filePath, snap.entries, { dryRun: true, malformedLines: keepMalformed });
+  const result = {
+    generation: snap.generation,
+    dropped,
+    records: snap.entries.length,
+    remainingMalformed: keepMalformed.length,
+    recordBearing: recordBearing.length,
+    dryRun,
+    snapshot: null,
+  };
+  if (dryRun) return result;
+
+  const snapshot = dropSnapshotPath(filePath, resolveNowMs(now));
+  // COPYFILE_EXCL: never overwrite an earlier snapshot.
+  await copyFile(filePath, snapshot, fsConstants.COPYFILE_EXCL);
+  await rewriteLearnings(filePath, snap.entries, { malformedLines: keepMalformed });
+  return { ...result, snapshot };
+}

@@ -1,0 +1,684 @@
+/**
+ * maintenance-due-banner.mjs — ONE session-start probe for the whole
+ * maintenance loop.
+ *
+ * ## Why this module exists
+ *
+ * Measured 2026-09-09 across consumer repos: `orchestrator.evolve.completed`
+ * fired ZERO times, all 628 learnings were still active, the session-end
+ * auto-dialectic nudge recorded `decided: true` while nobody ever ran it, and
+ * memory-cleanup had run in 1 of 3 repos. The maintenance loop was not
+ * missing — it was ADVERTISED IN THREE PLACES nobody reads at a moment nobody
+ * acts: two session-end nudges (3.6.5 auto-dream, 3.6.7 auto-dialectic) fire
+ * while the operator is closing down, and the session-start `reconcile-nudge`
+ * probe spoke for one signal out of several.
+ *
+ * This probe replaces all three with a single reading at the ONE moment the
+ * operator can act on it — session start — recommending the one verb that
+ * runs the whole loop: `/session housekeeping`.
+ *
+ * ## Design constraints it is written against
+ *
+ * - **HR-101 (a signal may only warn if it is rare).** Nothing is due ⇒ the
+ *   probe is SILENT. Eight independent signals are ANDed with a cooldown, not
+ *   ORed into a permanent warning: a repo that ran `/session housekeeping`
+ *   within the last {@link HOUSEKEEPING_COOLDOWN_DAYS} days says nothing at
+ *   all, because the operator already did the thing the banner would ask for.
+ * - **HR-106 (the banner reports what the rule judged).** Every DUE signal
+ *   carries the number or the date that made it due — never a bare count.
+ * - **Three-state, never two.** A signal whose inputs cannot be read goes to
+ *   `undeterminable`; it is never folded into "clean". Copied wholesale from
+ *   `reconcile-nudge-banner.mjs`'s `never` vs `undeterminable` discipline.
+ * - **NO new Session Config key.** Every threshold below is an EXISTING key or
+ *   an existing module constant. Same posture as `reconcile-nudge-banner.mjs`
+ *   and `loop-readiness-banner.mjs`: an advisory banner needs no switch.
+ *
+ * ## The eight signals
+ *
+ * | id                | due when                                                              | source |
+ * |-------------------|-----------------------------------------------------------------------|--------|
+ * | `evolve`          | no `orchestrator.evolve.completed` on record AND ≥20 active learnings  | `events.jsonl` + `computeReconcileNudge` |
+ * | `sweep`           | the dry-run expiry sweep would archive ≥1 entry                       | `learnings/expiry-sweep.mjs` |
+ * | `reconcile`       | `computeReconcileNudge().nudge === true`                              | `reconcile-nudge-banner.mjs` (reused whole) |
+ * | `dialectic`       | `shouldDispatchAutoDialectic().trigger === true`                      | `auto-dialectic.mjs` |
+ * | `memory-cleanup`  | `shouldDispatchAutoDream().trigger === true`                          | `auto-dream.mjs` |
+ * | `pending-sidecar` | a pending dream/dialectic proposal younger than 14 days is unapplied   | `.orchestrator/*-pending*.md` |
+ * | `generated-rules-expiring` | a machine-generated rule is expired or expires within {@link GENERATED_RULE_EXPIRY_HORIZON_DAYS} days | `instruction-budget-guard.mjs` |
+ * | `backlog-refinement` | no `orchestrator.backlog.refine_completed` within {@link BACKLOG_REFINE_INTERVAL_DAYS} days (only where the checker's own `resolveTarget` can read the checkout — skipped otherwise) | `events.jsonl` + `backlog-refine/fetch.mjs` |
+ *
+ * ### Why the expiry alarm is HERE and not in the test suite (#1372 follow-up)
+ *
+ * The invariant "no generated rule file sits expired in `.claude/rules/`" was
+ * first written as a vitest case comparing `expires-at` against TODAY. That is
+ * a calendar time-bomb in a BLOCKING gate: with nothing committed and nothing
+ * broken, `npm test` — pre-push hook and CI alike — turns red on the morning
+ * after the earliest date and blocks every unrelated hotfix, while the repair
+ * (consolidate the file, move its provenance pairs, delete it) is a human
+ * decision no test run can take. HR-101/HR-105: a signal must fire when
+ * something CHANGED, at a moment the operator can act, and be repairable by the
+ * thing that fires it. Session start, recommending `/session housekeeping`, is
+ * that moment; the predicate itself is still tested, against an INJECTED clock.
+ *
+ * Only SIDE-EFFECT-FREE signal functions are called — never a variant that
+ * advances `.orchestrator/dialectic-last-run`, because a probe that writes the
+ * stamp would consume the very signal it reports. (The former recording wrapper
+ * around this signal was removed in #1288; only the pure decision function
+ * remains.)
+ *
+ * Never throws. `computeMaintenanceDue` always returns the full shape;
+ * `checkMaintenanceDue` returns the banner object or `null`.
+ *
+ * @module scripts/lib/maintenance-due-banner
+ */
+
+import { existsSync, statSync } from 'node:fs';
+import path from 'node:path';
+
+import { SCAN_CHUNK_BYTES, eventsFilePath, scanEventsBackwards } from './events.mjs';
+import { computeReconcileNudge } from './reconcile-nudge-banner.mjs';
+import { sweepExpiredLearnings } from './learnings/expiry-sweep.mjs';
+import { shouldDispatchAutoDialectic } from './auto-dialectic.mjs';
+import { shouldDispatchAutoDream } from './auto-dream.mjs';
+import { resolveMemoryDir } from './memory-paths.mjs';
+import { resolveLedgerPath } from './ledger-path.mjs';
+import { readCanonicalSessions, isMeasuredSession } from './sessions-canonical.mjs';
+import {
+  daysUntilGeneratedRuleExpiry,
+  listMachineGeneratedRules,
+} from './instruction-budget-guard.mjs';
+import { planRuleExpirySweep } from './reconcile/rule-expiry-sweep.mjs';
+import { resolveTarget } from './backlog-refine/fetch.mjs';
+import { BACKLOG_REFINE_EVENT } from './backlog-refine/event.mjs';
+
+/**
+ * How many signals this probe knows about. The banner denominator is this
+ * number MINUS the signals a kill-switch skipped on this host — see the
+ * `skipped` array in {@link computeMaintenanceDue}'s result.
+ */
+export const MAINTENANCE_TOTAL_SIGNALS = 8;
+
+/**
+ * How far ahead the `generated-rules-expiring` signal looks.
+ *
+ * NAMED CEILING (BV-004): 7 days is one week of sessions — long enough that the
+ * operator meets the warning before the loader silently starts dropping the
+ * rule, short enough that it is not standing noise (HR-104: a signal that is
+ * essentially always present is no signal). On this repo's corpus at
+ * 2026-09-16 the earliest `expires-at` was 14 days out, so the row is silent.
+ *
+ * REVISIT TRIGGER: if the row is due on more than ~1 session start in 10, the
+ * horizon is measuring the reconcile engine's 30-day default TTL rather than an
+ * overdue consolidation — re-aim it (HR-101), never widen it.
+ */
+export const GENERATED_RULE_EXPIRY_HORIZON_DAYS = 7;
+
+/**
+ * Active-learning floor for the `evolve` signal. Deliberately the SAME number
+ * as `NUDGE_MIN_LEARNINGS` in `reconcile-nudge-banner.mjs` (20) — both answer
+ * "is the corpus large enough that never having processed it is a finding?".
+ * Defined locally rather than imported so the two can diverge if the reconcile
+ * threshold is ever retuned for reconcile-specific reasons.
+ */
+export const MAINTENANCE_MIN_LEARNINGS = 20;
+
+/** Suppress the banner when a housekeeping session completed this recently. */
+export const HOUSEKEEPING_COOLDOWN_DAYS = 7;
+
+/**
+ * A pending sidecar older than this is not a nudge, it is archaeology — the
+ * operator has demonstrably moved on, and re-raising it every session start is
+ * the HR-101 failure mode.
+ */
+export const SIDECAR_MAX_AGE_DAYS = 14;
+
+const MS_PER_DAY = 86_400_000;
+
+/** `resolveTarget` refusals that mean: the backlog checker does not serve this checkout. */
+const BACKLOG_UNSERVED_REASONS = new Set(['github-not-supported', 'no-gitlab-remote', 'no-remotes', 'not-a-git-repo']);
+
+/** The event name whose ABSENCE is the `evolve` signal. */
+const EVOLVE_EVENT = 'orchestrator.evolve.completed';
+
+/**
+ * How often the backlog refinement step (`/backlog`, `scripts/backlog-refine.mjs`)
+ * is expected to run: the signal is due when no {@link BACKLOG_REFINE_EVENT}
+ * younger than this many days is on record. A module constant, NOT a Session
+ * Config key (see "NO new Session Config key" above).
+ *
+ * NAMED CEILING (BV-004): one week matches {@link HOUSEKEEPING_COOLDOWN_DAYS} —
+ * a weekly housekeeping session clears it. REVISIT TRIGGER: the row is due on
+ * more than ~1 session start in 10 of repos that run housekeeping weekly
+ * (HR-101) — then re-aim it, never just widen it.
+ */
+export const BACKLOG_REFINE_INTERVAL_DAYS = 7;
+
+/**
+ * Events-ledger window for the #1401 census (`events-retention-banner.mjs`).
+ * Two ledger questions live here: "was {@link EVOLVE_EVENT} EVER recorded?" is
+ * about every line ever written, so no day count bounds it — a pruned history
+ * turns that answer `undeterminable`, never "never" (#1489). "Was
+ * {@link BACKLOG_REFINE_EVENT} recorded in the last
+ * {@link BACKLOG_REFINE_INTERVAL_DAYS} days?" IS bounded, so its window is the
+ * finite floor this module declares; a ledger that covers less turns the
+ * backlog answer `undeterminable` too.
+ */
+export const REQUIRED_EVENTS_WINDOW_DAYS = BACKLOG_REFINE_INTERVAL_DAYS;
+
+/** Pending-proposal sidecars, repo-relative (owned by auto-dream / auto-dialectic). */
+const PENDING_SIDECARS = ['.orchestrator/pending-dream.md', '.orchestrator/dialectic-pending.md'];
+
+// ---------------------------------------------------------------------------
+// Small readers — every one of them is never-throw and three-state
+// ---------------------------------------------------------------------------
+
+/** @param {unknown} now @returns {number} */
+function nowMs(now) {
+  if (now instanceof Date) return now.getTime();
+  if (typeof now === 'number' && Number.isFinite(now)) return now;
+  const parsed = typeof now === 'string' ? Date.parse(now) : NaN;
+  return Number.isFinite(parsed) ? parsed : Date.now();
+}
+
+/** ISO timestamp → `YYYY-MM-DD`, or null. */
+function isoDay(ts) {
+  return typeof ts === 'string' && ts.length >= 10 ? ts.slice(0, 10) : null;
+}
+
+/**
+ * Backwards-scan chunk size (#1290 item 2) — the shared reader's constant, kept
+ * under this module's own name because it is the number this probe's cost is
+ * reasoned about in. NAMED CEILING + revisit trigger live at
+ * {@link SCAN_CHUNK_BYTES}.
+ */
+export const TAIL_CHUNK_BYTES = SCAN_CHUNK_BYTES;
+
+/**
+ * Wall-clock budget for the "did /evolve ever run?" walk (#1414).
+ *
+ * NAMED CEILING (BV-004): 1000 ms is half of `PROBE_BUDGET_MS` (2000 ms in
+ * `session-start-probes.mjs`), which this probe shares with seven other signals.
+ * The walk is UNBOUNDED in principle — "never ran" is a claim about every line
+ * of every source — so it needs an own limit now that it spans the archives
+ * too, and running out must report `truncated`, never a clean "never".
+ *
+ * REVISIT TRIGGER: a repo where this reports `truncated` more than rarely. That
+ * means the answer needs an index rather than a scan, not a bigger budget
+ * (HR-101).
+ */
+export const EVOLVE_SCAN_BUDGET_MS = 1000;
+
+/**
+ * Find the most recent `orchestrator.evolve.completed` record — across ROTATION
+ * boundaries (#1414).
+ *
+ * Walks the ledger backwards through every source, newest first, and stops at
+ * the first hit, because the interesting answer is the LAST occurrence. Reading
+ * the active file alone was the bug: "never ran" is a claim about EVERY line
+ * ever written, and after a rotation the only `evolve.completed` record on the
+ * host can sit in `_archive/` — the probe then nags a repo that has run
+ * /evolve, which is the HR-101 failure mode this module exists to avoid.
+ *
+ * @param {string} repoRoot
+ * @returns {{ok: boolean, lastAt: string|null, truncated: boolean, historyCut: boolean}}
+ *   `ok: false` ⇒ a source exists but could not be read; `truncated: true` ⇒
+ *   the budget ran out before the walk finished. In BOTH cases the caller must
+ *   record `undeterminable`, never clean — a walk that did not finish has not
+ *   proven "never". `historyCut: true` ⇒ the walk finished but the history it
+ *   read begins after an archive that is gone (#1489: pruned by
+ *   `events-rotation.max-backups`), so a miss has not proven "never" either.
+ */
+function readLastEvolveRun(repoRoot) {
+  const file = eventsFilePath(repoRoot); // #1514: the repo's one ledger
+  let lastAt = null;
+  const scan = scanEventsBackwards({
+    filePath: file,
+    chunkBytes: TAIL_CHUNK_BYTES,
+    budgetMs: EVOLVE_SCAN_BUDGET_MS,
+    // Cheap substring pre-filter before JSON.parse — the property the previous
+    // hand-rolled scan was written for, kept here rather than re-derived.
+    filter: EVOLVE_EVENT,
+    onRecord: (rec) => {
+      if (rec?.event !== EVOLVE_EVENT) return false;
+      lastAt = typeof rec.timestamp === 'string' ? rec.timestamp : null;
+      return true;
+    },
+  });
+  if (scan.unreadable.length > 0) {
+    return { ok: false, lastAt: null, truncated: false, historyCut: false };
+  }
+  return { ok: true, lastAt, truncated: scan.truncated, historyCut: scan.gaps.length > 0 };
+}
+
+/**
+ * Wall-clock budget for the backlog-refinement window walk (#2094).
+ *
+ * NAMED CEILING (BV-004): 300 ms — the walk is BOUNDED by
+ * {@link BACKLOG_REFINE_INTERVAL_DAYS} days of ledger, unlike the evolve walk,
+ * and it shares `PROBE_BUDGET_MS` (2000 ms) with {@link EVOLVE_SCAN_BUDGET_MS}.
+ * Running out reports `truncated` ⇒ `undeterminable`, never "due".
+ *
+ * REVISIT TRIGGER: a repo whose week of events does not fit, i.e. the signal
+ * reads `undeterminable` more than rarely — then the answer needs an index.
+ */
+export const BACKLOG_SCAN_BUDGET_MS = 300;
+
+/**
+ * Was `orchestrator.backlog.refine_completed` recorded within the interval?
+ *
+ * Walks the ledger backwards (newest first) across rotation boundaries and
+ * stops at the first refine record inside the window, or at the first record
+ * OLDER than the window start — the point from which the window is proven
+ * covered. Every record is parsed (no substring pre-filter), because the
+ * timestamps of the other events are what prove coverage.
+ *
+ * NAMED CEILING (BV-004): "first record older than the window" assumes the
+ * ledger is append-ordered by time; concurrent appends can interleave by
+ * seconds, which cannot move a 7-day verdict. REVISIT TRIGGER: a ledger writer
+ * that back-dates records.
+ *
+ * @param {string} repoRoot
+ * @param {number} now epoch ms
+ * @returns {{state: 'recent'|'absent'|'undeterminable', lastAt: string|null}}
+ *   `absent` only when the walk provably covered the whole window — reached a
+ *   record older than its start, or read every line of an uncut history.
+ *   Truncated, unreadable or cut-before-the-window ⇒ `undeterminable`.
+ */
+function readBacklogRefineWindow(repoRoot, now) {
+  const windowStart = now - BACKLOG_REFINE_INTERVAL_DAYS * MS_PER_DAY;
+  let lastAt = null;
+  let covered = false;
+  const scan = scanEventsBackwards({
+    filePath: eventsFilePath(repoRoot),
+    chunkBytes: TAIL_CHUNK_BYTES,
+    budgetMs: BACKLOG_SCAN_BUDGET_MS,
+    onRecord: (rec) => {
+      const ts = typeof rec?.timestamp === 'string' ? Date.parse(rec.timestamp) : NaN;
+      if (!Number.isFinite(ts)) return false;
+      if (ts < windowStart) {
+        covered = true;
+        return true;
+      }
+      // A record dated after `now` proves nothing about the window (clock
+      // skew, a hand-written line): skipping it keeps one such line from
+      // silencing the signal until it rotates out.
+      if (rec.event === BACKLOG_REFINE_EVENT && ts <= now) {
+        lastAt = rec.timestamp;
+        return true;
+      }
+      return false;
+    },
+  });
+  if (lastAt !== null) return { state: 'recent', lastAt };
+  if (scan.unreadable.length > 0 || scan.truncated) return { state: 'undeterminable', lastAt: null };
+  if (covered || scan.gaps.length === 0) return { state: 'absent', lastAt: null };
+  return { state: 'undeterminable', lastAt: null };
+}
+
+/**
+ * Most recent COMPLETED housekeeping session, or null.
+ *
+ * @param {string} repoRoot
+ * @returns {string|null} ISO timestamp
+ */
+function readLastHousekeeping(repoRoot) {
+  try {
+    const entries = readCanonicalSessions({ repoRoot }).filter(isMeasuredSession);
+    let max = null;
+    for (const e of entries) {
+      if (e?.session_type !== 'housekeeping') continue;
+      const ts = e.completed_at;
+      if (typeof ts !== 'string' || ts.length === 0) continue;
+      if (max === null || ts > max) max = ts;
+    }
+    return max;
+  } catch {
+    return null;
+  }
+}
+
+/** Claude-Code-only memory dir gate — mirrors `session-end/phase-skip.mjs`. */
+function isClaudePlatform(platform) {
+  if (platform === undefined || platform === null || platform === '') return true;
+  const p = String(platform).toLowerCase();
+  return p === 'claude' || p === 'claude-code' || p === 'claudecode';
+}
+
+// ---------------------------------------------------------------------------
+// Computation
+// ---------------------------------------------------------------------------
+
+/**
+ * Compute the maintenance-due reading. Pure with respect to the repo: reads
+ * only, writes nothing, advances no last-run stamp. Never throws.
+ *
+ * @param {object} [opts]
+ * @param {string} [opts.repoRoot] — defaults to `process.cwd()`.
+ * @param {object} [opts.config] — parsed Session Config (thresholds only).
+ * @param {Date|number} [opts.now] — injectable clock.
+ * @param {string} [opts.platform] — harness platform; non-Claude skips `memory-cleanup`.
+ * @returns {Promise<{
+ *   due: Array<{id: string, detail: string}>,
+ *   total: number,
+ *   skipped: string[],
+ *   undeterminable: string[],
+ *   lastHousekeeping: string|null,
+ * }>}
+ */
+/**
+ * Generated rule files the expiry sweep can never act on from THIS host: the
+ * sweep's plan at the end of the warning horizon keeps the file whole because
+ * not one of its entries resolves to a learning in the local store. The
+ * learnings store is host-local and untracked, so a host whose store lacks the
+ * ids (measured 2026-10-19 on the M5: 6 records, 0 of 77 rule ids) was told to
+ * run a command that sweeps nothing. A failing plan (unreadable store) yields
+ * an empty set, i.e. the pre-existing recommendation.
+ *
+ * @param {string} repoRoot
+ * @param {number} now epoch ms
+ * @returns {Promise<Set<string>>} rule file names
+ */
+async function unsweepableRuleFiles(repoRoot, now) {
+  try {
+    const plan = await planRuleExpirySweep({
+      repoRoot,
+      now: new Date(now + GENERATED_RULE_EXPIRY_HORIZON_DAYS * 86_400_000).toISOString(),
+    });
+    return new Set(
+      plan.plans
+        .filter(
+          (p) =>
+            p.action === 'keep' &&
+            p.substantivePairs > 0 &&
+            p.unresolvedPairIds.length === p.substantivePairs,
+        )
+        .map((p) => p.file),
+    );
+  } catch {
+    return new Set();
+  }
+}
+
+export async function computeMaintenanceDue(opts = {}) {
+  const repoRoot =
+    typeof opts.repoRoot === 'string' && opts.repoRoot.length > 0 ? opts.repoRoot : process.cwd();
+  const config = opts.config ?? {};
+  const now = nowMs(opts.now);
+
+  /** @type {Array<{id: string, detail: string}>} */
+  const due = [];
+  /** @type {string[]} */
+  const undeterminable = [];
+  /**
+   * Signals a kill-switch turned OFF for this host. They are neither due nor
+   * undeterminable — they were never judged, so they must not appear in the
+   * denominator either (HR-106: the banner reports what the rule judged).
+   * @type {string[]}
+   */
+  const skipped = [];
+  const markDue = (id, detail) => due.push({ id, detail });
+
+  // --- reconcile (S3) + the active-learning count S1 needs ------------------
+  // ONE call serves both signals: re-deriving the active-learning filter here
+  // would be a second, drifting copy of the reconcile thresholds (BV-001.2).
+  let nudge;
+  try {
+    nudge = await computeReconcileNudge({ repoRoot, now: opts.now });
+  } catch {
+    /* left undefined — the two signals below become `undeterminable`, not clean */
+  }
+  if (!nudge) {
+    undeterminable.push('evolve', 'reconcile');
+  } else {
+    // --- evolve (S1) -------------------------------------------------------
+    const evolve = readLastEvolveRun(repoRoot);
+    // `truncated` is NOT "not found": a walk that ran out of budget proves
+    // nothing about the lines it never reached (#1414).
+    if (!evolve.ok || evolve.truncated) {
+      undeterminable.push('evolve');
+    } else if (evolve.lastAt === null && nudge.activeLearnings >= MAINTENANCE_MIN_LEARNINGS) {
+      // #1489: judged only where it would flip the verdict, so a cut history
+      // adds no row to a repo the floor already keeps silent (HR-101).
+      if (evolve.historyCut) undeterminable.push('evolve');
+      else markDue('evolve', `never, ${nudge.activeLearnings} active learnings`);
+    }
+
+    // --- reconcile (S3) ----------------------------------------------------
+    if (nudge.nudge === true) {
+      // HR-106: report what the rule JUDGED. `computeReconcileNudge` nudges on
+      // a BACKLOG — rule-eligible learnings minus those already materialized
+      // in the sidecar, the verdict ledger (#1710) or `.claude/rules/`
+      // (`countReconcileBacklog`, #1380;
+      // before #1380 it counted all eligible ones) — never on a date — so
+      // printing `lastRunAt` here put today's date next to the word "due" and
+      // read as "last run today and already due again". Measured 2026-09-09
+      // (learning 013a45ba): with 108 learnings capped under
+      // `max-proposals-per-run: 10`, the row stayed due after every run while
+      // showing that run's own date. `reasons` is the judgment itself.
+      const why = Array.isArray(nudge.reasons) && nudge.reasons.length > 0
+        ? nudge.reasons.join(', ')
+        : `last run ${isoDay(nudge.lastRunAt) ?? 'never'}`;
+      markDue('reconcile', why);
+    }
+  }
+
+  // --- sweep (S2) ----------------------------------------------------------
+  try {
+    const res = await sweepExpiredLearnings({
+      filePath: resolveLedgerPath('.orchestrator/metrics/learnings.jsonl', repoRoot),
+      archivePath: resolveLedgerPath('.orchestrator/metrics/learnings-archive.jsonl', repoRoot),
+      now: opts.now,
+      dryRun: true,
+    });
+    if (Number(res?.archived) > 0) markDue('sweep', `${res.archived} expired`);
+  } catch {
+    undeterminable.push('sweep');
+  }
+
+  // --- dialectic (S4) ------------------------------------------------------
+  const cadence = config?.dialectic?.cadence ?? 5;
+  if (cadence === 0) {
+    skipped.push('dialectic');
+  } else {
+    try {
+      const dec = await shouldDispatchAutoDialectic({ repoRoot, cadence });
+      if (dec?.trigger === true) {
+        markDue('dialectic', isoDay(dec.signals?.lastRunAt) ?? 'never');
+      }
+    } catch {
+      undeterminable.push('dialectic');
+    }
+  }
+
+  // --- memory-cleanup (S5) -------------------------------------------------
+  const threshold = config?.['memory-cleanup-threshold'] ?? 5;
+  /** @type {number|null} null = not measured (no MEMORY.md, skipped, or unreadable). */
+  let deadIndexLinks = null;
+  if (threshold === 0 || !isClaudePlatform(opts.platform)) {
+    skipped.push('memory-cleanup');
+  } else {
+    try {
+      const dec = await shouldDispatchAutoDream({
+        repoRoot,
+        memoryDir: resolveMemoryDir(repoRoot),
+        threshold,
+        softLimit: config?.['memory-cleanup-soft-limit'] ?? 180,
+      });
+      // #1801: dead index links ride along as an advisory count — they never
+      // make memory-cleanup due (the trigger is computed without them).
+      if (Number.isInteger(dec?.signals?.deadIndexLinks)) deadIndexLinks = dec.signals.deadIndexLinks;
+      if (dec?.trigger === true) {
+        const s = dec.signals ?? {};
+        markDue(
+          'memory-cleanup',
+          isoDay(s.lastCleanupAt) ?? `never, ${s.sessionsSinceCleanup ?? 0} sessions`,
+        );
+      }
+    } catch {
+      undeterminable.push('memory-cleanup');
+    }
+  }
+
+  // --- pending sidecar (S6) ------------------------------------------------
+  try {
+    const pending = [];
+    for (const rel of PENDING_SIDECARS) {
+      const file = path.join(repoRoot, rel);
+      if (!existsSync(file)) continue;
+      const ageDays = (now - statSync(file).mtimeMs) / MS_PER_DAY;
+      if (ageDays <= SIDECAR_MAX_AGE_DAYS) pending.push(path.basename(rel));
+    }
+    if (pending.length > 0) markDue('pending-sidecar', pending.join(', '));
+  } catch {
+    undeterminable.push('pending-sidecar');
+  }
+
+  // --- generated-rules-expiring (S7) ---------------------------------------
+  // The predicate and the population both come from `instruction-budget-guard`,
+  // which is where the generated corpus is DEFINED (its byte ceiling judges the
+  // same set). A local re-implementation would be a second definition of
+  // "machine-generated" that agrees only until one of the two is edited.
+  try {
+    const listed = listMachineGeneratedRules({ repoRoot });
+    if (!listed.ok) {
+      // The directory is there but unreadable — not knowing is not clean.
+      undeterminable.push('generated-rules-expiring');
+    } else {
+      const expiring = listed.rules
+        .map((r) => ({ ...r, days: daysUntilGeneratedRuleExpiry({ meta: r.meta, now }) }))
+        .filter((r) => r.days !== null && r.days <= GENERATED_RULE_EXPIRY_HORIZON_DAYS)
+        .sort((a, b) => a.days - b.days);
+      if (expiring.length > 0) {
+        // HR-106: name the files and the dates the verdict was computed from —
+        // the operator has to open exactly those files to repair this.
+        // HR-106 again, one step further: name the REPAIR, not only the
+        // finding. The sweep (#1377) is the mechanical half — prose out, the
+        // provenance pair kept as `markers only` — and an operator who is told
+        // only which files expired has to rediscover that the command exists.
+        const unsweepable = await unsweepableRuleFiles(repoRoot, now);
+        const sweepable = expiring.filter((r) => !unsweepable.has(r.file));
+        const stuck = expiring.filter((r) => unsweepable.has(r.file));
+        const parts = [];
+        if (sweepable.length > 0) {
+          parts.push(
+            `${sweepable.map((r) => `${r.file} ${r.expiresAt}`).join(', ')} → ` +
+              `node scripts/sweep-expired-rules.mjs --horizon-days ${GENERATED_RULE_EXPIRY_HORIZON_DAYS} (dry-run first)`,
+          );
+        }
+        if (stuck.length > 0) {
+          // The sweep resolves every entry's date through its learning in the
+          // HOST-LOCAL learnings store; with none of a file's ids there it keeps
+          // the file whole, so recommending the command would be a no-op.
+          parts.push(
+            `${stuck.map((r) => `${r.file} ${r.expiresAt}`).join(', ')} → not sweepable on this host ` +
+              '(none of their learning ids are in .orchestrator/metrics/learnings.jsonl), ' +
+              'sweep on the host that holds them',
+          );
+        }
+        markDue('generated-rules-expiring', parts.join('; '));
+      }
+    }
+  } catch {
+    undeterminable.push('generated-rules-expiring');
+  }
+
+  // --- backlog-refinement (S8, #2094) --------------------------------------
+  // The signal asks the checker's OWN resolver whether this checkout is a
+  // target it can read (`resolveTarget`, a few `git remote -v` spawns). Two
+  // separate classifications disagreed twice (#2094 review): the signal stayed
+  // due on a repo the checker refused, with no run able to clear it. A repo
+  // the checker cannot serve — GitHub, no GitLab remote it can resolve, no
+  // remote, not a git repo — is `skipped`, out of the denominator. A git that
+  // could not be ASKED, or any other refusal, is `undeterminable`.
+  try {
+    const target = resolveTarget({ cwd: repoRoot, preferVcs: config?.vcs ?? null });
+    if (!target.ok && BACKLOG_UNSERVED_REASONS.has(target.reason)) {
+      skipped.push('backlog-refinement');
+    } else if (!target.ok) {
+      undeterminable.push('backlog-refinement');
+    } else {
+      const refine = readBacklogRefineWindow(repoRoot, now);
+      if (refine.state === 'undeterminable') undeterminable.push('backlog-refinement');
+      else if (refine.state === 'absent') {
+        markDue('backlog-refinement', `none in ${BACKLOG_REFINE_INTERVAL_DAYS}d → run /backlog`);
+      }
+    }
+  } catch {
+    undeterminable.push('backlog-refinement');
+  }
+
+  return {
+    due,
+    // HR-106: the denominator counts the signals this host actually EVALUATED.
+    // A signal a kill-switch turned off was never judged, so reporting it in
+    // "3 of 6" would quote a denominator the rule never used.
+    total: MAINTENANCE_TOTAL_SIGNALS - skipped.length,
+    skipped,
+    undeterminable,
+    lastHousekeeping: readLastHousekeeping(repoRoot),
+    deadIndexLinks,
+  };
+}
+
+/**
+ * Session-start probe entry point.
+ *
+ * Silent (`null`) when nothing is due and everything was readable, and ALSO
+ * when a housekeeping session completed within {@link HOUSEKEEPING_COOLDOWN_DAYS}
+ * days — the cooldown is what keeps this instrument rare (HR-101). The
+ * computation still runs and is still available via {@link computeMaintenanceDue};
+ * only the banner is suppressed. Dead MEMORY.md index links (#1801) add their
+ * own line whenever their count is above 0, cooldown or not.
+ *
+ * @param {{repoRoot?: string, config?: object, now?: Date|number, platform?: string}} [opts]
+ * @returns {Promise<null | {severity: 'warn', message: string, due: string[], undeterminable: string[], deadIndexLinks: number}>}
+ */
+export async function checkMaintenanceDue(opts = {}) {
+  try {
+    const computed = await computeMaintenanceDue(opts);
+    // #1801: its own line, independent of due/cooldown — housekeeping does not
+    // repair the index, only /memory-cleanup does, and at 0 the line is absent.
+    const deadLine =
+      computed.deadIndexLinks > 0
+        ? `memory: ${computed.deadIndexLinks} tote Index-Links — /memory-cleanup`
+        : null;
+    // #2196: structured identities for the session-start repeat gate — which
+    // signals are due, never the dates or counts inside their detail text.
+    const facts = {
+      due: computed.due.map((d) => d.id),
+      undeterminable: [...computed.undeterminable],
+      deadIndexLinks: computed.deadIndexLinks,
+    };
+    const deadOnly = deadLine
+      ? { severity: 'warn', message: deadLine, ...facts, due: [], undeterminable: [] }
+      : null;
+    if (computed.due.length === 0 && computed.undeterminable.length === 0) return deadOnly;
+
+    // Cooldown — no new config key: the housekeeping session's own record IS
+    // the "last maintenance run" stamp.
+    if (computed.lastHousekeeping !== null) {
+      const ageMs = nowMs(opts.now) - Date.parse(computed.lastHousekeeping);
+      if (Number.isFinite(ageMs) && ageMs >= 0 && ageMs < HOUSEKEEPING_COOLDOWN_DAYS * MS_PER_DAY) {
+        return deadOnly;
+      }
+    }
+
+    // HR-106: every number in the banner is a number the verdict was computed
+    // from — no aggregate stands alone without the signal that produced it.
+    const detail = computed.due.map((d) => `${d.id}: ${d.detail}`).join(' · ');
+    const unknown =
+      computed.undeterminable.length > 0
+        ? ` · undeterminable: ${computed.undeterminable.join(', ')}`
+        : '';
+    const message =
+      `⚠ maintenance due: ${computed.due.length} of ${computed.total}` +
+      (detail ? ` (${detail})` : '') +
+      unknown +
+      ' — run /session housekeeping.' +
+      (deadLine ? `\n${deadLine}` : '');
+
+    return { severity: 'warn', message, ...facts };
+  } catch {
+    // Defensive catch-all — a session-start banner must never throw.
+    return null;
+  }
+}

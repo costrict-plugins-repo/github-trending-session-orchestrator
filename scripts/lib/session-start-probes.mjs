@@ -1,0 +1,1658 @@
+/**
+ * session-start-probes.mjs — the mechanical runner for the Phase 4 probe family.
+ *
+ * ## Why this module exists
+ *
+ * `skills/session-start/SKILL.md` § Phase 4 names 22 measurement probes, each
+ * with a module path and an entry function (re-measured 2026-10-28 — see the
+ * registry Census below; the family stood at 18 when this module was written
+ * on 2026-08-23, at 19 on 2026-09-11, gained `events-retention` with
+ * #1401, `security-pulse` with #1769 stage 2 (2026-10-25) and
+ * `runtime-readiness` with #1848 (2026-10-28) — update this count with every
+ * registration).
+ * Measured 2026-08-23 at `4f6404e`, NONE of them had a mechanical caller:
+ *
+ * ```
+ * $ grep -c "session-start-probes\|checkSessionsStaleness\|checkProjectHygiene" \
+ *     hooks/*.mjs .husky/* package.json .gitlab-ci.yml
+ * 0
+ * ```
+ *
+ * The only caller was prose in a SKILL.md — i.e. an LLM had to remember to run
+ * eighteen probes by hand, every session. And whether it ever did was itself
+ * unobservable: 336 recorded session starts carried no probe event of any kind.
+ * That is `.claude/rules/host-resources.md` § HR-105 ("a rule you cannot
+ * falsify is not a rule") applied to a whole probe family, and the repo-memory
+ * "built-but-not-wired" class in its purest form.
+ *
+ * This runner is the wiring: it invokes the probes, collects their banner lines
+ * into the caller's single-envelope buffer, and writes ONE
+ * `orchestrator.probes.completed` telemetry record per run so the next question
+ * — "did they run, and what did they find?" — is answerable from the ledger
+ * rather than from memory.
+ *
+ * ## Contract
+ *
+ * - **Fail-open, always.** A probe that throws, hangs, or is missing from the
+ *   install produces an `outcome`, never an exception. `runSessionStartProbes`
+ *   has no rejecting path; a caller needs no try/catch (the hook keeps one
+ *   anyway as defence-in-depth).
+ * - **Budget-bounded.** Each probe gets `PROBE_BUDGET_MS` of its OWN work time.
+ *   See the ceiling note on that constant for what the bound can and cannot do.
+ * - **Absent is not zero.** A probe that did not run is recorded with the
+ *   reason it did not (`skipped` + `reason`), never silently omitted and never
+ *   folded into a clean count.
+ *
+ * @module scripts/lib/session-start-probes
+ */
+
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
+import path from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { promisify } from 'node:util';
+
+import { emitEvent, eventsFilePath } from './events.mjs';
+import { ARCHIVE_DIR_NAME, ARCHIVE_NAME_RE } from './events-schema.mjs';
+import { hookProgram } from './program-lookup.mjs';
+import { execFile } from './native-command.mjs';
+import { atomicWriteText } from './io.mjs';
+
+/**
+ * Resolve a sibling module to an absolute `file:` URL.
+ *
+ * A bare relative specifier (`'./ci-status-banner.mjs'`) resolves against the
+ * module doing the `import()`, so the registry would only be importable from
+ * THIS file — any other consumer, a test included, would resolve every entry
+ * against its own directory and see eighteen phantom "module-absent" skips that
+ * look exactly like a stale plugin install. Pinning the specifier to this
+ * module's directory makes `PROBES` self-contained.
+ *
+ * @param {string} rel — path relative to `scripts/lib/`
+ * @returns {string}
+ */
+const local = (rel) => pathToFileURL(path.join(import.meta.dirname, rel)).href;
+
+const execFileAsync = promisify(execFile);
+
+/** Fallback hint when nothing cheaper than an on-demand CLI call is available. */
+const CI_UNKNOWN_HINT_DEFAULT = 'run `glab ci status` on demand';
+
+/**
+ * `ci-status` "no usable reading for HEAD" reasons after which the last PUSHED
+ * commit is worth asking about: GitLab's `no-pipeline-for-head-sha`, GitHub's
+ * `no-check-runs-for-head` and `head-sha-not-on-remote`, and GitLab's
+ * `pipeline-unmatched-ref` (all emitted by `checkCiStatus`).
+ *
+ * `head-sha-not-on-remote` (#1727) is GitHub's answer for a local HEAD the
+ * remote does not know — the normal state of a session with unpushed commits,
+ * now that the GitHub path asks for the LOCAL HEAD sha instead of the literal
+ * ref `HEAD`. Left out of this set, an unpushed GitHub HEAD rendered only the
+ * on-demand hint while the last pushed commit could be red: silence there
+ * reads as green, the #1332 collapse on the other host.
+ *
+ * `pipeline-unmatched-ref` (#857) is not a "no data" state — pipelines EXIST for
+ * the sha, they just all sit on a foreign ref, so the reading stays `unknown`.
+ * For this consumer that is the same DARK outcome: the operator learns nothing
+ * about HEAD. Routing it to the pushed-commit re-query at least yields the
+ * pushed sha's own verdict instead of an unactionable line.
+ */
+const PUSHED_FOLLOW_UP_REASONS = new Set([
+  'no-pipeline-for-head-sha',
+  'no-check-runs-for-head',
+  'head-sha-not-on-remote',
+  'pipeline-unmatched-ref',
+]);
+
+/**
+ * The {@link PUSHED_FOLLOW_UP_REASONS} whose HEAD reading was taken for the
+ * LOCAL HEAD sha and found no CI data for it — so when the pushed commit IS
+ * HEAD, re-querying it would ask the identical question (see
+ * {@link ciPushedFollowUp}). `pipeline-unmatched-ref` is deliberately absent:
+ * there pipelines DO exist for the sha, only on a foreign ref, and the
+ * re-query keeps the behaviour #857 gave it.
+ */
+const NO_DATA_FOR_LOCAL_HEAD_REASONS = new Set([
+  'no-pipeline-for-head-sha',
+  'no-check-runs-for-head',
+  'head-sha-not-on-remote',
+]);
+
+/**
+ * Full SHAs for `refs`, in order, from ONE `git rev-parse` — or `null` when
+ * any ref does not resolve (no upstream, detached HEAD, not a git repo, git
+ * missing). Full, not short: `checkCiStatus({ sha })` matches against GitLab's
+ * full pipeline SHAs and refuses anything shorter.
+ *
+ * NAMED CEILING (BV-004): one `git rev-parse` with a 2s timeout, called only
+ * from {@link ciStatusFollowUp} — i.e. only when the `ci-status` probe already
+ * ran (network opt-in) and its reading needs a commit SHA.
+ *
+ * ASYNC on purpose (#1396): it runs inside the probe's budget race, and only a
+ * call that yields the event loop is (a) counted as the probe's OWN work time
+ * and (b) preemptible by the race. A synchronous spawn is subtracted from
+ * `workMs` as loop-blocked time (see {@link startLoopBlockedMeter}), so a 2s
+ * hang would never have scored `budget-exceeded`. An abandoned child is not
+ * waited for: the hook ends with `process.exit(0)`.
+ *
+ * @param {string|undefined} repoRoot
+ * @param {string[]} refs
+ * @returns {Promise<string[]|null>}
+ */
+async function revParseShas(repoRoot, refs) {
+  if (!repoRoot || typeof repoRoot !== 'string') return null;
+  try {
+    const { stdout } = await execFileAsync(hookProgram('git', repoRoot), ['rev-parse', ...refs], {
+      cwd: repoRoot,
+      encoding: 'utf8',
+      timeout: 2000,
+    });
+    const shas = String(stdout).trim().split('\n').map((s) => s.trim());
+    const valid = shas.length === refs.length
+      && shas.every((s) => /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(s));
+    return valid ? shas : null;
+  } catch {
+    // Every failure means "no cheap pushed-SHA hint", never an error worth
+    // surfacing here.
+    return null;
+  }
+}
+
+/**
+ * `ci-status` follow-up (#1332): when HEAD has no CI data, ask for the verdict
+ * of the last PUSHED commit — the commit whose pipeline can actually be red
+ * while HEAD reads "unknown".
+ *
+ * NAMED CEILING (BV-004): at most one `git rev-parse` plus ONE extra CLI round
+ * trip (`checkCiStatus({ sha })`), only on a {@link PUSHED_FOLLOW_UP_REASONS}
+ * reading, and only behind the existing network opt-in
+ * (`SO_PROBES_INCLUDE_NETWORK=1` — without it the whole `ci-status` probe is
+ * `skipped: network-probe-opt-in` and this never runs). It runs INSIDE the
+ * probe's budget race and gets only what is left of that budget; if it
+ * overruns or throws, the runner keeps the HEAD reading it was given (see
+ * `runSessionStartProbes`). REVISIT TRIGGER: `follow_up: 'budget-exceeded'`
+ * on the `ci-status` record of `orchestrator.probes.completed` showing up
+ * regularly. Since #1728 that value means EITHER `ci-status` follow-up
+ * overran — this pushed-SHA requery OR {@link ciRedHistoryFollowUp}'s
+ * last-green history read; since #1735 the record's `follow_up_stage` names
+ * which one (`pushed-sha` here, `red-history` there). Count only
+ * `follow_up_stage: 'pushed-sha'` before caching the verdict per pushed SHA
+ * instead of re-asking.
+ *
+ * The CLI round trip is skipped when the pushed commit IS HEAD on a
+ * {@link NO_DATA_FOR_LOCAL_HEAD_REASONS} reading, on GitLab and GitHub alike:
+ * both paths take the HEAD reading for the LOCAL HEAD SHA, so the re-query
+ * would ask the identical question. GitHub joined that skip with #1727 —
+ * before it, `checkCiStatus` asked the GitHub API for the literal ref `HEAD`,
+ * which GitHub resolves to the REMOTE default branch, so the pushed SHA was a
+ * different question there even when it equalled local HEAD.
+ *
+ * The resolved SHA is handed to the runner through `deliver` BEFORE the CLI
+ * round trip, so a requery that overruns the budget or throws still leaves
+ * the pushed SHA in the reading the renderer receives (#1396).
+ *
+ * @param {*} result   The HEAD reading from `checkCiStatus`
+ * @param {{repoRoot?: string}} ctx
+ * @param {(extra: object) => Promise<*>} requery  Re-invokes the probe with extra options
+ * @param {(partial: *) => void} deliver  Records a partial result as the fallback
+ * @returns {Promise<*>}
+ */
+async function ciPushedFollowUp(result, ctx, requery, deliver) {
+  const reason = result?.details?.reason;
+  // One spawn for both: an unresolvable `@{upstream}` fails the whole call,
+  // which is exactly the "no upstream" answer.
+  const shas = await revParseShas(ctx?.repoRoot, ['HEAD', '@{upstream}']);
+  // `pushed.sha: null` records "no upstream" as DATA — the renderer never asks git.
+  if (!shas) return { ...result, pushed: { sha: null } };
+  const [head, sha] = shas;
+  if (NO_DATA_FOR_LOCAL_HEAD_REASONS.has(reason) && sha === head) {
+    return { ...result, pushed: { sha, sameAsHead: true } };
+  }
+  deliver({ ...result, pushed: { sha } });
+  let verdict;
+  try {
+    verdict = await requery({ sha });
+  } catch {
+    // checkCiStatus never throws; a failure here only loses the verdict detail.
+    verdict = null;
+  }
+  return { ...result, pushed: { sha, verdict } };
+}
+
+/**
+ * `ci-status` follow-up (#1728): the GitHub red reading arrives WITHOUT its
+ * last-green history (`checkCiStatus({ deferHistory: true })`, reason
+ * `last-green-deferred`), so the red verdict is in the runner's hands before
+ * the ~0.5 s history query starts. It is delivered FIRST, re-marked
+ * `last-green-budget-exceeded` — the reading that stands if the query overruns
+ * the budget or throws, and that renders "history not read within the probe
+ * budget". Then the history query alone runs via the module's
+ * `readDeferredGithubHistory` — never a second full `checkCiStatus`, which
+ * would repeat `gh repo view` and the check-runs query.
+ *
+ * @param {*} result  A red reading with `details.reason: 'last-green-deferred'`
+ * @param {{repoRoot?: string}} ctx
+ * @param {(partial: *) => void} deliver
+ * @param {*} mod  The probe's imported module (`ci-status-banner.mjs`)
+ * @returns {Promise<*>}
+ */
+async function ciRedHistoryFollowUp(result, ctx, deliver, mod) {
+  const { deferredHistory: _pending, ...reading } = result;
+  const fallback = {
+    ...reading,
+    details: { ...reading.details, reason: 'last-green-budget-exceeded' },
+  };
+  deliver(fallback);
+  // No reader on the module: the query never ran, so no budget was exceeded —
+  // keep the reading's own `last-green-deferred` ("history not read").
+  if (typeof mod?.readDeferredGithubHistory !== 'function') return reading;
+  return mod.readDeferredGithubHistory(result, { repoRoot: ctx?.repoRoot });
+}
+
+/**
+ * The `ci-status` follow-up (#1332, #1396): every git fact a `ci-status`
+ * banner names is resolved HERE, inside the probe's budget race, and carried
+ * on the result as data — the renderer stays a pure function of the result.
+ * #1396: the renderer used to run `git rev-parse` itself after a fallen-back
+ * follow-up, outside the budget, where `orchestrator.probes.completed` could
+ * never score it `timed_out`.
+ *
+ *   - an `unknown` reading on a {@link PUSHED_FOLLOW_UP_REASONS} reason →
+ *     {@link ciPushedFollowUp} (`pushed`)
+ *   - a `green` reading beside a set-aside FAILED same-commit pipeline →
+ *     `head: { sha }` for {@link droppedFailedLine} (#1390 P5)
+ *   - a GitHub `red` reading whose history was deferred →
+ *     {@link ciRedHistoryFollowUp} (`redCount` / `lastGreen`, #1728)
+ *
+ * @param {*} result
+ * @param {{repoRoot?: string}} ctx
+ * @param {(extra: object) => Promise<*>} requery
+ * @param {(partial: *) => void} deliver
+ * @param {*} [mod]  The probe's imported module
+ * @param {(name: string) => void} [stage]  Names the branch for the ledger
+ *   (`follow_up_stage`, #1735): `red-history`, `pushed-sha` or `head-sha`
+ * @returns {Promise<*>}
+ */
+async function ciStatusFollowUp(result, ctx, requery, deliver, mod, stage = () => {}) {
+  if (result?.status === 'red' && result?.details?.reason === 'last-green-deferred') {
+    stage('red-history');
+    return ciRedHistoryFollowUp(result, ctx, deliver, mod);
+  }
+  if (result?.status === 'unknown' && PUSHED_FOLLOW_UP_REASONS.has(result?.details?.reason)) {
+    stage('pushed-sha');
+    return ciPushedFollowUp(result, ctx, requery, deliver);
+  }
+  if (result?.status === 'green' && droppedFailedCount(result) > 0) {
+    stage('head-sha');
+    const sha = (await revParseShas(ctx?.repoRoot, ['HEAD']))?.[0] ?? null;
+    return { ...result, head: { sha } };
+  }
+  return result;
+}
+
+/**
+ * `CI <status> (#<pipeline>)` for a pushed-SHA verdict, or `null` when there
+ * is no readable verdict (the caller then falls back to the command hint).
+ *
+ * @param {*} v  A `checkCiStatus` result
+ * @returns {string|null}
+ */
+function pushedVerdictText(v) {
+  if (!v || typeof v !== 'object') return null;
+  if (v.degraded) return `CI state unknown (${v.degraded})`;
+  if (typeof v.status !== 'string') return null;
+  const pid = v.details?.currentPipelineId;
+  const parts = [];
+  if (pid !== null && pid !== undefined) parts.push(`#${pid}`);
+  if (v.status === 'unknown' && v.details?.reason) parts.push(v.details.reason);
+  return `CI ${v.status}${parts.length > 0 ? ` (${parts.join(', ')})` : ''}`;
+}
+
+/**
+ * On-demand command listing every CI run of ONE commit, in the CLI that read
+ * CI — a glab command cannot answer in a GitHub repo (#1339 P1).
+ *
+ * Takes the FULL sha. Measured 2026-09-19, glab 1.117.0: `glab ci status` has
+ * no `--ref` flag ("Unknown flag: --ref.", exit 1), and `glab ci list --sha`
+ * matches exactly, so a short sha lists nothing.
+ *
+ * @param {boolean} gh  The reading came from the gh CLI
+ * @param {string} sha  Full commit sha
+ * @returns {string}
+ */
+function commitRunsCommand(gh, sha) {
+  return gh ? `gh run list --commit ${sha}` : `glab ci list --sha ${sha}`;
+}
+
+/**
+ * Hint text for a `status: 'unknown'` ci-status reading.
+ *
+ * @param {object} result   The probe result (possibly carrying `pushed` from
+ *   {@link ciPushedFollowUp})
+ * @returns {string}
+ */
+function ciUnknownHint(result) {
+  // Every GitHub unknown reason needs a GitHub hint, including running,
+  // queued and cancelled checks that do not trigger a pushed-commit query.
+  const gh = result?.details?.cliUsed === 'gh';
+  const onDemand = gh ? 'run `gh run list` on demand' : CI_UNKNOWN_HINT_DEFAULT;
+  if (!PUSHED_FOLLOW_UP_REASONS.has(result?.details?.reason)) return onDemand;
+  const pushed = result.pushed && typeof result.pushed === 'object' ? result.pushed : null;
+  // Pure (#1396): the SHA is whatever the follow-up resolved inside the budget.
+  // Without `pushed` (the follow-up overran or threw before resolving it) the
+  // hint degrades to the on-demand command — it never asks git itself.
+  const sha = pushed ? pushed.sha : null;
+  if (!sha) return onDemand;
+  const short = sha.slice(0, 8);
+  if (pushed?.sameAsHead) return `last pushed: ${short} = HEAD — ${onDemand}`;
+  const verdict = pushedVerdictText(pushed?.verdict);
+  if (verdict) return `last pushed: ${short} — ${verdict}`;
+  return `last pushed: ${short} (pipeline not checked; run \`${commitRunsCommand(gh, sha)}\`)`;
+}
+
+/**
+ * The `(pipeline #<id>)` part of a red `ci-status` line. GitLab readings carry
+ * `details.currentPipelineId` (`?` when it is null, the pre-#856 text). GitHub
+ * readings have no pipeline id at all (#856) — there the part is omitted
+ * instead of printing a `(pipeline #?)` that names a pipeline that never
+ * existed.
+ *
+ * @param {*} r
+ * @returns {string}
+ */
+function redPipelineText(r) {
+  const details = r?.details;
+  if (!details || typeof details !== 'object' || !('currentPipelineId' in details)) return '';
+  return ` (pipeline #${details.currentPipelineId ?? '?'})`;
+}
+
+/**
+ * The `— last green: …` part of a red `ci-status` line.
+ *
+ *   - GitLab (`lastGreen.pipelineId` present): unchanged text, byte for byte.
+ *   - GitHub (#856, no pipeline ids): `— last green: commit <sha7> (<n>
+ *     commit(s) ago)` — interpolating the GitLab form there printed
+ *     `#undefined` into the banner the operator reads.
+ *   - `details.reason: 'last-green-query-failed'` with no `lastGreen`: says
+ *     so. Omitting it would read exactly like "no green commit in the window",
+ *     a different fact (three states, not two: found / none / not measured).
+ *   - `last-green-budget-exceeded` (#1728): the red verdict arrived, the
+ *     history query did not finish inside the probe budget — says so.
+ *     `last-green-deferred` (the follow-up never re-marked it): not read.
+ *
+ * @param {*} r
+ * @returns {string}
+ */
+function lastGreenText(r) {
+  const lg = r?.lastGreen;
+  if (lg && typeof lg === 'object') {
+    const sha7 = String(lg.sha ?? '').slice(0, 7);
+    if (lg.pipelineId !== undefined) {
+      return ` — last green: #${lg.pipelineId} (commit ${sha7}, ${r.redCount} pipelines ago)`;
+    }
+    const n = lg.ageCommits;
+    return ` — last green: commit ${sha7} (${n} commit${n === 1 ? '' : 's'} ago)`;
+  }
+  const reason = r?.details?.reason;
+  if (reason === 'last-green-query-failed') return ' — last green: unknown (history query failed)';
+  if (reason === 'last-green-budget-exceeded') return ' — last green: unknown (history not read within the probe budget)';
+  if (reason === 'last-green-deferred') return ' — last green: unknown (history not read)';
+  return '';
+}
+
+/** Additive GitHub diagnostics; absent counts leave existing banners unchanged. */
+function checkRunCountsText(result) {
+  const counts = result?.details?.checkRunCounts;
+  if (!counts || result?.details?.cliUsed !== 'gh') return '';
+  const parts = [
+    ['success', 'successful'], ['failure', 'failed/action required'],
+    ['inProgress', 'in progress'], ['queued', 'queued'],
+    ['cancelled', 'cancelled'], ['skipped', 'skipped'],
+    ['neutral', 'neutral'], ['waiting', 'waiting'], ['other', 'unrecognised'],
+  ].filter(([key]) => Number.isSafeInteger(counts[key]) && counts[key] > 0)
+    .map(([key, label]) => `${label}: ${counts[key]}`);
+  return parts.length ? ` — Check runs: ${parts.join(', ')}` : '';
+}
+
+/**
+ * "Green, but allow_failure jobs failed" — the ONE predicate both the
+ * `ci-status` renderer and its `severityOf` use (#1333). Two predicates once
+ * disagreed: `severityOf` read truthiness, so `allowFailureJobs: []` scored
+ * `warn` while the renderer printed nothing.
+ *
+ * @param {*} r
+ * @returns {boolean}
+ */
+function hasFailedAllowFailureJobs(r) {
+  return Array.isArray(r?.allowFailureJobs) && r.allowFailureJobs.length > 0;
+}
+
+/**
+ * How many same-commit pipelines the ref preference SET ASIDE ended `failed`
+ * (#1390 P5) — the ONE predicate the `ci-status` renderer and its `severityOf`
+ * share, for the reason {@link hasFailedAllowFailureJobs} records (#1333).
+ * Only `failed` counts: a set-aside `canceled`/`skipped` run says nothing about
+ * the commit, and a line that fires on those would teach the operator to skip
+ * the banner (HR-101).
+ *
+ * @param {*} r
+ * @returns {number}
+ */
+function droppedFailedCount(r) {
+  const statuses = r?.details?.droppedStatuses;
+  return Array.isArray(statuses) ? statuses.filter((s) => s === 'failed').length : 0;
+}
+
+/**
+ * Banner line for a `green` reading beside a FAILED pipeline of the same
+ * commit that the ref preference set aside (#1390 P5). The verdict stays the
+ * #857 ref-preference result; this only stops the failure from vanishing
+ * behind a silent green.
+ *
+ * The HEAD sha comes from `r.head.sha`, resolved by {@link ciStatusFollowUp}
+ * inside the budget (#1396) — the reading carries no sha, and the GitLab path
+ * read the local HEAD, so HEAD is the commit it spoke for. Without it (the
+ * follow-up fell back) the line names the CLI's failed-run listing instead.
+ * REVISIT TRIGGER: once `checkCiStatus` publishes the sha it read, take it
+ * from the reading.
+ *
+ * Only the GitLab path publishes `droppedStatuses` today (`candidateEvidence`
+ * is called from `checkGitlab` alone); the gh form exists so a GitHub producer
+ * can never print a glab command (#1339 P1 class) — see {@link commitRunsCommand}.
+ *
+ * @param {*} r  A green reading with `droppedFailedCount(r) > 0`
+ * @returns {string}
+ */
+function droppedFailedLine(r) {
+  const sha = typeof r.head?.sha === 'string' ? r.head.sha : null;
+  const gh = r.details.cliUsed === 'gh';
+  let check;
+  if (sha) check = commitRunsCommand(gh, sha);
+  else check = gh ? 'gh run list' : 'glab ci list --status=failed';
+  const ref = r.details.matchedRef ?? 'HEAD';
+  const on = sha ? `${ref} for ${sha.slice(0, 8)}` : ref;
+  return `⚠ CI green on ${on}, but ${droppedFailedCount(r)} other pipeline(s) for the same commit FAILED (set-aside statuses: ${r.details.droppedStatuses.join(', ')}) — check \`${check}\``;
+}
+
+// ---------------------------------------------------------------------------
+// Budget
+// ---------------------------------------------------------------------------
+
+/**
+ * Wall-clock ceiling for the ENTIRE probe run, in milliseconds.
+ *
+ * Derived from measurement, not aspiration:
+ *   - `hooks/hooks.json` gives the whole SessionStart hook `timeout: 10` (10s; was 5 until #1859).
+ *     Everything below is carved out of that, not out of nothing.
+ *   - The pre-existing work in the same hook already spends a measured ~845 ms
+ *     median on `backfillOnSessionStart` alone, plus git, registry and the
+ *     resource probe.
+ *   - Measured 2026-08-23 against this repo (the largest in the fleet), one
+ *     `runSessionStartProbes` call per process, five runs:
+ *     **855 / 916 / 968 / 1063 / 1104 ms** — median 968 ms, dominated by
+ *     `project-hygiene` and `tests-src-ratio`, the two probes that shell out.
+ *
+ * 2000 ms is ~2x the measured median here and still leaves the hook well over
+ * half its 10s envelope. Note the headroom is real but not generous, and this is
+ * the WORST repo in the fleet by design — see the revisit trigger below, which
+ * this repo already sits just underneath rather than comfortably below.
+ *
+ * NAMED CEILING (BV-004): the budget is denominated in a probe's OWN work time
+ * (wall-clock elapsed minus the time a synchronous sibling held the event loop
+ * — see {@link startLoopBlockedMeter}), and it is PER PROBE, not one shared
+ * wall deadline. A probe that blocks the loop *synchronously* (several do —
+ * `project-hygiene` and `tests-src-ratio` shell out with `execFileSync`) still
+ * cannot be preempted by a timer that cannot run, so it is reported with its
+ * true cost and can overrun this budget. The bound is therefore hard for
+ * async/network probes and advisory for synchronous ones — but it no longer
+ * charges the async ones for the synchronous ones' time.
+ *
+ * READING `durationMs` vs `workMs`: probes are launched together, so a probe's
+ * individual `durationMs` includes time spent waiting for a SIBLING
+ * synchronous probe to release the event loop. Measured 2026-09-11 here, all
+ * 17 non-network probes reported `durationMs` ≈ 5.8 s while their isolated
+ * costs ranged 0.5–3519 ms. `durationMs` ranks contention; `workMs` — the
+ * field the `timeout` verdict is computed from, and the one persisted as
+ * `work_ms` — ranks work.
+ *
+ * REVISIT TRIGGER: if `duration_ms` in `orchestrator.probes.completed` exceeds
+ * half this budget at the median across a repo's recorded starts, or if any
+ * single probe's `durationMs` regularly exceeds `PROBE_BUDGET_MS`, move the
+ * slow probes off the hook's critical path (a detached child process writing
+ * its banner for the NEXT start) rather than raising this number.
+ */
+export const PROBE_BUDGET_MS = 2000;
+
+/** Sentinel resolved by the deadline race; never leaks to a caller. */
+const TIMED_OUT = Symbol('probe-timeout');
+
+/**
+ * Event-loop-lag sampling interval for {@link startLoopBlockedMeter}.
+ *
+ * NAMED CEILING (BV-004): 20 ms is ~50 wakeups/s, negligible next to the
+ * run's own hundreds of ms, and fine-grained enough that a block shorter than
+ * one sample is also shorter than anything the budget cares about. REVISIT
+ * TRIGGER: if a probe's own work ever needs to be bounded below ~100 ms, this
+ * sampling floor becomes the measurement error and needs `perf_hooks`
+ * `monitorEventLoopDelay` instead.
+ */
+const LOOP_BLOCKED_SAMPLE_MS = 20;
+
+/**
+ * Measure how long the event loop was monopolised by SYNCHRONOUS work.
+ *
+ * Why this exists (measured 2026-09-11 against this repo, `PROBES` run in
+ * parallel): `project-hygiene` (3519 ms) and `tests-src-ratio` (314 ms) shell
+ * out with `execFileSync` and cannot be preempted. Every probe's wall-clock
+ * `durationMs` therefore read ~5.8 s while its own work was 0.5–66 ms, and the
+ * only two probes reported as `timeout` were the two that YIELD to the event
+ * loop mid-work (`peer-cards-staleness`, 7 ms; `maintenance-due`, 40 ms) — a
+ * probe whose work is synchronous wins its own race in a microtask before the
+ * long-expired macrotask timer can run. The old instrument therefore graded
+ * ASYNCHRONY, not cost: the two cheapest preemptible probes took the blame for
+ * the two most expensive non-preemptible ones (`.claude/rules/host-resources.md`
+ * § HR-103 — check the unit before the threshold; § HR-106 — report what the
+ * rule judged).
+ *
+ * A timer scheduled every {@link LOOP_BLOCKED_SAMPLE_MS} that fires late by
+ * `d` proves the loop was unavailable for `d`. Summing that lateness gives the
+ * blocked time, which is subtracted from a probe's wall-clock elapsed to yield
+ * its OWN cost — the quantity `PROBE_BUDGET_MS` was always meant to bound.
+ *
+ * NAMED CEILING (BV-004): the meter knows THAT the loop was blocked, never BY
+ * WHOM — so the blocker's own blocking time is subtracted from its own
+ * `workMs` too. Measured 2026-09-11 here: `project-hygiene`, the ~1–3.5 s
+ * `execFileSync` blocker, reports `workMs` ≈ 9 ms. Read `workMs` as EXACT for a
+ * preemptible probe and as a LOWER BOUND for a synchronous one — which is
+ * coherent with what the budget can do (a non-preemptible probe was never
+ * boundable), but it means `workMs` must never be used to rank the synchronous
+ * probes against each other. REVISIT TRIGGER: if a synchronous probe ever has
+ * to be held to a budget, attribute the gap to the probe that caused it
+ * (`async_hooks`, or run the shell-outs in a worker) rather than re-tuning this
+ * subtraction. Isolated per-probe cost, for now, is measured by running one
+ * probe per process.
+ *
+ * @returns {{ read: () => number, stop: () => void }}
+ */
+function startLoopBlockedMeter() {
+  let blockedMs = 0;
+  let last = Date.now();
+  const timer = setInterval(() => {
+    const now = Date.now();
+    blockedMs += Math.max(0, now - last - LOOP_BLOCKED_SAMPLE_MS);
+    last = now;
+  }, LOOP_BLOCKED_SAMPLE_MS);
+  if (typeof timer?.unref === 'function') timer.unref();
+  return {
+    // The in-progress gap counts too: after a long block the interval callback
+    // may not have run yet when a probe callback asks.
+    read: () => blockedMs + Math.max(0, Date.now() - last - LOOP_BLOCKED_SAMPLE_MS),
+    stop: () => clearInterval(timer),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Probe registry
+// ---------------------------------------------------------------------------
+
+/**
+ * The Phase 4 probe family, in the order `skills/session-start/SKILL.md`
+ * introduces them (banner order is registry order, never completion order, so
+ * a run is reproducible).
+ *
+ * Census (2026-09-11, `skills/session-start/references/phase-4-ssot-environment-check.md`
+ * — the #1157 SKILL.md-size split extracted Phase 4's procedure out of
+ * `SKILL.md` itself, so the original 2026-08-23 citation of SKILL.md lines
+ * 693-835 no longer resolves; re-run the census against the reference file):
+ *   grep -oE "fn: 'check[A-Za-z]+'" scripts/lib/session-start-probes.mjs \
+ *     | sed "s/fn: '//;s/'//" > fns.txt                                  # -> 22
+ *   grep -oFf fns.txt \
+ *     skills/session-start/references/phase-4-ssot-environment-check.md \
+ *     | sort -u | wc -l                                                    # -> 22
+ * i.e. every registered entry function is named in the reference file
+ * (re-measured 2026-10-28 on the working tree over base `864de090`: 22 + 22
+ * after `runtime-readiness` / #1848 and its reference-file prose naming
+ * `checkRuntimeReadinessBanner`; 21 + 21 on 2026-10-25 after
+ * `security-pulse` / #1769; 20 + 20 on 2026-10-02 after `events-retention` / #1401;
+ * 19 on 2026-09-11). The older
+ * census `grep -oE 'via \`(await )?check[A-Za-z]+'` returned 0 at `86e636a9`
+ * — the prose no longer says "via" — so it is retired, not re-counted.
+ * (Prior census, 2026-08-23 at `4f6404e`: 16 + 2 = 18 — one probe was
+ * registered since without a matching update here. This count is deliberately
+ * NOT pinned by an exact-equality test against `PROBES.length` — the registry
+ * is exactly the "dynamically-grown artifact set" `.claude/rules/testing.md`
+ * § Dynamic Artifact Counts bans exact-count assertions for, and a regex over
+ * this prose paragraph would break on every rewording rather than on drift
+ * that matters. Re-run the grep above by hand whenever a probe is added or
+ * removed, so this comment and `skills/session-start/SKILL.md` § Phase 4
+ * stay in sync with each other.)
+ *
+ * Each entry:
+ *   - `id`         stable telemetry id (also the banner-ordering key)
+ *   - `spec`       absolute `file:` URL to import (see {@link local})
+ *   - `fn`         exported entry function name
+ *   - `network`    true when the probe spawns a VCS CLI that talks to a remote
+ *   - `args`       builds the probe's options object from the run context
+ *   - `precondition` optional; returns a skip-reason string to skip the probe
+ *   - `render`     optional; maps a result to a banner line. Default:
+ *                  `result.message` when severity is warn/alert.
+ *   - `followUp`   optional; `async (result, ctx, requery, deliver, mod, stage) => result'`
+ *                  run INSIDE the budget race after the entry function, where
+ *                  `requery(extra)` re-invokes it with `{...args, ...extra}`,
+ *                  `deliver(partial)` replaces the fallback result, `mod`
+ *                  is the probe's imported module (for a narrower second call
+ *                  than a full requery, #1728), and `stage(name)` names the
+ *                  branch that is running (#1735). If it
+ *                  throws or overruns the budget, the last delivered result
+ *                  stands (recorded `followUp: 'threw'|'budget-exceeded'`, plus
+ *                  `followUpStage` when the follow-up named one).
+ *   - `render` is a PURE function of the result (#1396): anything it names
+ *     that the entry function does not return is resolved in `followUp`,
+ *     inside the budget — never in the renderer.
+ *   - `telemetry`  optional; PURE `(result) => object|undefined` — the numbers
+ *                  the probe measured, persisted as `measure` on its element
+ *                  of `orchestrator.probes.completed` for `ran-*` outcomes
+ *                  (#1489), bounded by {@link probeMeasure}.
+ */
+export const PROBES = [
+  {
+    id: 'bootstrap-lock-freshness',
+    spec: local('./bootstrap-lock-freshness.mjs'),
+    fn: 'checkBootstrapLockFreshness',
+    network: false,
+    // SKILL.md gates this one on the lock's existence: without a lock the probe
+    // returns a hard `alert` ("bootstrap.lock missing") that is not a finding
+    // about THIS repo but about it never having been bootstrapped.
+    precondition: ({ repoRoot }) =>
+      existsSync(path.join(repoRoot, '.orchestrator', 'bootstrap.lock'))
+        ? null
+        : 'no-bootstrap-lock',
+    args: ({ repoRoot }) => ({ repoRoot, currentPluginVersion: pluginVersion() }),
+  },
+  {
+    id: 'vault-staleness',
+    spec: local('./vault-staleness-banner.mjs'),
+    fn: 'checkVaultStaleness',
+    network: false,
+    args: ({ repoRoot }) => ({ repoRoot }),
+    // No custom severityOf needed (#1159 single-vocabulary fix, N3 in the
+    // #1158/#1159 review): the probe's THIRD shape — `{severity:'warn',
+    // kind:'probe-stale'}` when its last record is older than
+    // MAX_RECORD_AGE_DAYS — now carries `severity: 'warn'` directly, so the
+    // module-level default severityOf() below (which reads `result.severity`
+    // verbatim) already renders it. The registry previously remapped a
+    // distinct `severity: 'info'` value by hand; that second vocabulary is
+    // gone from the source, so the remap is gone here too. See
+    // vault-staleness-banner.mjs's header for the "one vocabulary, not two"
+    // rationale.
+  },
+  {
+    id: 'telemetry-flush-health',
+    spec: local('./telemetry-flush-health-banner.mjs'),
+    fn: 'checkTelemetryFlushHealth',
+    network: false,
+    args: ({ repoRoot }) => ({ repoRoot }),
+    // No custom render/severityOf: the probe returns `{severity:'warn',
+    // message}` — exactly the shape the module-level defaults below read. It
+    // reports the LAST `orchestrator.telemetry.flush` record when that record
+    // is a `sandbox:*` refusal (#1255); the refusal reached the ledger and
+    // nothing else before this entry existed.
+  },
+  {
+    id: 'ci-status',
+    spec: local('./ci-status-banner.mjs'),
+    fn: 'checkCiStatus',
+    network: true,
+    // #1728: `deferHistory` keeps the GitHub last-green history query out of
+    // the entry function, so a red verdict is delivered before the query can
+    // overrun PROBE_BUDGET_MS (measured 2026-10-22: red with history
+    // 1605–1717 ms, the query alone ~495 ms). The follow-up reads it inside
+    // what is left of the budget. Ceiling: other local-HEAD callers of
+    // `checkCiStatus` still pay the query inline on red (see `checkGithub`).
+    // Second ceiling (BV-004): the red verdict is still lost when
+    // `checkCiStatus` ITSELF (git lookups + `gh repo view` + check-runs,
+    // measured 915–941 ms on 2026-10-22) overruns the work-time budget —
+    // `delivered` is set only after the entry function returns. Revisit
+    // trigger: an `orchestrator.probes.completed` record with `ci-status`
+    // `outcome: 'timeout'`.
+    args: ({ repoRoot }) => ({ repoRoot, deferHistory: true }),
+    // #1332: on `no-pipeline-for-head-sha` / `no-check-runs-for-head`, query
+    // the last PUSHED commit's verdict via `checkCiStatus({ sha })` — see the
+    // ceiling on the function. #1396: also resolves every SHA the renderer names.
+    // #1728: on a deferred GitHub red reading, reads the last-green history.
+    followUp: ciStatusFollowUp,
+    // Bespoke shape: `{status, ok, details, …}` with no `message` field. The
+    // banner text is prescribed by SKILL.md § Phase 4.
+    //
+    // The degraded branch is NOT decoration (#1031): this entry overrides BOTH
+    // `render` and `severityOf`, so the module-level defaults that already
+    // handle a `{severity:'warn', message, degraded}` result never run for this
+    // probe. Without these two lines a degraded ci-status result scored `'ok'`
+    // and rendered nothing — "could not read" displayed exactly like "green",
+    // which is the confusion the probe's own migration removed one layer down.
+    render: (r) => {
+      if (!r || typeof r !== 'object') return null;
+      if (r.degraded) return typeof r.message === 'string' && r.message ? r.message : null;
+      // #856: a running or canceled HEAD pipeline is "no verdict", neither
+      // "could not be determined" nor `🚨 CI RED`. A red PUSHED commit keeps
+      // the escalated line below.
+      if ((r.phase === 'running' || r.phase === 'canceled') && r.pushed?.verdict?.status !== 'red') {
+        const pid = r.details?.currentPipelineId;
+        const ref = pid !== null && pid !== undefined ? ` (#${pid})` : '';
+        return r.phase === 'running'
+          ? `⚠ ci-status: CI running on HEAD${ref} — no verdict yet`
+          : `⚠ ci-status: last CI run on HEAD was canceled${ref} — no verdict`;
+      }
+      // `status: 'unknown'` is the SAME collapse one level over: HEAD carries
+      // no pipeline (the normal state of a working session with local commits),
+      // so the probe cannot say anything about CI — while the last PUSHED
+      // commit may be red. Measured 2026-09-12: HEAD had 2 unpushed commits,
+      // origin/main's pipeline #9301 was red, and session-start printed
+      // nothing. Silence there reads as green; it is not.
+      if (r.status === 'unknown') {
+        const reason = r.details?.reason ?? 'reason unrecorded';
+        // #1337: a RED pushed commit is an alert, and the banner says what the
+        // rule judges (HR-106) — same 🚨 as a red HEAD.
+        const mark = r.pushed?.verdict?.status === 'red' ? '🚨' : '⚠';
+        return `${mark} ci-status: CI status for HEAD could not be determined (${reason})${checkRunCountsText(r)} — ${ciUnknownHint(r)}`;
+      }
+      if (r.status === 'red') {
+        const job = r.failingJobName ? ` Failing job: ${r.failingJobName}` : '';
+        return `🚨 CI RED on HEAD${redPipelineText(r)}${lastGreenText(r)}.${job}${checkRunCountsText(r)}`;
+      }
+      if (r.status === 'green') {
+        const lines = [];
+        if (hasFailedAllowFailureJobs(r)) {
+          const names = r.allowFailureJobs.map((j) => j?.name ?? String(j)).join(', ');
+          lines.push(`⚠ CI green on HEAD, but ${r.allowFailureJobs.length} allow_failure job(s) FAILED: ${names}. A pipeline reports success regardless of these.`);
+        }
+        // #1390 P5: a failed same-commit pipeline the ref preference set aside.
+        if (droppedFailedCount(r) > 0) lines.push(droppedFailedLine(r));
+        // Both findings can hold at once; `pushBanner` takes a multi-line
+        // string verbatim, so neither swallows the other.
+        return lines.length > 0 ? lines.join('\n') : null;
+      }
+      return null;
+    },
+    // `status: 'red'` is an alert even though the probe publishes no severity.
+    // A degraded result is a finding, never clean — same rule as the generic
+    // path in `severityOf()` below.
+    severityOf: (r) => {
+      // `null` is a COMPLETE answer — "this repo has no CI" — and stays clean.
+      // Every other non-green status is "state not determined", never `ok`
+      // (HR-105: a probe that scores an undeterminable state as clean is an
+      // instrument that cannot report the thing it exists to report).
+      if (!r || typeof r !== 'object') return 'ok';
+      if (r.degraded) return 'warn';
+      // #1337 escalation stays first; then #856 no-verdict phases are `warn`.
+      if (r.pushed?.verdict?.status === 'red') return 'alert';
+      if (r.phase === 'running' || r.phase === 'canceled') return 'warn';
+      if (r.status === 'red') return 'alert';
+      // A set-aside failed run (#1390 P5) is `warn`, never `alert`: the reading
+      // itself is green, and `alert` is what a red pipeline scores.
+      if (r.status === 'green') {
+        return hasFailedAllowFailureJobs(r) || droppedFailedCount(r) > 0 ? 'warn' : 'ok';
+      }
+      // #1337: HEAD undetermined but the pushed commit's pipeline is red —
+      // the code on origin is broken, so this is an alert, not a warning.
+      if (r.pushed?.verdict?.status === 'red') return 'alert';
+      return 'warn';
+    },
+  },
+  {
+    id: 'qg-command-drift',
+    spec: local('./qg-command-drift-banner.mjs'),
+    fn: 'checkQgCommandDrift',
+    network: false,
+    args: ({ repoRoot }) => ({ repoRoot }),
+  },
+  {
+    id: 'peer-cards-staleness',
+    spec: local('./peer-cards/staleness-banner.mjs'),
+    fn: 'checkPeerCardsStaleness',
+    network: false,
+    args: ({ repoRoot }) => ({ repoRoot }),
+    // #2196: the stale card's NAME is the fact; its age grows daily.
+    repeatFacts: (r) => (r?.stale ?? []).map((c) => ({ key: c.target })),
+  },
+  {
+    id: 'loop-readiness',
+    spec: local('./loop-readiness-banner.mjs'),
+    fn: 'checkLoopReadiness',
+    network: false,
+    args: ({ repoRoot, env }) => ({ repoRoot, env }),
+  },
+  {
+    id: 'instruction-budget',
+    spec: local('./instruction-budget-guard.mjs'),
+    fn: 'checkInstructionBudget',
+    network: false,
+    // No precondition (#1132): this probe counts the always-on directive
+    // corpus under `.claude/rules/`, and a repo without that directory has an
+    // empty corpus — a legitimate measured answer, not a declined measurement.
+    // A `no-rules-dir` precondition used to sit here purely to dodge a stderr
+    // side-effect in `rule-loader.loadApplicableRules`; that side-effect is now
+    // category-gated at its source, so the precondition suppressed nothing and
+    // cost a misleading `skipped: 'no-rules-dir'` record.
+    args: ({ repoRoot }) => ({ repoRoot }),
+  },
+  {
+    // Replaces the former `reconcile-nudge` entry AND the two session-end
+    // nudges (3.6.5 auto-dream, 3.6.7 auto-dialectic): one reading of the whole
+    // maintenance loop, at the one moment the operator can act on it. The
+    // reconcile signal is not lost — `maintenance-due-banner.mjs` calls
+    // `computeReconcileNudge` wholesale as its S3, so `reconcile-nudge-banner.mjs`
+    // remains a live dependency, just no longer its own registry entry (a
+    // second entry would double-report the same finding).
+    id: 'maintenance-due',
+    spec: local('./maintenance-due-banner.mjs'),
+    fn: 'checkMaintenanceDue',
+    network: false,
+    args: ({ repoRoot, config }) => ({ repoRoot, config }),
+    // #2196: which signals are due — never the dates in their detail.
+    repeatFacts: (r) => [
+      ...(r?.due ?? []).map((id) => ({ key: id })),
+      ...(r?.undeterminable ?? []).map((id) => ({ key: `undeterminable:${id}` })),
+      ...(r?.deadIndexLinks > 0 ? [{ key: 'dead-index-links', amount: r.deadIndexLinks }] : []),
+    ],
+  },
+  {
+    id: 'sessions-staleness',
+    spec: local('./sessions-staleness-banner.mjs'),
+    fn: 'checkSessionsStaleness',
+    network: false,
+    args: ({ repoRoot }) => ({ repoRoot }),
+  },
+  {
+    id: 'sessions-integrity',
+    spec: local('./sessions-integrity-banner.mjs'),
+    fn: 'checkSessionsIntegrity',
+    network: false,
+    args: ({ repoRoot }) => ({ repoRoot }),
+  },
+  {
+    id: 'owner-config',
+    spec: local('./owner-config-banner.mjs'),
+    fn: 'checkOwnerConfig',
+    network: false,
+    // Host-wide `owner.yaml`, deliberately NOT repo-scoped — no repoRoot arg.
+    args: () => ({}),
+    // A loose-mode warning and a load-health warning both complete as `warn`,
+    // so without this the loose-mode check's firing rate is unmeasurable
+    // (HR-105). 0/1, not a boolean: `probeMeasure` keeps only snake_case keys
+    // with finite-number or null values. No measure on a clean (null) answer.
+    telemetry: (r) => (r ? { loose_mode: r.looseMode === true ? 1 : 0 } : undefined),
+  },
+  {
+    // #1848: do the runtime deps of the plugin install THIS code runs from
+    // resolve? Install-level, not repo-scoped — no repoRoot arg; the module
+    // defaults to its own plugin root. node:* only, no process, installs
+    // nothing. `null` means every dependency resolves (missing: 0); an
+    // unreadable package.json is `degraded`, persisted as missing: null —
+    // a check that could not run is not a zero (absent is not zero).
+    id: 'runtime-readiness',
+    spec: local('./runtime-readiness.mjs'),
+    fn: 'checkRuntimeReadinessBanner',
+    network: false,
+    args: () => ({}),
+    telemetry: (r) => ({ missing: r === null ? 0 : (r?.degraded ? null : (r?.missing?.length ?? null)) }),
+  },
+  {
+    id: 'moc-staleness',
+    spec: local('./moc-staleness-banner.mjs'),
+    fn: 'checkMocStaleness',
+    network: false,
+    args: ({ repoRoot, config }) => ({ repoRoot, config }),
+  },
+  {
+    id: 'context-coverage',
+    spec: local('./context-coverage-banner.mjs'),
+    fn: 'checkContextCoverage',
+    network: false,
+    args: ({ repoRoot, config }) => ({ repoRoot, config }),
+  },
+  {
+    id: 'claude-md-budget-lint',
+    spec: local('./claude-md-budget-lint.mjs'),
+    fn: 'checkClaudeMdBudgetLint',
+    network: false,
+    args: ({ repoRoot }) => ({ repoRoot }),
+  },
+  {
+    id: 'tests-src-ratio',
+    spec: local('./tests-src-ratio.mjs'),
+    fn: 'checkTestsSrcRatio',
+    network: false,
+    args: ({ repoRoot }) => ({ repoRoot }),
+  },
+  {
+    id: 'project-hygiene',
+    spec: local('./project-hygiene.mjs'),
+    fn: 'checkProjectHygiene',
+    network: false,
+    // #84: the sizing walk is synchronous, so the race below cannot stop it;
+    // the probe's own budget becomes its deadline instead. Evaluated at call
+    // time. Ceiling: time a sibling held the loop before this call is not
+    // deducted — the hook's start gate (budget + margin) still bounds the run.
+    args: ({ repoRoot, budgetMs }) => ({
+      repoRoot,
+      ...(Number.isFinite(budgetMs) ? { deadline: Date.now() + budgetMs } : {}),
+    }),
+    // #2196: the finding's `check` plus its magnitude (commits, MB, files).
+    // Ceiling: several findings of one `check` (ci-audit-job) share one key,
+    // and the banner shows the first three findings, not the new one first.
+    repeatFacts: (r) => (r?.findings ?? []).map((f) => ({ key: f.check, amount: f.amount })),
+  },
+  {
+    id: 'mirror-issues',
+    spec: local('./mirror-issues-banner.mjs'),
+    fn: 'checkMirrorIssues',
+    network: true,
+    args: ({ repoRoot }) => ({ repoRoot }),
+  },
+  {
+    id: 'git-config-drift',
+    spec: local('./git-config-drift.mjs'),
+    fn: 'checkGitConfigDrift',
+    network: false,
+    args: ({ repoRoot, env }) => ({ repoRoot, env }),
+  },
+  {
+    // #1401 part 3: archive COUNT retention vs the TIME window the ledger's
+    // readers declare (`REQUIRED_EVENTS_WINDOW_DAYS`). Without any ledger there
+    // is nothing to measure — recorded as `skipped`, never as `ran-clean`. A
+    // bare, empty or foreign-only `_archive/` is no ledger either: the probe
+    // answers those `not-measured` at severity ok, which the runner would
+    // record as `ran-clean` (see {@link hasRotationArchive}).
+    id: 'events-retention',
+    spec: local('./events-retention-banner.mjs'),
+    fn: 'checkEventsRetention',
+    network: false,
+    precondition: ({ repoRoot }) => {
+      const metrics = path.dirname(eventsFilePath(repoRoot)); // #1514: the ledger checkEventsRetention reads
+      return existsSync(path.join(metrics, 'events.jsonl')) || hasRotationArchive(metrics)
+        ? null
+        : 'no-events-ledger';
+    },
+    args: ({ repoRoot, config }) => ({ repoRoot, config }),
+    // #1489: the coverage reaches the ledger on every measured answer, warn or
+    // not — a warning that never fires is otherwise indistinguishable from a
+    // dead one (HR-105). Counts and day spans only: no path, no timestamp.
+    // A degraded answer carries no `archives`, so it persists no measure. Every
+    // measured answer has a finite `coverageDays` — a span with no stamp is
+    // degraded since #1498 — and `probeMeasure` drops a non-finite value, so a
+    // regression there reads as "not measured", never as a number.
+    telemetry: (r) => (Number.isInteger(r?.archives)
+      ? {
+          coverage_days: Math.round(r.coverageDays * 1000) / 1000,
+          archives: r.archives,
+          max_backups: r.maxBackups,
+          required_days: r.requiredDays ?? null,
+        }
+      : undefined),
+  },
+  {
+    // #1769 stage 2: reads ONLY the host-local cache (no HTTP, at most one
+    // bounded `git rev-parse HEAD`); a missing or stale cache is `state:
+    // 'not-measured'|'stale'` at severity ok and starts the detached, throttled
+    // refresher. Banner only for a finding (HR-101).
+    id: 'security-pulse',
+    spec: local('./security-pulse-banner.mjs'),
+    fn: 'checkSecurityPulse',
+    network: false,
+    args: ({ repoRoot, config, env }) => ({ repoRoot, config, env }),
+    telemetry: (r) => (typeof r?.state === 'string'
+      ? {
+          // 0 not-measured, 1 stale, 2 fresh, 3 degraded (measured, but incomplete).
+          cache_state: r.state === 'fresh' ? 2 : r.state === 'stale' ? 1 : r.state === 'degraded' ? 3 : 0,
+          node_below_floor: r.nodeBelowFloor ?? null,
+          repo_malicious: r.repoMalicious ?? null,
+          repo_critical: r.repoCritical ?? null,
+          kev_hits: r.kevHits ?? null,
+          close_without_delta: r.closeWithoutDelta ?? null,
+          cache_age_h: r.cacheAgeH ?? null,
+          refresh_spawned: r.refresh === 'spawned' ? 1 : 0,
+        }
+      : undefined),
+  },
+];
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * The installed plugin's own version, for `bootstrap-lock-freshness`'s
+ * version-drift comparison. Read from THIS plugin's package.json (two levels up
+ * from `scripts/lib/`), never from the target repo — the probe compares the
+ * lock's recorded plugin version against the plugin that is running now.
+ *
+ * @returns {string|undefined} — undefined when unreadable (the probe then
+ *   reports `current=unknown` rather than a fabricated version).
+ */
+function pluginVersion() {
+  try {
+    const pkg = path.resolve(import.meta.dirname, '..', '..', 'package.json');
+    const parsed = JSON.parse(readFileSync(pkg, 'utf8'));
+    return typeof parsed.version === 'string' ? parsed.version : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * NAMED CEILING (BV-004): keys per probe `measure`. `events-retention`, the one
+ * probe with telemetry today, persists 4. Revisit when a probe needs more than
+ * 8 — the cap exists so one probe cannot inflate every SessionStart record.
+ */
+const MEASURE_MAX_KEYS = 8;
+const MEASURE_KEY_RE = /^[a-z][a-z0-9_]{0,31}$/;
+
+/**
+ * A probe's `telemetry(result)`, bounded for the ledger (#1489): at most
+ * {@link MEASURE_MAX_KEYS} snake_case keys whose values are finite numbers or
+ * `null`; any other entry is dropped. Strings are refused outright, not
+ * vetted: `orchestrator.probes.completed` also travels over the optional
+ * webhook unredacted, and a string is how a path or a repo slug gets there.
+ * A missing, throwing or empty telemetry yields `undefined` — no `measure`
+ * key, which reads as "not measured", never as zero.
+ *
+ * Reading the returned object stays inside the `try`: `Object.entries` runs
+ * its getters and a Proxy's `ownKeys` trap, and either may throw — which,
+ * outside it, rejected the whole runner against its never-rejects contract.
+ *
+ * @param {{telemetry?: Function}} probe
+ * @param {*} result — the probe's delivered result
+ * @returns {Record<string, number|null>|undefined}
+ */
+function probeMeasure(probe, result) {
+  if (typeof probe.telemetry !== 'function') return undefined;
+  try {
+    const raw = probe.telemetry(result);
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+    const entries = Object.entries(raw)
+      .filter(([k, v]) => MEASURE_KEY_RE.test(k) && (v === null || (typeof v === 'number' && Number.isFinite(v))))
+      .slice(0, MEASURE_MAX_KEYS);
+    return entries.length > 0 ? Object.fromEntries(entries) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Does `<metricsDir>/_archive/` hold at least one rotated events archive? The
+ * `events-retention` precondition's second half.
+ *
+ * It lists the directory exactly as `checkEventsRetention` does (same
+ * `ARCHIVE_NAME_RE` filter), so the precondition skips precisely the inputs the
+ * probe would answer `not-measured`. The directory existing is not a ledger
+ * (#1401 review: an empty or foreign-only `_archive/` was recorded
+ * `ran-clean`). Any listing error other than ENOENT answers `true`: the probe
+ * then runs and reports the unlistable directory as `degraded`, because an
+ * unreadable source must never be skipped as absent.
+ *
+ * @param {string} metricsDir — `<repoRoot>/.orchestrator/metrics`
+ * @returns {boolean}
+ */
+function hasRotationArchive(metricsDir) {
+  try {
+    return readdirSync(path.join(metricsDir, ARCHIVE_DIR_NAME)).some((n) => ARCHIVE_NAME_RE.test(n));
+  } catch (err) {
+    return err?.code !== 'ENOENT';
+  }
+}
+
+/**
+ * Race `promise` against a budget denominated in the probe's OWN work time —
+ * wall-clock elapsed MINUS the time a synchronous sibling held the event loop
+ * (see {@link startLoopBlockedMeter} for why that subtraction is the whole
+ * point).
+ *
+ * The loser is neutralised (`.catch`) before the race so a late rejection can
+ * never surface as an unhandled rejection and kill an exit-0 hook.
+ *
+ * Two properties worth stating, because both were live defects:
+ *
+ *  - **A delivered result is never discarded.** When the budget really is
+ *    exhausted, the already-settled promise still wins: "measured, then thrown
+ *    away" is worse than not measuring (the module's own rule, stated at the
+ *    telemetry boundary below). Only a probe that has produced nothing is a
+ *    `timeout`.
+ *  - **Termination.** The re-arm loop only repeats while blocked time is
+ *    accruing, i.e. while some sibling monopolises the loop. Siblings are
+ *    finite and synchronous, so the loop cannot spin forever; once they
+ *    release, work time advances and the budget binds normally.
+ *
+ * @template T
+ * @param {Promise<T>} promise
+ * @param {number} budgetMs — the probe's own-work budget; `<= 0` times out.
+ * @param {{ read: () => number }} meter — loop-blocked meter.
+ * @returns {Promise<{ raced: T|symbol, workMs: number }>}
+ */
+async function withWorkDeadline(promise, budgetMs, meter) {
+  let done = false;
+  /** @type {unknown} */
+  let value;
+  const settled = promise.catch((err) => ({ __probeError: err })).then((v) => {
+    done = true;
+    value = v;
+    return v;
+  });
+
+  const t0 = Date.now();
+  const blocked0 = meter.read();
+  const workElapsed = () => Date.now() - t0 - (meter.read() - blocked0);
+
+  for (;;) {
+    const remaining = budgetMs - workElapsed();
+    if (remaining <= 0) {
+      // Budget exhausted — but a probe that already delivered is not a timeout.
+      return { raced: done ? value : TIMED_OUT, workMs: workElapsed() };
+    }
+    let timer;
+    const expiry = new Promise((resolve) => {
+      timer = setTimeout(() => resolve(TIMED_OUT), remaining);
+      // Never hold the event loop open for the timer alone.
+      if (typeof timer?.unref === 'function') timer.unref();
+    });
+    let raced;
+    try {
+      raced = await Promise.race([settled, expiry]);
+    } finally {
+      clearTimeout(timer);
+    }
+    if (raced !== TIMED_OUT) return { raced, workMs: workElapsed() };
+    // The timer fired, but it may have fired LATE because the loop was blocked.
+    // Recheck against work time; re-arm for whatever budget is genuinely left.
+  }
+}
+
+/**
+ * Normalise a probe result's severity.
+ *
+ * `null` is the family's universal "clean, say nothing" return. Everything else
+ * is judged by its `severity` field — including the THREE-state probes
+ * (`mirror-issues`, `git-config-drift`, `ci-status`) whose `degraded` result
+ * means "state unknown" and must NEVER be read as clean.
+ *
+ * @param {*} result
+ * @param {{severityOf?: (r: *) => string}} probe
+ * @returns {'ok'|'warn'|'alert'}
+ */
+function severityOf(result, probe) {
+  if (typeof probe.severityOf === 'function') {
+    const s = probe.severityOf(result);
+    return s === 'alert' || s === 'warn' ? s : 'ok';
+  }
+  if (result === null || result === undefined) return 'ok';
+  const s = result.severity;
+  return s === 'alert' || s === 'warn' ? s : 'ok';
+}
+
+/**
+ * Default banner renderer: the probe's own `message`, but only when it actually
+ * found something. A probe that returns `{severity: 'ok'|'info'}` is silent.
+ *
+ * @param {*} result
+ * @param {string} severity
+ * @returns {string|null}
+ */
+function defaultRender(result, severity) {
+  if (severity === 'ok') return null;
+  const msg = result?.message;
+  return typeof msg === 'string' && msg.length > 0 ? msg : null;
+}
+
+/**
+ * Load Session Config for the repo, fail-open to `{}`.
+ * @param {string} repoRoot
+ * @returns {Promise<object>}
+ */
+async function loadConfig(repoRoot) {
+  try {
+    const { readConfigFile, parseSessionConfig } = await import('./config.mjs');
+    return parseSessionConfig(await readConfigFile(repoRoot)) ?? {};
+  } catch {
+    return {};
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Repeat gate (#2196)
+// ---------------------------------------------------------------------------
+
+/**
+ * A finding unchanged since its last REPORT is repeated at most once per this
+ * many days. Measured 2026-11-21 over the live ledger (86 probe runs since
+ * 2026-11-11): `project-hygiene` warned 84/86, `maintenance-due` 86/86,
+ * `peer-cards-staleness` 86/86 — each describing a standing state, the same
+ * line every session (HR-101). The gate re-aims those probes at CHANGE; it does
+ * not raise any threshold and does not touch `alert`.
+ */
+export const REPEAT_INTERVAL_DAYS = 7;
+
+/** A fact's magnitude at least this multiple of its last REPORTED value is news. */
+export const REPEAT_GROWTH_FACTOR = 2;
+
+const REPEAT_STATE_FILE = 'probe-repeat.json';
+
+/**
+ * Where "already reported" lives: `.orchestrator/tmp/probe-repeat.json` beside
+ * the events ledger's `.orchestrator/` — so a linked worktree shares its main
+ * checkout's state (#1514) and a fresh worktree does not re-report everything.
+ * `.orchestrator/tmp/` is gitignored here (`git check-ignore --no-index`).
+ *
+ * @param {string} repoRoot
+ * @returns {string}
+ */
+export function repeatStatePath(repoRoot) {
+  return path.join(path.dirname(path.dirname(eventsFilePath(repoRoot))), 'tmp', REPEAT_STATE_FILE);
+}
+
+/** Missing or corrupt state reads as empty — every finding is then reported (fail-open to visibility). */
+function readRepeatState(file) {
+  try {
+    const parsed = JSON.parse(readFileSync(file, 'utf8'));
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+/** Best-effort atomic write via the shared writer; a failure only means the next run reports again. */
+async function writeRepeatState(file, state) {
+  try {
+    await atomicWriteText(file, JSON.stringify(state));
+  } catch { /* never block session start */ }
+}
+
+/**
+ * Decide whether a warn finding is news.
+ *
+ * `facts` are stable identities (a card name, a signal id, a hygiene `check`),
+ * optionally with a numeric `amount` — never message text, which carries
+ * counters that drift every day ("60d" → "61d"). Report when: no valid prior
+ * state, the last report is `REPEAT_INTERVAL_DAYS` old (or in the future), a
+ * key is new, or an amount reached `REPEAT_GROWTH_FACTOR` × its last REPORTED
+ * value. The baseline moves only on a report, so slow growth still surfaces.
+ * Keys that vanished are dropped while suppressed, so a finding that clears
+ * and comes back is reported as new. A finding without any usable fact is
+ * always reported.
+ *
+ * @param {object|undefined} prev — `{ reportedAt: number, facts: {[key]: number|null} }`
+ * @param {Array<{key: string, amount?: number}>} facts
+ * @param {number} nowMs
+ * @returns {{ report: boolean, next: { reportedAt: number, facts: Record<string, number|null> } }}
+ */
+export function judgeRepeat(prev, facts, nowMs) {
+  /** @type {Record<string, number|null>} */
+  const current = {};
+  for (const f of facts) {
+    if (!f || typeof f.key !== 'string') continue;
+    const amt = Number.isFinite(f.amount) ? f.amount : null;
+    const had = current[f.key];
+    current[f.key] = had === undefined ? amt : (amt === null ? had : Math.max(had ?? amt, amt));
+  }
+  const fresh = { report: true, next: { reportedAt: nowMs, facts: current } };
+  // No usable fact (an extractor reading a renamed field yields `[]` or
+  // `{key: undefined}`s) means the gate cannot tell old from new: report,
+  // every time — fail-open to visibility, never a silent week.
+  if (Object.keys(current).length === 0) return fresh;
+  const prevFacts = prev?.facts;
+  if (!prev || !Number.isFinite(prev.reportedAt) || !prevFacts || typeof prevFacts !== 'object') return fresh;
+  const age = nowMs - prev.reportedAt;
+  if (!(age >= 0 && age < REPEAT_INTERVAL_DAYS * 86_400_000)) return fresh;
+  for (const [key, amt] of Object.entries(current)) {
+    if (!Object.hasOwn(prevFacts, key)) return fresh;
+    const base = prevFacts[key];
+    if (amt !== null && Number.isFinite(base) && base > 0 && amt >= base * REPEAT_GROWTH_FACTOR) return fresh;
+  }
+  const kept = {};
+  for (const key of Object.keys(current)) kept[key] = prevFacts[key] ?? current[key];
+  return { report: false, next: { reportedAt: prev.reportedAt, facts: kept } };
+}
+
+// ---------------------------------------------------------------------------
+// Runner
+// ---------------------------------------------------------------------------
+
+/**
+ * Run the Phase 4 probe family and record the run.
+ *
+ * Never rejects and never throws: every failure mode of every probe is folded
+ * into that probe's `outcome`.
+ *
+ * @param {object} [opts]
+ * @param {string} opts.repoRoot — repo the probes measure AND the repo whose
+ *   `.orchestrator/metrics/events.jsonl` receives the telemetry record. Pinning
+ *   this is what keeps a test out of the real ledger.
+ * @param {object} [opts.config] — parsed Session Config; loaded from `repoRoot`
+ *   when omitted.
+ * @param {object} [opts.env=process.env] — environment passed to env-reading
+ *   probes and consulted for `SO_PROBES_INCLUDE_NETWORK`.
+ * @param {number} [opts.timeoutMs=PROBE_BUDGET_MS] — wall-clock budget.
+ * @param {boolean} [opts.display=false] — whether the caller WILL show
+ *   `bannerLines` to an operator (#2196). Only then does the repeat gate record
+ *   a line as reported; otherwise it judges (outcome and `suppressed` stay
+ *   honest) but writes no state, and a line it would have shown is recorded
+ *   `repeat: 'not-displayed'`. Default false: a caller that forgets the flag
+ *   reports every time instead of using up the weekly report.
+ * @param {object} [deps] — test seams.
+ * @param {Array<object>} [deps.probes=PROBES] — probe registry override.
+ * @param {(type: string, payload: object, opts: object) => Promise<void>} [deps.emit=emitEvent]
+ * @returns {Promise<{bannerLines: string[], results: Array<{id: string, outcome: string, severity?: string, durationMs: number, reason?: string}>, event: object|null}>}
+ */
+export async function runSessionStartProbes(opts = {}, deps = {}) {
+  const started = Date.now();
+  const {
+    repoRoot,
+    env = process.env,
+    timeoutMs = PROBE_BUDGET_MS,
+  } = opts;
+  const probes = Array.isArray(deps.probes) ? deps.probes : PROBES;
+  const clock = typeof deps.now === 'function' ? deps.now : Date.now;
+  const emit = typeof deps.emit === 'function' ? deps.emit : emitEvent;
+  const display = opts.display === true;
+
+  // No repoRoot means every repo-scoped probe would measure the wrong tree and
+  // the event would land in whatever `SO_PROJECT_DIR` happens to resolve to.
+  // Refusing here is the fail-open answer: report nothing, write nothing.
+  if (!repoRoot || typeof repoRoot !== 'string') {
+    return { bannerLines: [], results: [], event: null };
+  }
+
+  const config = opts.config ?? (await loadConfig(repoRoot));
+
+  // Network probes: excluded by default, and the exclusion is RECORDED.
+  //
+  // `ci-status` and `mirror-issues` spawn `glab`/`gh` against a remote with an
+  // 8s CLI timeout of their own — a single one can eat most of the hook's 10s (5s before #1859)
+  // `hooks.json` budget. Measured warm here on 2026-08-23: 520 ms and 498 ms,
+  // and that is the BEST case (warm CLI, live network, authenticated). Paying
+  // that on every session start of every repo buys a signal the operator can
+  // get on demand from `/session`, so the default is off.
+  //
+  // What is NOT acceptable is dropping them silently — that reproduces the
+  // exact defect this module repairs. They appear in every run's telemetry as
+  // `outcome: 'skipped'`, `reason: 'network-probe-opt-in'`, so "were they run?"
+  // stays an answerable question.
+  const includeNetwork = env?.SO_PROBES_INCLUDE_NETWORK === '1';
+
+  // Per-probe, denominated in the probe's own work time — NOT a shared
+  // wall-clock deadline. A shared wall deadline charged every probe for its
+  // siblings' non-preemptible `execFileSync` calls; see
+  // {@link startLoopBlockedMeter}.
+  const budgetMs = Math.max(0, Number(timeoutMs) || 0);
+  // `budgetMs` in ctx: a synchronous probe turns it into its own deadline (#84).
+  const ctx = { repoRoot, config, env, budgetMs };
+  const meter = startLoopBlockedMeter();
+
+  /** @type {Map<string, object>} */
+  const byId = new Map();
+
+  // #2196 repeat gate: read once, written once after the family ran.
+  const repeatFile = repeatStatePath(repoRoot);
+  const repeatState = probes.some((p) => typeof p.repeatFacts === 'function') ? readRepeatState(repeatFile) : {};
+  let repeatDirty = false;
+
+  await Promise.all(
+    probes.map(async (probe) => {
+      const t0 = Date.now();
+      const record = (outcome, extra = {}) => {
+        byId.set(probe.id, {
+          id: probe.id,
+          outcome,
+          durationMs: Date.now() - t0,
+          ...extra,
+        });
+      };
+
+      if (probe.network && !includeNetwork) {
+        record('skipped', { reason: 'network-probe-opt-in' });
+        return;
+      }
+
+      let skipReason;
+      try {
+        skipReason = typeof probe.precondition === 'function' ? probe.precondition(ctx) : null;
+      } catch {
+        // A precondition that throws is a defect in the precondition, not a
+        // finding about the repo — treat it as "cannot decide", run nothing.
+        record('error', { reason: 'precondition-threw' });
+        return;
+      }
+      if (typeof skipReason === 'string' && skipReason.length > 0) {
+        record('skipped', { reason: skipReason });
+        return;
+      }
+
+      // The entry function's result once it has returned, for probes with a
+      // `followUp`. The follow-up is optional enrichment: when it throws or
+      // overruns, the probe still DELIVERED, and "a probe that already
+      // delivered is not a timeout" (withWorkDeadline) applies to it too.
+      /** @type {{__probeResult: *}|null} */
+      let delivered = null;
+      /** @type {'threw'|'budget-exceeded'|undefined} */
+      let followUpFailure;
+      // Which branch of the follow-up was running (#1735): a probe with more
+      // than one follow-up path names it via the `stage` callback, so a
+      // `budget-exceeded` record says WHICH step overran.
+      /** @type {string|undefined} */
+      let followUpStage;
+
+      // The whole invocation — import included — is inside the race, because a
+      // pre-#369-style absent module and a hung probe are both "did not
+      // deliver" and both must resolve to an outcome rather than to a throw.
+      const invocation = (async () => {
+        const mod = await import(probe.spec);
+        const fn = mod?.[probe.fn];
+        if (typeof fn !== 'function') {
+          return { __probeError: new Error(`export ${probe.fn} missing`), __absent: true };
+        }
+        const first = await fn(probe.args(ctx));
+        if (typeof probe.followUp !== 'function') return { __probeResult: first };
+        delivered = { __probeResult: first };
+        // Optional second step (#1332, `ci-status` only today), inside this
+        // race so it spends the SAME per-probe budget — NAMED CEILING (BV-004):
+        // it gets exactly what the entry function left of `budgetMs`, with no
+        // second timer and no margin, because the fallback is decided AFTER
+        // the race below: a timeout with `delivered` set is `delivered`.
+        try {
+          return {
+            __probeResult: await probe.followUp(
+              first,
+              ctx,
+              (extra) => fn({ ...probe.args(ctx), ...extra }),
+              (partial) => { delivered = { __probeResult: partial }; },
+              mod,
+              (name) => { followUpStage = typeof name === 'string' ? name : undefined; },
+            ),
+          };
+        } catch {
+          followUpFailure = 'threw';
+          return delivered;
+        }
+      })();
+
+      const deadline = await withWorkDeadline(invocation, budgetMs, meter);
+      const { workMs } = deadline;
+      let { raced } = deadline;
+      if (raced === TIMED_OUT && delivered) {
+        // The follow-up is what ran out of budget, not the probe. Its pending
+        // promise is abandoned exactly as a hung probe's would be.
+        raced = delivered;
+        followUpFailure = 'budget-exceeded';
+      }
+
+      if (raced === TIMED_OUT) {
+        record('timeout', { reason: 'budget-exceeded', workMs });
+        return;
+      }
+      if (raced && raced.__probeError) {
+        // A missing module is the documented "pre-#N plugin install" case:
+        // SKILL.md says skip silently. Made visible as a skip, not an error.
+        if (raced.__absent || raced.__probeError?.code === 'ERR_MODULE_NOT_FOUND') {
+          record('skipped', { reason: 'module-absent' });
+        } else {
+          // The thrown value is probe-supplied: String() of an object without a
+          // prototype (or with a throwing toString) throws itself, which would
+          // reject the runner — the contract is that it never rejects.
+          let reason;
+          try {
+            reason = String(raced.__probeError?.message ?? raced.__probeError).slice(0, 200);
+          } catch {
+            reason = 'probe-threw-unprintable';
+          }
+          record('error', { reason });
+        }
+        return;
+      }
+
+      const result = raced?.__probeResult;
+      // A custom `severityOf`, a `render`, or a getter on the result the
+      // defaults read is probe-supplied code that can throw. The runner never
+      // rejects, so such a throw degrades this probe the way a throwing
+      // precondition does: `error` with a fixed reason, no banner line.
+      let severity;
+      let line;
+      let stage = 'severity-threw';
+      try {
+        severity = severityOf(result, probe);
+        stage = 'render-threw';
+        // The renderer gets the RESULT only (#1396): no `ctx`, so it has no
+        // repo to spawn git against. It runs after the budget race, where
+        // nothing it did would be measured; a repo-local fact a banner names
+        // is resolved in the probe's `followUp`, inside the race, and carried
+        // as data.
+        line = typeof probe.render === 'function'
+          ? probe.render(result)
+          : defaultRender(result, severity);
+      } catch {
+        record('error', { reason: stage, workMs });
+        return;
+      }
+      // #2196: a repeat-gated probe's unchanged warn finding keeps its
+      // `ran-warn` outcome (the finding exists) but loses its banner line; the
+      // line stays in `results` as `suppressedLine`, and `repeat` reaches the
+      // ledger so the BANNER's firing rate is measurable (HR-105). Never `alert`.
+      // The state moves only when the caller displays the banner: a headless
+      // or banner-off run must not use up the weekly report (`not-displayed`).
+      let repeat;
+      let suppressedLine;
+      if (typeof probe.repeatFacts === 'function') {
+        if (severity === 'warn' && line) {
+          let verdict;
+          try {
+            verdict = judgeRepeat(repeatState[probe.id], probe.repeatFacts(result) ?? [], clock());
+          } catch {
+            verdict = null; // a throwing fact extractor reports — never hides
+          }
+          if (verdict && !verdict.report) {
+            repeat = 'suppressed';
+            suppressedLine = line;
+            line = null;
+          } else {
+            repeat = display ? 'reported' : 'not-displayed';
+          }
+          if (display) {
+            if (verdict) repeatState[probe.id] = verdict.next;
+            else delete repeatState[probe.id];
+            repeatDirty = true;
+          }
+        } else if (display && severity === 'ok' && Object.hasOwn(repeatState, probe.id)) {
+          delete repeatState[probe.id]; // cleared: its return is news again
+          repeatDirty = true;
+        }
+      }
+      const measure = probeMeasure(probe, result);
+      record(severity === 'ok' ? 'ran-clean' : severity === 'warn' ? 'ran-warn' : 'ran-alert', {
+        severity,
+        workMs,
+        ...(followUpFailure ? { followUp: followUpFailure } : {}),
+        ...(followUpFailure && followUpStage ? { followUpStage } : {}),
+        ...(measure ? { measure } : {}),
+        ...(line ? { line } : {}),
+        ...(repeat ? { repeat } : {}),
+        ...(suppressedLine ? { suppressedLine } : {}),
+      });
+    }),
+  );
+
+  meter.stop();
+  if (repeatDirty) await writeRepeatState(repeatFile, repeatState);
+
+  // Registry order, never completion order — a run must be reproducible.
+  const results = [];
+  const bannerLines = [];
+  for (const probe of probes) {
+    const r = byId.get(probe.id);
+    if (!r) continue;
+    if (r.line) bannerLines.push(r.line);
+    const { line: _line, ...rest } = r;
+    results.push(rest);
+  }
+
+  const count = (pred) => results.filter(pred).length;
+  const ran = count((r) => r.outcome.startsWith('ran-'));
+  const warned = count((r) => r.outcome === 'ran-warn' || r.outcome === 'ran-alert');
+  const skipped = count((r) => r.outcome === 'skipped');
+  const errored = count((r) => r.outcome === 'error');
+  const timedOut = count((r) => r.outcome === 'timeout');
+
+  // One aggregate line, and only when something actually failed to deliver — a
+  // banner that fires on every start teaches the operator to ignore banners
+  // (`.claude/rules/host-resources.md` § HR-101).
+  if (errored + timedOut > 0) {
+    const parts = [];
+    if (errored > 0) parts.push(`${errored} errored`);
+    if (timedOut > 0) parts.push(`${timedOut} timed out`);
+    bannerLines.push(
+      `⚠ session-start probes: ${parts.join(', ')} — see orchestrator.probes.completed in .orchestrator/metrics/events.jsonl.`,
+    );
+  }
+
+  const event = {
+    total: probes.length,
+    ran,
+    warned,
+    skipped,
+    errored,
+    timed_out: timedOut,
+    duration_ms: Date.now() - started,
+    // `reason` travels. Dropping it here was the module's own rule broken at its
+    // own boundary: `module-absent` is the ONE skip reason that means a probe is
+    // permanently dead, and without it the ledger cannot tell that apart from
+    // `network-probe-opt-in`, which is the intended default. "Measured, then
+    // discarded" is worse than "not measured" — the value existed.
+    probes: results.map((r) => ({
+      id: r.id,
+      outcome: r.outcome,
+      ...(typeof r.reason === 'string' && r.reason.length > 0 ? { reason: r.reason } : {}),
+      // `work_ms` is the quantity the `timeout` verdict is computed FROM, so it
+      // has to reach the ledger (`.claude/rules/host-resources.md` § HR-105 — a
+      // rule you cannot falsify is not a rule). `duration_ms` at probe level is
+      // deliberately NOT persisted: under parallel launch it ranks contention,
+      // not work, and persisting a misleading field was the #1089 failure.
+      ...(Number.isFinite(r.workMs) ? { work_ms: Math.round(r.workMs) } : {}),
+      // A follow-up that fell back to the delivered result is otherwise
+      // invisible (the outcome is `ran-*`); this is its revisit trigger's input.
+      ...(typeof r.followUp === 'string' ? { follow_up: r.followUp } : {}),
+      // The follow-up branch that fell back (#1735), e.g. `pushed-sha` or
+      // `red-history` for `ci-status`; absent when the probe named none.
+      ...(typeof r.followUpStage === 'string' ? { follow_up_stage: r.followUpStage } : {}),
+      // What the probe MEASURED, warn or not (#1489, HR-105): without it a
+      // probe that never warns reads the same whether it is rare or dead.
+      ...(r.measure ? { measure: r.measure } : {}),
+      // #2196: `reported` = line shown, `suppressed` = unchanged warn finding,
+      // line withheld, `not-displayed` = news, but the caller showed no banner.
+      ...(typeof r.repeat === 'string' ? { repeat: r.repeat } : {}),
+    })),
+  };
+
+  // Telemetry is best-effort like every other side effect here: a ledger that
+  // cannot be written must not cost the operator his banners.
+  try {
+    await emit('orchestrator.probes.completed', event, { repoRoot });
+  } catch { /* never block the caller */ }
+
+  return { bannerLines, results, event };
+}

@@ -1,0 +1,233 @@
+---
+description: "When the user types /plan or asks to create a project plan, feature PRD, or retrospective"
+globs: ""
+alwaysApply: false
+---
+
+# Plan — Structured Project Planning & PRD Generation
+
+Three planning modes with a shared research-driven Q&A engine. Pattern across all modes: **research → questions → document → review → issues**.
+
+## Phase 0: Read Session Config
+
+Read Session Config from CLAUDE.md. `plan-baseline-path` is optional: `/plan new` uses it when configured, else the plugin's bundled templates (`skills/plan/mode-new.md` Phase 0 — same decision as `/bootstrap`, via `node "$PLUGIN_ROOT/scripts/baseline-archetypes.mjs" --repo "$REPO_ROOT"`). Without a baseline, print "No baseline configured — using the plugin's bundled archetypes." and continue; a configured but broken baseline (reader exit 2) aborts with its sanitized reason. `feature` and `retro` run without it.
+
+Additional fields: `plan-default-visibility`, `plan-prd-location`, `plan-retro-location`, `vcs`. Expand `~` in paths.
+
+## Phase 1: Mode Selection
+
+Parse the argument to determine mode:
+
+- **`new`** — Project kickoff: scaffolding, architecture decisions, initial setup
+- **`feature`** — Feature PRD: requirements gathering, compact scope, acceptance criteria
+- **`retro`** — Retrospective: data-driven analysis of recent work, learnings extraction
+
+If no mode specified, ask via numbered list:
+
+```
+Which planning mode?
+
+1. new (Recommended) — Project kickoff: full PRD, repo setup, issue creation. Fits a repo that has no PRD yet.
+2. feature — One feature: compact scope, acceptance criteria, issues. Cheaper, but assumes the project context already exists.
+3. retro — Retrospective on finished work: metrics, reflection, improvement actions. Defines no new scope.
+```
+
+## Phase 2: Q&A Engine (Shared Core)
+
+Every question wave follows the same pattern. This is the core mechanic across all modes.
+
+### 2.1 Pre-Question Research
+
+Before each Q&A wave, perform research **sequentially** — Cursor has no parallel agents:
+
+1. **Market/online context** — Search for relevant market data, best practices, competitor analysis, or technical patterns for the upcoming questions
+2. **Baseline analysis** — Read projects-baseline templates, rules, and scripts at `$BASELINE_PATH` (Glob, Grep, Read). Skip it when `plan-baseline-path` is unset (`/plan new` then reads the bundled templates in `$PLUGIN_ROOT/templates/`).
+3. **Repo context** — Analyze current repository for patterns, file structure, dependencies, conventions (skip for `/plan new` wave 1)
+
+### 2.2 Question Presentation
+
+Synthesize research into **5 questions per wave**. Present as numbered Markdown lists — Cursor has no AskUserQuestion:
+
+- **Option 1 is ALWAYS the recommendation**, marked with `(Recommended)`
+- Include Pros/Cons drawn from the research for each option
+- Include an "Other" option when custom input makes sense
+
+Example:
+```
+## Architecture (Wave 1, Q1)
+
+Which project archetype fits best?
+
+1. nextjs-saas (Recommended) — Pro: Full SaaS stack with auth, payments. Con: Heavier setup.
+2. express-service — Pro: Lightweight API. Con: No frontend.
+3. docker-service — Pro: Maximum flexibility. Con: More manual setup.
+4. Other — Describe your preferred archetype.
+```
+
+### 2.3 Adaptive Depth
+
+Starting wave counts: `new` → 3 waves minimum, `feature` → 1 wave minimum, `retro` → 1 wave minimum. Maximum 5 waves across all modes.
+
+After each wave:
+- **Answers clear** → proceed to document generation
+- **Complexity revealed** → add targeted follow-up wave
+- **User aborts** → proceed with answers gathered
+
+### 2.4 Answer Tracking
+
+After each wave, output a recap:
+```
+## Answers So Far (Wave N/M)
+1. Archetype: nextjs-saas
+2. Visibility: internal
+3. Audience: B2B customers
+```
+
+---
+
+## Mode: new — Project Kickoff
+
+**Wave 1** — Core Decisions: archetype (read `$BASELINE_PATH/templates/`), visibility, target audience, core problem, GitLab group.
+
+**Wave 2** — Technical Details (per chosen archetype): tech stack decisions, design style, external integrations, performance requirements, security requirements.
+
+**Wave 3** — Business & Scope: MVP appetite (1w/2w/6w), success criteria (SMART), known risks, post-launch plan, ecosystem dependencies.
+
+Document: 8-section full PRD. Save to `{plan-prd-location}/YYYY-MM-DD-{project-name}.md`.
+
+After PRD approval: run `$BASELINE_PATH/scripts/setup-project.sh`, verify repo, populate CLAUDE.md, commit PRD. <!-- path-check: example -->
+
+Issues: Epic (project name) + sub-issues per MVP feature from PRD Section 4 (Solution & Scope).
+
+---
+
+## Mode: feature — Feature PRD
+
+**Wave 1** — Feature Core: what to build, why now, who uses it, scope + explicit exclusions, dependencies.
+
+**Wave 2** (conditional — only if Wave 1 reveals multiple subsystems or unclear integration): architecture decisions, integration points, data model changes, edge cases, performance impact.
+
+Document: 5-section compact PRD. Save to `{plan-prd-location}/YYYY-MM-DD-{feature-slug}.md`.
+
+Issues: Epic (feature name) + sub-issues per acceptance criterion group.
+
+---
+
+## Mode: retro — Retrospective
+
+**Phase 1 (automatic, no user input):** Read `.orchestrator/metrics/sessions.jsonl`, run git log analysis, query open issues, compare last 5 vs prior 5 sessions.
+
+**Wave 1** — What went well / what didn't: highlights, blockers with root causes, carryover items, process assessment, data anomalies.
+
+**Wave 2** (conditional — if Wave 1 reveals significant blockers or process issues): improvement actions, priority ranking, ownership, baseline changes, Session Config adjustments.
+
+Artifacts: retro doc → `{plan-retro-location}/YYYY-MM-DD-retro.md`. Improvement issues + learnings update (`.orchestrator/metrics/learnings.jsonl`).
+
+---
+
+## Phase 3: Document Generation
+
+Read the appropriate template from the skill directory:
+- `new` → `prd-full-template.md` (8 sections)
+- `feature` → `prd-feature-template.md` (5 sections)
+- `retro` → `retro-template.md`
+
+Fill ALL sections — no TBD or placeholder content. If a section cannot be filled from gathered data, make a best-effort recommendation and mark it `<!-- REVIEW: inferred from research, confirm with stakeholders -->`.
+
+Save the document, creating the target directory (`mkdir -p`) if needed.
+
+## Phase 4: PRD Review (skip for retro)
+
+Dispatch a sequential self-review (read `prd-reviewer-prompt.md` from skill directory). Reviewer checks 6 criteria:
+1. **Completeness** — all sections filled
+2. **Consistency** — no internal contradictions
+3. **Clarity** — implementable by a developer from this document alone
+4. **Scope** — focused on one project/feature
+5. **YAGNI** — no unrequested features
+6. **SMART metrics** — success criteria are measurable
+
+If any criterion fails, revise and re-review. Maximum **3 iterations**. After 3 rounds with remaining issues, present to user as numbered list:
+
+```
+The PRD reviewer flagged these remaining issues:
+[list]
+
+1. Accept as-is (Recommended) — the flagged issues are minor, so the PRD is usable now. You can still edit it later.
+2. Manual edit — you edit the PRD yourself before continuing. Costs a round-trip.
+3. Re-run review — one more revision round. Costs another review pass and may surface nothing new.
+```
+
+Then present the saved PRD path and ask for final approval:
+
+```
+PRD saved to [path]. Ready for your review.
+
+1. Approve PRD (Recommended) — proceed to issue creation. You can still edit the PRD afterwards; the issues link to it rather than copy it.
+2. Request changes — describe what to change. Costs one more revision round.
+```
+
+## Phase 5: Issue Creation
+
+### Auto-Prioritize
+
+Score each issue by three factors:
+1. **Technical dependencies** (highest weight) — blocking issues get `priority::critical` or `priority::high`. DB schema before API, API before frontend.
+2. **Business value** (medium weight) — core MVP = `priority::high`, nice-to-haves = `priority::medium/low`.
+3. **Risk** (tiebreaker) — unknowns or external dependencies bump priority up one level.
+
+Labels: `priority:<level>`, `type:feature/enhancement/chore`, `status:ready`, `area:<inferred>`. For `new`: add `appetite:<1w|2w|6w>`.
+
+### User Confirmation (numbered list)
+
+```
+Proposed issue structure:
+
+Epic: [title]
+
+| # | Sub-Issue | Priority | Labels | Blocked By |
+|---|-----------|----------|--------|------------|
+
+Total: [N] issues.
+
+1. Create all issues (Recommended)
+2. Adjust priorities
+3. Remove issues
+4. Cancel
+```
+
+### Issue Creation
+
+- **GitLab**: `glab issue create --title "[Plan] <title>" --label "<labels>" --description "<body>"`
+- **GitHub**: `gh issue create --title "[Plan] <title>" --label "<labels>" --body "<body>"`
+- 1s pause between creations. Set dependency links after all issues are created (GitLab: `glab api` blocking relations).
+
+### Final Report
+
+```
+## Plan Complete
+
+### Document
+- [PRD/Retro] saved to: [path]
+
+### Issues Created
+| # | Title | Priority | Labels | Blocks |
+|---|-------|----------|--------|--------|
+
+### Dependencies
+[Dependency graph: #1 → #2 → #4, #3 (independent)]
+
+### Next Steps
+- [Contextual: run /session feature to implement, or address improvement issues]
+```
+
+## Critical Rules
+
+- **NEVER skip the Q&A phase** — even with a detailed brief, validate through structured questions
+- **NEVER assume baseline templates** — read from the configured `plan-baseline-path` when set, else from the plugin's bundled templates
+- **ALWAYS research before asking** — sequential research before every Q&A wave
+- **ALWAYS mark Option 1 as recommended** — with `(Recommended)` on every question
+- **ALWAYS use numbered Markdown lists** — Cursor has no AskUserQuestion
+- **ALWAYS save documents before creating issues** — the PRD/retro document is the source of truth
+- **NEVER leave PRD sections with TBD** — make a best-effort recommendation if data is insufficient
+- **NEVER create issues without user confirmation**
+- **NEVER include internal paths, IPs, or infrastructure details in output documents**

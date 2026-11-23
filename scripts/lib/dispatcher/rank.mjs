@@ -1,0 +1,461 @@
+/**
+ * rank.mjs — autopilot dispatcher ranking scorer (Epic #673 P2, issue #677).
+ *
+ * Ranks FREE candidate repos so the cross-repo dispatcher can recommend the
+ * single most worthwhile one to work on next. Combines three signals into a
+ * multiplicative score:
+ *
+ *   priority  × staleness × readiness
+ *
+ *  - PRIORITY  — open-backlog severity (critical/high counts) from
+ *    `scanBacklog` (scripts/lib/backlog-scan.mjs). null (glab/gh missing or
+ *    timeout) ⇒ neutral fallback (1) + a warning. NEVER blocks.
+ *  - STALENESS — days since the candidate's last completed session. Older =
+ *    more worthwhile (you have not touched it in a while). No prior sessions ⇒
+ *    maximally stale.
+ *  - READINESS — CI status (red repos are worth less right now) × host
+ *    resource verdict (a degraded/critical host de-prioritises everything
+ *    equally; it is a host-level signal, fetched once and shared).
+ *
+ * Design contract (PRD §2 P2.3, §3 FA-2, §4):
+ *  - `scoreCandidate` is a PURE, deterministic, documented formula — no I/O.
+ *  - `rankCandidates` does all I/O through injectable `deps` so Wave-4 tests
+ *    are deterministic. Default `deps` wires the real signal sources.
+ *  - GLAB/GH FALLBACK is mandatory: a null priority is ranked on
+ *    staleness × readiness only, with a human-readable warning. Never throws,
+ *    never blocks.
+ *  - All returns are plain serialisable objects (CLI wrapper lands in #678).
+ *
+ * @typedef {{ repoRoot: string, repoName: string, free: boolean, status: 'frei'|'in-progress'|'force-closed', heartbeat: string|null, sessionId: string|null }} Candidate
+ */
+
+import { scanBacklog } from '../backlog-scan.mjs';
+import { checkCiStatus as realCheckCiStatus } from '../ci-status-banner.mjs';
+import { probe as realProbe, evaluate as realEvaluate, DEFAULT_RESOURCE_THRESHOLDS as CANONICAL_RESOURCE_THRESHOLDS } from '../resource-probe.mjs';
+import { isMeasuredSession, readCanonicalSessions } from '../sessions-canonical.mjs';
+
+/** Staleness cap (days). Beyond this, additional age does not raise the score. */
+export const STALENESS_CAP_DAYS = 90;
+
+/** Day length in ms — shared age-in-days idiom (mirrors backlog-scan ageDays). */
+const MS_PER_DAY = 86_400_000;
+
+/**
+ * Canonical resource-threshold defaults (mirrors
+ * scripts/lib/config/vault-integration.mjs `_parseResourceThresholds`).
+ * Used by the default `resourceVerdict` dep so ranking works standalone
+ * without a parsed Session Config in hand.
+ */
+// #1089: re-exported from the single canonical definition rather than a third
+// hand-maintained copy — the three copies had already drifted apart.
+const DEFAULT_RESOURCE_THRESHOLDS = { ...CANONICAL_RESOURCE_THRESHOLDS };
+
+// ---------------------------------------------------------------------------
+// PURE core
+// ---------------------------------------------------------------------------
+
+/**
+ * Score a single candidate from its gathered signals. Pure + deterministic.
+ *
+ * FORMULA (multiplicative — higher = more worth working on):
+ *
+ *   priorityScore   = priority
+ *                       ? 1 + 2·criticalCount + 1·highCount
+ *                       : 1                         // null ⇒ neutral fallback
+ *   stalenessScore  = 1 + min(staleDays, 90) / 30  // older = higher, capped
+ *   readinessScore  = ciFactor · resourceFactor
+ *       ciFactor       = ciStatus === 'red' && !ciPhase ? 0.25 : 1
+ *                        // null / 'unknown' / 'green' are all non-blocking (1);
+ *                        // ciPhase 'running'/'canceled' = no verdict (1, #856)
+ *       resourceFactor = critical ? 0.25 : degraded ? 0.6 : 1
+ *                        // 'green' / 'warn' ⇒ 1
+ *
+ *   score = priorityScore · stalenessScore · readinessScore
+ *
+ * Rationale:
+ *  - A candidate with no backlog signal is neither rewarded nor punished — it
+ *    competes on staleness × readiness alone (the glab/gh fallback).
+ *  - Staleness is bounded so an ancient repo cannot dominate purely on age.
+ *  - Readiness only ever DAMPENS (factors ≤ 1): a red CI or a strained host
+ *    makes a repo less attractive right now, but never negative.
+ *
+ * @param {{
+ *   priority: { criticalCount: number, highCount: number } | null,
+ *   staleDays: number,
+ *   readiness: {
+ *     ciStatus: 'green'|'red'|'unknown'|null,
+ *     resourceVerdict: 'green'|'warn'|'degraded'|'critical',
+ *   },
+ * }} signals
+ * @returns {number} score (≥ 0; higher = more worthwhile)
+ */
+export function scoreCandidate(signals) {
+  const { priority, staleDays, readiness } = signals;
+
+  const priorityScore = priority
+    ? 1 + 2 * (priority.criticalCount || 0) + 1 * (priority.highCount || 0)
+    : 1;
+
+  // Guard against NaN/negative staleDays — clamp to [0, cap].
+  const safeStaleDays =
+    typeof staleDays === 'number' && Number.isFinite(staleDays) && staleDays > 0
+      ? staleDays
+      : 0;
+  const stalenessScore = 1 + Math.min(safeStaleDays, STALENESS_CAP_DAYS) / 30;
+
+  const ciStatus = readiness?.ciStatus ?? null;
+  const resourceVerdict = readiness?.resourceVerdict ?? 'green';
+
+  // #856: a running or canceled HEAD pipeline carries no verdict — not red.
+  const ciPhase = readiness?.ciPhase;
+  const noVerdict = ciPhase === 'running' || ciPhase === 'canceled';
+  const ciFactor = ciStatus === 'red' && !noVerdict ? 0.25 : 1;
+  const resourceFactor =
+    resourceVerdict === 'critical'
+      ? 0.25
+      : resourceVerdict === 'degraded'
+        ? 0.6
+        : 1;
+  const readinessScore = ciFactor * resourceFactor;
+
+  return priorityScore * stalenessScore * readinessScore;
+}
+
+// ---------------------------------------------------------------------------
+// Default signal-source implementations (the real wiring)
+// ---------------------------------------------------------------------------
+
+/**
+ * Default PRIORITY source: run `scanBacklog` against the candidate repo.
+ *
+ * `scanBacklog` keys off the CURRENT process git remote, so to score a
+ * DIFFERENT repo we run it with that repo as the working directory and restore
+ * cwd afterwards. Returns the scanBacklog summary or null (CLI missing /
+ * timeout / parse-fail). Never throws.
+ *
+ * @param {string} repoRoot
+ * @param {number} nowMs
+ * @returns {Promise<null | {criticalCount: number, highCount: number}>}
+ */
+async function defaultFetchPriority(repoRoot, nowMs) {
+  const prevCwd = process.cwd();
+  try {
+    process.chdir(repoRoot);
+    return await scanBacklog({ nowMs });
+  } catch {
+    return null;
+  } finally {
+    try {
+      process.chdir(prevCwd);
+    } catch {
+      /* best-effort cwd restore */
+    }
+  }
+}
+
+/**
+ * Default STALENESS source: read `<repoRoot>/.orchestrator/metrics/sessions.jsonl`,
+ * find the MOST RECENT REAL (non-phantom) record's timestamp, and compute days
+ * since `completed_at` (fallback `started_at`). No file / no parsable REAL
+ * record / no timestamp ⇒ `STALENESS_CAP_DAYS` (treat as maximally stale =
+ * most worthwhile).
+ *
+ * Skips `status: 'abandoned'` phantom stubs (#834) — session-close-backfill
+ * writes these for sessions that ended without a real close (0 waves, seconds
+ * of runtime). Counting one would let a single recent phantom make a
+ * genuinely neglected repo look freshly touched, defeating the dispatcher's
+ * whole purpose (this is the N=1 extreme case of the phantom-tail problem —
+ * one stub is enough to zero out staleness).
+ *
+ * #1209: takes the MAX timestamp over every canonical REAL record instead of
+ * scanning backward through raw file lines from the tail. A raw backward scan
+ * trusts FILE POSITION as a proxy for recency, which silently breaks the
+ * moment a backfill/repair writer appends an OLDER record after genuinely
+ * newer ones already exist — `session-record-repair.mjs` and
+ * `migrate-sessions-jsonl.mjs` both do this by design (see
+ * `sessions-canonical.mjs`'s module header, "by-design raw" list). A
+ * duplicated `session_id` re-appended late at the tail would make the old
+ * backward scan report the STALE re-append's date instead of the genuinely
+ * newer session's date; `readCanonicalSessions` collapses the duplicate to
+ * one record first, so the max-reduce below sees only the true timestamps.
+ *
+ * @param {string} repoRoot
+ * @param {number} nowMs
+ * @returns {Promise<number>} days since last REAL session (≥ 0)
+ */
+async function defaultStaleDaysFor(repoRoot, nowMs) {
+  try {
+    const records = readCanonicalSessions({ repoRoot });
+    if (records.length === 0) return STALENESS_CAP_DAYS;
+
+    let latestMs = null;
+    for (const rec of records) {
+      // Audit E1: a synthetic backfill stub (even a `status: 'completed'` one)
+      // must not make a neglected repo look freshly touched.
+      if (!isMeasuredSession(rec)) continue;
+      const iso = rec.completed_at || rec.started_at || null;
+      if (!iso || typeof iso !== 'string') continue;
+      const t = Date.parse(iso);
+      if (Number.isNaN(t)) continue;
+      if (latestMs === null || t > latestMs) latestMs = t;
+    }
+    if (latestMs === null) return STALENESS_CAP_DAYS;
+
+    const days = (nowMs - latestMs) / MS_PER_DAY;
+    return days > 0 ? days : 0;
+  } catch {
+    // Not the missing/unreadable-ledger path: readCanonicalSessions already
+    // returns [] for both (ENOENT silently, any other read failure with a
+    // stderr WARN — sessions-canonical.mjs § #1188), handled by the
+    // `records.length === 0` branch above. This catch only absorbs an
+    // unexpected throw (e.g. a non-string repoRoot) ⇒ maximally stale.
+    return STALENESS_CAP_DAYS;
+  }
+}
+
+/**
+ * Default READINESS (CI) source: thin wrapper over `checkCiStatus`.
+ *
+ * Passes the probe's result through VERBATIM rather than flattening it to a
+ * status string (#1031 follow-up). `checkCiStatus` has THREE return states —
+ * `null` (benign absence), `{status, …}` (a real reading), and
+ * `{severity:'warn', degraded:<reason>}` (the state could NOT be read) — and
+ * the old `typeof result.status === 'string' ? result.status : null` collapsed
+ * the third onto the first. That was not a scoring bug (both are non-blocking)
+ * but it discarded the one thing the operator needs to know: the ranking was
+ * computed WITHOUT a CI reading, and why. {@link normalizeCiSignal} in
+ * `rankCandidates` performs the shape reduction and keeps the reason.
+ *
+ * A THROW is the fourth state, and it is NOT the first: `checkCiStatus` is
+ * documented never to throw, so an exception here means the probe itself broke
+ * (a bad import, an unexpected runtime error). Returning `null` for it would
+ * assert measured ABSENCE — the one thing we know is false. It is mapped to the
+ * degraded shape instead, so {@link normalizeCiSignal} surfaces it as
+ * `ciStatus: 'unknown'` + `ciDegraded: 'probe-threw'` rather than silently.
+ *
+ * @param {{ repoRoot: string }} args
+ * @returns {Promise<'green'|'red'|'unknown'|null|object>} raw probe result.
+ */
+async function defaultCheckCiStatus({ repoRoot }) {
+  try {
+    return (await realCheckCiStatus({ repoRoot })) ?? null;
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    return {
+      severity: 'warn',
+      ok: false,
+      message: `⚠ ci-status: CI probe threw — state UNKNOWN, not "green". ${detail}`,
+      degraded: 'probe-threw',
+    };
+  }
+}
+
+/**
+ * Reduce whatever a `checkCiStatus` dep returned to the pair the ranking needs:
+ * a scoring status and — when the state was UNREADABLE — the reason.
+ *
+ * Accepts every shape the dep contract permits, old and new:
+ *   - a bare status string (`'green'`/`'red'`/`'unknown'`) — the shape every
+ *     injected test dep uses; passed through unchanged.
+ *   - `null`/`undefined` — genuine absence, no signal, no reason.
+ *   - `{status: <string>}` — a real reading from `checkCiStatus`.
+ *   - `{degraded: <reason>}` with no usable `status` — the probe FAILED. Mapped
+ *     to `'unknown'`, which `scoreCandidate` already treats as non-blocking
+ *     (`ciFactor` dampens on `'red'` only), so ranking is byte-identical to the
+ *     previous `null` — but the reason survives into `readiness.ciDegraded`
+ *     and into a `warnings` entry.
+ *   - anything else — `null`, as before.
+ *
+ * `ciDegraded` is `null` (and the caller OMITS the key) whenever the state was
+ * readable, so existing strict `toEqual` pins on `signals.readiness` hold.
+ *
+ * @param {unknown} raw
+ * @returns {{ ciStatus: 'green'|'red'|'unknown'|null, ciDegraded: string|null, ciPhase?: 'running'|'canceled' }}
+ */
+export function normalizeCiSignal(raw) {
+  if (typeof raw === 'string' && raw) return { ciStatus: raw, ciDegraded: null };
+  if (!raw || typeof raw !== 'object') return { ciStatus: null, ciDegraded: null };
+  if (typeof raw.status === 'string' && raw.status) {
+    // #856: `ciPhase` only when the probe published one, so strict `toEqual`
+    // pins on phase-less readings hold.
+    const phase = raw.phase === 'running' || raw.phase === 'canceled' ? raw.phase : null;
+    return { ciStatus: raw.status, ciDegraded: null, ...(phase ? { ciPhase: phase } : {}) };
+  }
+  if (typeof raw.degraded === 'string' && raw.degraded) {
+    return { ciStatus: 'unknown', ciDegraded: raw.degraded };
+  }
+  return { ciStatus: null, ciDegraded: null };
+}
+
+/**
+ * Default READINESS (resource) source: probe the host ONCE and evaluate against
+ * the canonical default thresholds. This is a HOST-level signal (identical for
+ * every candidate), so `rankCandidates` calls it exactly once per ranking run.
+ * Falls back to 'green' (non-dampening) on any failure.
+ *
+ * @returns {Promise<'green'|'warn'|'degraded'|'critical'>}
+ */
+async function defaultResourceVerdict() {
+  try {
+    const snapshot = await realProbe();
+    const { verdict } = realEvaluate(snapshot, DEFAULT_RESOURCE_THRESHOLDS);
+    return verdict || 'green';
+  } catch {
+    return 'green';
+  }
+}
+
+/**
+ * Build the default `deps` object. Exposed for tests that want to override a
+ * single dep while keeping the real ones for the rest.
+ *
+ * @returns {{
+ *   fetchPriority: (repoRoot: string, nowMs: number) => Promise<null | {criticalCount: number, highCount: number}>,
+ *   staleDaysFor: (repoRoot: string, nowMs: number) => Promise<number>,
+ *   checkCiStatus: (args: { repoRoot: string }) => Promise<'green'|'red'|'unknown'|null>,
+ *   resourceVerdict: () => Promise<'green'|'warn'|'degraded'|'critical'>,
+ * }}
+ */
+export function defaultDeps() {
+  return {
+    fetchPriority: defaultFetchPriority,
+    staleDaysFor: defaultStaleDaysFor,
+    checkCiStatus: defaultCheckCiStatus,
+    resourceVerdict: defaultResourceVerdict,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Orchestration
+// ---------------------------------------------------------------------------
+
+/**
+ * Rank a list of FREE candidate repos (the dispatcher pre-filters
+ * `free === true`). Gathers signals via injectable `deps`, scores each
+ * candidate with the pure `scoreCandidate` formula, and sorts DESC by score.
+ *
+ * Sort is deterministic: score DESC, then staleDays DESC, then repoName ASC.
+ * `ranked[0]` is the top recommendation.
+ *
+ * GLAB/GH FALLBACK: when `deps.fetchPriority` returns null (CLI missing /
+ * timeout), the candidate is scored with `priority: null` (neutral 1) AND a
+ * warning is pushed. Never throws, never blocks.
+ *
+ * The host resource verdict is fetched ONCE (host-level signal) and shared
+ * across all candidates.
+ *
+ * @param {Candidate[]} freeCandidates
+ * @param {{
+ *   now?: number,
+ *   deps?: Partial<ReturnType<typeof defaultDeps>>,
+ * }} [opts]
+ * @returns {Promise<{
+ *   ranked: Array<{ candidate: Candidate, score: number, signals: {
+ *     priority: { criticalCount: number, highCount: number } | null,
+ *     staleDays: number,
+ *     readiness: { ciStatus: 'green'|'red'|'unknown'|null, resourceVerdict: 'green'|'warn'|'degraded'|'critical', ciDegraded?: string },
+ *   } }>,
+ *   warnings: string[],
+ * }>}
+ */
+export async function rankCandidates(freeCandidates, opts = {}) {
+  const candidates = Array.isArray(freeCandidates) ? freeCandidates : [];
+  const nowMs = typeof opts.now === 'number' ? opts.now : Date.now();
+  const deps = { ...defaultDeps(), ...(opts.deps || {}) };
+  const warnings = [];
+
+  // Host-level resource verdict — fetched ONCE, shared across candidates.
+  let resourceVerdict;
+  try {
+    resourceVerdict = (await deps.resourceVerdict()) || 'green';
+  } catch {
+    // Non-blocking: a failed host probe defaults to non-dampening 'green'.
+    resourceVerdict = 'green';
+    warnings.push('resource verdict unavailable (host probe failed) — readiness scored without resource dampening');
+  }
+
+  const rows = [];
+  for (const candidate of candidates) {
+    const repoRoot = candidate?.repoRoot;
+    const repoName = candidate?.repoName ?? repoRoot ?? '<unknown>';
+
+    // PRIORITY (with glab/gh fallback).
+    let priority;
+    try {
+      const raw = await deps.fetchPriority(repoRoot, nowMs);
+      priority =
+        raw && typeof raw === 'object'
+          ? { criticalCount: raw.criticalCount || 0, highCount: raw.highCount || 0 }
+          : null;
+    } catch {
+      priority = null;
+    }
+    if (priority === null) {
+      warnings.push(
+        `priority unavailable for ${repoName} (glab/gh missing or timeout) — ranked on staleness×readiness only`,
+      );
+    }
+
+    // STALENESS.
+    let staleDays;
+    try {
+      const d = await deps.staleDaysFor(repoRoot, nowMs);
+      staleDays = typeof d === 'number' && Number.isFinite(d) && d >= 0 ? d : STALENESS_CAP_DAYS;
+    } catch {
+      staleDays = STALENESS_CAP_DAYS;
+    }
+
+    // READINESS — CI status. A degraded probe result ("state unknown") is
+    // NON-BLOCKING but not INVISIBLE: it scores like `null`, and reports why.
+    // Declared WITHOUT an initialiser on purpose: both paths below assign, and
+    // a `= null` seed would quietly re-create a fall-through "absent" default.
+    let ciStatus;
+    let ciDegraded;
+    let ciPhase;
+    try {
+      ({ ciStatus, ciDegraded, ciPhase } = normalizeCiSignal(await deps.checkCiStatus({ repoRoot })));
+    } catch {
+      // A THROWING dep is not measured ABSENCE. Leaving `ciDegraded` at null
+      // here re-created the exact collapse `normalizeCiSignal` exists to
+      // prevent: the ranking silently proceeded as if no CI signal existed,
+      // when in truth the probe broke. Scoring is unchanged (`'unknown'` is
+      // non-blocking) — only the reason becomes visible.
+      ciStatus = 'unknown';
+      ciDegraded = 'probe-threw';
+    }
+    if (ciDegraded) {
+      warnings.push(
+        `CI state unknown for ${repoName} (${ciDegraded}) — ranked without CI dampening`,
+      );
+    }
+
+    const signals = {
+      priority,
+      staleDays,
+      readiness: {
+        ciStatus,
+        resourceVerdict,
+        // Key OMITTED when the CI state was readable — a strict `toEqual` on
+        // `signals.readiness` must not have to know about a field that only
+        // exists on the failure path.
+        ...(ciDegraded ? { ciDegraded } : {}),
+        ...(ciPhase ? { ciPhase } : {}),
+      },
+    };
+    const score = scoreCandidate(signals);
+
+    rows.push({ candidate, score, signals });
+  }
+
+  rows.sort((a, b) => {
+    if (b.score !== a.score) return b.score - a.score;
+    if (b.signals.staleDays !== a.signals.staleDays) {
+      return b.signals.staleDays - a.signals.staleDays;
+    }
+    const an = a.candidate?.repoName ?? '';
+    const bn = b.candidate?.repoName ?? '';
+    return an < bn ? -1 : an > bn ? 1 : 0;
+  });
+
+  return { ranked: rows, warnings };
+}

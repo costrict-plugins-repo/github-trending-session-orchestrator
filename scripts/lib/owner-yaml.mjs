@@ -1,0 +1,1259 @@
+/**
+ * owner-yaml.mjs — owner.yaml schema, validator, parser, writer (Issue #161, D1).
+ *
+ * Implements the public Owner Persona Layer API: schema validation, disk I/O,
+ * and sensible defaults. This module IS the live owner-config surface — the
+ * richer D2-era schema (`owner-config.mjs`, with `schema-version`, `metadata`,
+ * and extended fields) was removed on 2026-09-09; this module's D1 surface
+ * from the #161 epic is now the only one.
+ *
+ * ── Schema (schema-version: 1) ───────────────────────────────────────────────
+ *
+ *   owner:
+ *     name: string                           (required, non-empty)
+ *     language: 'de' | 'en'                  (required)
+ *   tone:
+ *     style: 'direct' | 'neutral' | 'friendly'  (required)
+ *     tonality: string                           (optional, free text)
+ *   efficiency:
+ *     output-level: 'lite' | 'full' | 'ultra'   (required)
+ *     preamble: 'minimal' | 'verbose'            (required)
+ *   hardware-sharing:
+ *     enabled: boolean                           (required)
+ *     hash-salt: string                          (required when enabled=true)
+ *   paths:                  (optional; host-local path overrides — #653)
+ *     vault-dir: string          ('' = no override; mirrors Session Config vault-integration.vault-dir)
+ *     baseline-path: string      ('' = no override; maps to Session Config plan-baseline-path / projects-baseline)
+ *     namespace-map-path: string ('' = no override; #725 D5 — points at a host-local JSON
+ *                                  { "real-slug": "pseudonym-slug" } map that vault-mirror uses to
+ *                                  give owner-leaky repos stable pseudonyms instead of collapsing
+ *                                  them all to 'redacted-repo'. Never committed; env SO_NAMESPACE_MAP overrides.)
+ *     confidential-names-file: string ('' = no override; #728a — points at a host-local FLAT JSON
+ *                                  array-of-strings ["customer-name", "private-repo", …] the
+ *                                  owner-leakage scanner's CP11 rule matches against tracked files.
+ *                                  The names live in the referenced file ONLY — NEVER inline in
+ *                                  owner.yaml. Never committed; env SO_CONFIDENTIAL_NAMES_FILE overrides.)
+ *     projects-root: string ('' = no override; #1562 — host-local cross-repo confinement / scan
+ *                                  root, default ~/Projects. A leading ~ expands to the home
+ *                                  directory; a value that is not absolute after expansion is
+ *                                  ignored with a WARN by getConfinementRoot (config/cross-repo.mjs).
+ *                                  Never committed; env SO_PROJECTS_ROOT overrides.)
+ *   dispatcher:             (optional; host-local cross-repo dispatcher autonomy override — #679)
+ *     autonomy: string      ('' = no override; resolver enum off | advisory | autonomous-gated;
+ *                            precedence env SO_DISPATCHER_AUTONOMY > this > committed > off)
+ *   vault-integration:      (optional; host-local switch for the vault-integration gate — SO#1448)
+ *     enabled: boolean      (false = off on this host; true is ignored — the host may not enable)
+ *     mode: 'off' | 'warn' | 'strict'  (applied only when weaker than the committed mode;
+ *                            precedence env SO_VAULT_INTEGRATION > this > committed.
+ *                            An invalid value drops ONLY this section, see loadOwnerConfig)
+ *   learnings:              (optional; host-local learnings-store role — #1516)
+ *     store-role: 'writer' | 'inbox'  (absent = writer; inbox = this host only appends
+ *                            to learnings-inbox.jsonl and never rewrites learnings.jsonl.
+ *                            precedence env SO_LEARNINGS_STORE_ROLE > this > writer.
+ *                            An empty `learnings:` is absent. An invalid value or any
+ *                            other key drops ONLY this section, see loadOwnerConfig;
+ *                            the store-role resolver then reads the role as invalid and
+ *                            canonical-store writes refuse — it never falls back to writer)
+ *     inbox-repos: string[]  (optional; #1754 — repo roots, each absolute or `~/`-prefixed,
+ *                            whose stores are inbox on this host while every other repo
+ *                            keeps store-role. precedence env SO_LEARNINGS_STORE_ROLE >
+ *                            store inside a listed root > store-role > writer. A non-list,
+ *                            or an entry that is empty, relative, non-string or carries
+ *                            NUL/CR/LF, drops the section like an invalid store-role)
+ *   hooks:                  (optional; host-local hook profile — #1881)
+ *     profile: 'strict' | 'full' | 'standard' | 'relaxed'  (absent = standard; `full` =
+ *                            legacy alias of strict; `relaxed` blocks only irreversible
+ *                            rules (#2090). precedence env SO_HOOK_PROFILE > this >
+ *                            standard, see hooks/_lib/profile-gate.mjs. minimal/off are env-only)
+ *     disabled: string[]     (hook names switched off on this host; unioned with env
+ *                            SO_DISABLED_HOOKS; never a safety hook. An invalid value or
+ *                            any other key drops ONLY this section, see loadOwnerConfig)
+ *   notifications:          (optional; per-user notification switches — #1936)
+ *     stop: boolean          (false = on-stop sends no OSC 9/777 desktop notification;
+ *                            on/off/1/0 accepted, see parseSwitch. absent = true.
+ *                            precedence env SO_STOP_NOTIFICATION > this > true. An
+ *                            invalid value or any other key drops ONLY this section)
+ *   agent-caps:             (optional; host-local agent caps and memory brake)
+ *     process-starting, reading: number | 'off'   (keys and values: config/agent-caps.mjs,
+ *     brake-engage-pct: number | 'off'             precedence env > this > Session Config >
+ *     brake-release-pct: number                    default. A bad value warns and is skipped;
+ *                            any other key drops ONLY this section)
+ *   drift-check:            (optional; host-local path exceptions — #937)
+ *     foreign-host-prefixes: string[] (narrow absolute directory prefixes;
+ *                            missing matching paths warn, unmatched paths error)
+ *   vault-dirs:             (optional list; per-directory vault-dir — agents/vault#319)
+ *     - path: string                       (the vault directory)
+ *       match: { path-prefix: string }     (required; cwd directory prefix, first match wins)
+ *       name: string                       (optional label, defaults to path)
+ *                            precedence env SO_VAULT_DIR > this > paths.vault-dir > committed
+ *
+ * ── Exports ───────────────────────────────────────────────────────────────────
+ *
+ *   resolvePrivateConfigDir({env}?) — THE host-private config dir resolver (#1223)
+ *   resolveOwnerYamlPath(env?) — owner.yaml path, resolved at CALL time (#1223)
+ *   validateOwnerSections(obj) — pure validation, no I/O; bucketed per section (#820)
+ *   validateOwnerConfig(obj)   — pure validation, no I/O; thin wrapper over validateOwnerSections
+ *   loadOwnerConfig({path?})   — reads file; per-section tolerance for OPTIONAL
+ *                                sections (paths/dispatcher/vault-integration/drift-check/learnings/hooks/
+ *                                notifications/agent-caps/vaults/baselines/vault-dirs) — #820
+ *   writeOwnerConfig(config, {path?}) — validates, writes YAML, creates dir
+ *   getDefaults()              — returns sensible default config object
+ *   parseSwitch(value)         — on/off reader for SO_STOP_NOTIFICATION + notifications.stop (#1936)
+ *
+ * ── Zero bare-specifier imports (GH#62/#63, GitLab #1230) ────────────────────
+ *
+ * `js-yaml` is resolved LAZILY inside {@link loadOwnerConfig} / {@link
+ * writeOwnerConfig} (see {@link getYaml}), never at module load. Importing this
+ * module therefore costs `node:fs` + `node:path` + `node:module` and nothing
+ * else, which is what keeps it safe on the hook import graph: before this
+ * change, `import yaml from 'js-yaml'` at the top of this file crashed FOUR
+ * hooks with `ERR_MODULE_NOT_FOUND` for anyone whose `node_modules` was absent
+ * (on-session-start, on-session-end, post-edit-validate,
+ * skill-invocation-telemetry — measured 2026-09-06 over a `hooks/` + `scripts/`
+ * copy with no `node_modules`, 4 of 27 hooks rc=1).
+ *
+ * When the package cannot be resolved both entry points DEGRADE rather than
+ * throw: they return their normal shape plus `reason: 'yaml-parser-missing'`
+ * (`source: 'defaults'` / `written: false`) and emit ONE rate-limited stderr
+ * WARN naming `npm install` as the fix.
+ */
+
+import { readFileSync, writeFileSync, mkdirSync, existsSync, chmodSync } from 'node:fs';
+import { join, dirname, isAbsolute } from 'node:path';
+import { createRequire } from 'node:module';
+import { resolvePrivateConfigDir } from './config/private-config-dir.mjs';
+import { yamlHasDocument } from './yaml-has-document.mjs';
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/** Basename of the owner persona config file. */
+const OWNER_YAML_FILE = 'owner.yaml';
+
+// ---------------------------------------------------------------------------
+// Lazy js-yaml resolution (GH#62/#63, GitLab #1230)
+// ---------------------------------------------------------------------------
+
+/**
+ * Memoised `js-yaml` module, or `false` once resolution has failed.
+ * `null` = not yet attempted.
+ * @type {null | false | { load: Function, dump: Function }}
+ */
+let _yaml = null;
+
+/** Guards the one-per-process stderr WARN below. */
+let _yamlWarned = false;
+
+/**
+ * Resolve `js-yaml` at CALL time instead of at import time (GH#62/#63).
+ *
+ * WHY `createRequire` and not `await import('js-yaml')`: every caller of
+ * {@link loadOwnerConfig} consumes it SYNCHRONOUSLY. Measured 2026-09-09 with
+ * `rg -n --glob '!tests/**' 'loadOwnerConfig\(' scripts hooks skills` (minus
+ * this file itself — this is the sole loader now, no other async homonym
+ * exists): 8 call sites, all synchronous — `rg 'await\s+loadOwnerConfig'`
+ * over the same scope returns ZERO. All eight read `loadOwnerConfig().config`
+ * (`hooks/on-session-start.mjs:639`, `hooks/skill-invocation-telemetry.mjs:155`,
+ * `scripts/telemetry.mjs:81,130`, `scripts/vault-mirror.mjs:444`,
+ * `scripts/lib/telemetry/sync.mjs:513,643`, and
+ * `skills/session-start/references/phase-6-7-memory-banner-telemetry-consent.md:53`).
+ * `writeOwnerConfig` is likewise sync at its single call site,
+ * `scripts/lib/owner-interview.mjs:228`.
+ *
+ * Making either loader async would be a breaking change to all of them; a lazy
+ * `require()` keeps the sync contract and only fails at CALL time — where the
+ * failure is catchable — instead of at module load, where it is not.
+ *
+ * @returns {{ load: Function, dump: Function } | null} the module, or `null`
+ *   when `node_modules` is absent / the package cannot be resolved.
+ */
+function getYaml() {
+  if (_yaml !== null) return _yaml === false ? null : _yaml;
+  try {
+    _yaml = createRequire(import.meta.url)('js-yaml');
+  } catch {
+    _yaml = false;
+  }
+  return _yaml === false ? null : _yaml;
+}
+
+/**
+ * Emit the one-per-process actionable WARN for a missing `js-yaml`. Kept to a
+ * SINGLE line and rate-limited to once per process, mirroring the GH#63
+ * degradation contract `hooks/on-stop.mjs` already satisfies: a missing package
+ * must never be louder than the fix it asks for.
+ */
+function warnYamlMissing() {
+  if (_yamlWarned) return;
+  _yamlWarned = true;
+  console.warn(
+    "WARN owner-yaml: 'js-yaml' is not installed — owner.yaml cannot be parsed or written; " +
+      "using defaults. Run 'npm install' in the plugin directory to restore it.",
+  );
+}
+
+/**
+ * Re-export of the single host-private-config-dir resolver (#1223).
+ *
+ * The implementation lives in the ZERO-IMPORT leaf
+ * `scripts/lib/config/private-config-dir.mjs`, NOT here: `host-identity.mjs`
+ * sits on `hooks/on-stop.mjs`'s import subgraph (via `session-lock.mjs`), and
+ * this module statically imports `js-yaml`. While the resolver lived here,
+ * importing it from `host-identity.mjs` dragged `js-yaml` onto THAT subgraph and
+ * broke the GH#63 "degrade gracefully without node_modules" contract
+ * (`ERR_MODULE_NOT_FOUND` in `tests/hooks/on-stop.test.mjs`).
+ *
+ * As of GitLab #1230 (2026-09-06) THIS module is no longer a bare-specifier node
+ * on that graph either: the `js-yaml` import it used to carry statically is now
+ * lazy (see {@link getYaml}), so the four hooks that reach this file —
+ * on-session-start, on-session-end, post-edit-validate,
+ * skill-invocation-telemetry — load without `node_modules` instead of dying with
+ * ERR_MODULE_NOT_FOUND. Keep it that way: any NEW static bare import added here
+ * re-breaks all four at once, in a file whose own unit tests would never notice
+ * (the repo always has `node_modules`).
+ *
+ * NOTE for `tests/husky/pre-commit-owner-leakage.test.mjs`: that test copies
+ * the CP11 import chain FILE BY FILE into a tmp repo, so the leaf below is on
+ * its copied-file list. Any FURTHER repo-local import added here needs the same
+ * treatment.
+ */
+export { resolvePrivateConfigDir };
+
+/**
+ * Resolve the owner.yaml path at CALL time via the single private-config-dir
+ * resolver {@link resolvePrivateConfigDir} (#1223). Honours
+ * `SO_CONFIG_HOME` > `XDG_CONFIG_HOME` > homedir, each trimmed.
+ *
+ * @param {Record<string, string|undefined>} [env] — env source (default `process.env`)
+ * @returns {string} absolute path to owner.yaml
+ */
+export function resolveOwnerYamlPath(env = process.env) {
+  return join(resolvePrivateConfigDir({ env }), OWNER_YAML_FILE);
+}
+
+const VALID_LANGUAGES = /** @type {const} */ (['de', 'en']);
+const VALID_TONE_STYLES = /** @type {const} */ (['direct', 'neutral', 'friendly']);
+const VALID_OUTPUT_LEVELS = /** @type {const} */ (['lite', 'full', 'ultra']);
+const VALID_PREAMBLE_LEVELS = /** @type {const} */ (['minimal', 'verbose']);
+
+/**
+ * REQUIRED sections (#820) — an invalid entry here keeps the legacy
+ * whole-file-discard behaviour of `loadOwnerConfig` unchanged.
+ */
+const REQUIRED_SECTIONS = /** @type {const} */ (['owner', 'tone', 'efficiency', 'hardware-sharing']);
+
+/**
+ * OPTIONAL object sections (#820) — a malformed entry is replaced by its
+ * `getDefaults()` value and reported via `droppedSections` + a stderr WARN,
+ * but does NOT discard the rest of the file.
+ *
+ * Exported (#1262.4) as the SSOT for consumers that must iterate exactly these
+ * sections — currently `scripts/lib/owner-config-banner.mjs`, which derived the
+ * #1244 "survived a whole-file discard" set from a hand-mirrored local copy.
+ * Frozen so a consumer cannot mutate the shared array.
+ *
+ * `vault-integration` has no `getDefaults()` entry: absent means "no host
+ * override", so a dropped section simply leaves the committed gate in force.
+ * `learnings` (#1516) likewise has none: absent means the `writer` role.
+ * `hooks` (#1881) has none either: absent means the default hook profile.
+ * `notifications` (#1936) has none: absent means every notification stays on.
+ * `agent-caps` has none: absent means no host override.
+ */
+export const OPTIONAL_OBJECT_SECTIONS = /** @type {const} */ (
+  Object.freeze(['paths', 'dispatcher', 'vault-integration', 'drift-check', 'learnings', 'hooks', 'notifications', 'agent-caps'])
+);
+
+/**
+ * OPTIONAL list sections (#820) — malformed entries are passed through
+ * UNTOUCHED (their consumers run a lenient parse-at-point-of-use pass —
+ * `parseNamedVaults`/`parseBaselines` — that already drops bad entries with
+ * its own WARN). Surfaced here only via `sectionWarnings`, never dropped.
+ */
+const OPTIONAL_LIST_SECTIONS = /** @type {const} */ (['vaults', 'baselines', 'vault-dirs']);
+
+/** Host-settable vault-integration modes (mirrors VAULT_MODE_VALUES in config-schema.mjs). */
+const VALID_VAULT_INTEGRATION_MODES = ['off', 'warn', 'strict'];
+
+/**
+ * Host-settable learnings-store roles (#1516). Mirrors STORE_ROLES in
+ * learnings/store-role.mjs — duplicated, not imported, because this module is
+ * on the hook import graph and must stay import-light.
+ */
+const VALID_LEARNINGS_STORE_ROLES = ['writer', 'inbox'];
+
+/**
+ * Host-settable hook profiles and the hooks owner.yaml may not disable (#1881).
+ * Mirror OWNER_PROFILES / SAFETY_HOOKS in hooks/_lib/profile-gate.mjs —
+ * duplicated, not imported, because the gate loads this module;
+ * tests/hooks/profile-gate.test.mjs pins the parity. `minimal`, `off` and a
+ * safety hook stay env-only: an agent can append to this file.
+ */
+const VALID_HOOK_PROFILES = ['strict', 'full', 'standard', 'relaxed'];
+const SAFETY_HOOKS = [
+  'pre-bash-destructive-guard',
+  'enforce-scope',
+  'enforce-commands',
+  'pre-bash-sessions-ledger-guard',
+  'pre-edit-sessions-ledger-guard',
+  'config-protection',
+  'pre-task-scope-disjoint',
+  'pre-bash-staging-fence',
+  'codex-apply-patch-guard',
+];
+
+/** A hook name as `SO_DISABLED_HOOKS` takes it: a hook file stem. */
+const HOOK_NAME_RE = /^[a-z0-9][a-z0-9-]*$/i;
+
+/** Keys of the `agent-caps` section. Mirrors AGENT_CAP_KEYS in config/agent-caps.mjs (import-light, as above). */
+const VALID_AGENT_CAP_KEYS = ['process-starting', 'reading', 'brake-engage-pct', 'brake-release-pct'];
+
+const SWITCH_ON = ['true', 'on', '1', 'yes'];
+const SWITCH_OFF = ['false', 'off', '0', 'no'];
+
+/**
+ * Read an on/off switch as env `SO_STOP_NOTIFICATION` or owner.yaml
+ * `notifications.stop` carries it (#1936). One parser for both tiers, so
+ * `stop: off` — which YAML reads as the STRING "off", not a boolean — means
+ * off: a strict boolean check would drop the section and keep the
+ * notification on, silently ignoring exactly the user who tried to switch it
+ * off.
+ *
+ * @param {unknown} value
+ * @returns {boolean|undefined} undefined = unset or unreadable (next tier decides)
+ */
+export function parseSwitch(value) {
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'number') return value === 1 ? true : value === 0 ? false : undefined;
+  if (typeof value !== 'string') return undefined;
+  const v = value.trim().toLowerCase();
+  if (SWITCH_ON.includes(v)) return true;
+  if (SWITCH_OFF.includes(v)) return false;
+  return undefined;
+}
+
+/** Canonical validation-order — MUST match the pre-#820 inline validation order. */
+const SECTION_ORDER = /** @type {const} */ ([
+  ...REQUIRED_SECTIONS,
+  ...OPTIONAL_OBJECT_SECTIONS,
+  ...OPTIONAL_LIST_SECTIONS,
+]);
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function isPlainObject(v) {
+  return v !== null && typeof v === 'object' && !Array.isArray(v);
+}
+
+// ---------------------------------------------------------------------------
+// Defaults
+// ---------------------------------------------------------------------------
+
+/**
+ * Returns the sensible default owner config. `owner.name` is left as an empty
+ * string — callers (e.g. D2 bootstrap) must fill it in from user input.
+ *
+ * @returns {object}
+ */
+export function getDefaults() {
+  return {
+    owner: {
+      name: '',
+      language: 'en',
+    },
+    tone: {
+      style: 'neutral',
+      tonality: '',
+    },
+    efficiency: {
+      'output-level': 'full',
+      preamble: 'minimal',
+    },
+    'hardware-sharing': {
+      enabled: false,
+      'hash-salt': '',
+    },
+    paths: {
+      'vault-dir': '',
+      'baseline-path': '',
+      'namespace-map-path': '',
+      'confidential-names-file': '',
+      'projects-root': '',
+    },
+    dispatcher: {
+      autonomy: '',
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Validation
+// ---------------------------------------------------------------------------
+
+/**
+ * Validate a raw owner config object, bucketed per top-level section (#820).
+ * Pure function — never throws, never reads or writes any file. Reuses the
+ * EXACT validation rules `validateOwnerConfig` has always applied; only the
+ * bucketing is new, so error message text and (within a section) ordering
+ * are unchanged.
+ *
+ * @param {unknown} obj
+ * @returns {{ sections: Record<string, { valid: boolean, errors: string[] }>, errors: string[] }}
+ */
+export function validateOwnerSections(obj) {
+  if (!isPlainObject(obj)) {
+    return { sections: {}, errors: ['config must be a plain object'] };
+  }
+
+  const sections = {};
+
+  // ── owner ──────────────────────────────────────────────────────────────────
+  {
+    const errors = [];
+    const owner = obj.owner;
+    if (!isPlainObject(owner)) {
+      errors.push('owner must be an object');
+    } else {
+      if (typeof owner.name !== 'string' || owner.name.trim().length === 0) {
+        errors.push('owner.name is required and must be a non-empty string');
+      }
+      if (!VALID_LANGUAGES.includes(owner.language)) {
+        errors.push(
+          `owner.language must be one of ${VALID_LANGUAGES.join(', ')}, got: ${JSON.stringify(owner.language)}`,
+        );
+      }
+    }
+    sections.owner = { valid: errors.length === 0, errors };
+  }
+
+  // ── tone ───────────────────────────────────────────────────────────────────
+  {
+    const errors = [];
+    const tone = obj.tone;
+    if (!isPlainObject(tone)) {
+      errors.push('tone must be an object');
+    } else {
+      if (!VALID_TONE_STYLES.includes(tone.style)) {
+        errors.push(
+          `tone.style must be one of ${VALID_TONE_STYLES.join(', ')}, got: ${JSON.stringify(tone.style)}`,
+        );
+      }
+      // tonality is optional; if present must be a string
+      if (tone.tonality !== undefined && tone.tonality !== null && typeof tone.tonality !== 'string') {
+        errors.push('tone.tonality must be a string or absent');
+      }
+    }
+    sections.tone = { valid: errors.length === 0, errors };
+  }
+
+  // ── efficiency ─────────────────────────────────────────────────────────────
+  {
+    const errors = [];
+    const efficiency = obj.efficiency;
+    if (!isPlainObject(efficiency)) {
+      errors.push('efficiency must be an object');
+    } else {
+      if (!VALID_OUTPUT_LEVELS.includes(efficiency['output-level'])) {
+        errors.push(
+          `efficiency.output-level must be one of ${VALID_OUTPUT_LEVELS.join(', ')}, got: ${JSON.stringify(efficiency['output-level'])}`,
+        );
+      }
+      if (!VALID_PREAMBLE_LEVELS.includes(efficiency.preamble)) {
+        errors.push(
+          `efficiency.preamble must be one of ${VALID_PREAMBLE_LEVELS.join(', ')}, got: ${JSON.stringify(efficiency.preamble)}`,
+        );
+      }
+    }
+    sections.efficiency = { valid: errors.length === 0, errors };
+  }
+
+  // ── hardware-sharing ───────────────────────────────────────────────────────
+  {
+    const errors = [];
+    const hw = obj['hardware-sharing'];
+    if (!isPlainObject(hw)) {
+      errors.push('hardware-sharing must be an object');
+    } else {
+      if (typeof hw.enabled !== 'boolean') {
+        errors.push(`hardware-sharing.enabled must be a boolean, got: ${typeof hw.enabled}`);
+      }
+      // hash-salt is required when enabled=true
+      if (hw.enabled === true) {
+        if (typeof hw['hash-salt'] !== 'string' || hw['hash-salt'].length === 0) {
+          errors.push('hardware-sharing.hash-salt is required (non-empty string) when hardware-sharing.enabled is true');
+        }
+      }
+      // if present and non-empty, must be a string
+      if (
+        hw['hash-salt'] !== undefined &&
+        hw['hash-salt'] !== null &&
+        hw['hash-salt'] !== '' &&
+        typeof hw['hash-salt'] !== 'string'
+      ) {
+        errors.push('hardware-sharing.hash-salt must be a string');
+      }
+    }
+    sections['hardware-sharing'] = { valid: errors.length === 0, errors };
+  }
+
+  // Host-local exception list only; invalid entries drop the entire section.
+  {
+    const errors = [];
+    const drift = obj['drift-check'];
+    if (drift !== undefined && drift !== null) {
+      if (!isPlainObject(drift)) {
+        errors.push('drift-check must be an object when present');
+      } else if (drift['foreign-host-prefixes'] !== undefined) {
+        const prefixes = drift['foreign-host-prefixes'];
+        if (!Array.isArray(prefixes)) {
+          errors.push('drift-check.foreign-host-prefixes must be an array');
+        } else {
+          for (const prefix of prefixes) {
+            const parts = typeof prefix === 'string' ? prefix.split('/').filter(Boolean) : [];
+            if (typeof prefix !== 'string' || !prefix.startsWith('/') ||
+                !/^\/[A-Za-z0-9._/-]+$/.test(prefix) || prefix.includes('//') ||
+                parts.some((part) => part === '.' || part === '..') ||
+                parts.length < 3 || (['Users', 'home'].includes(parts[0]) && parts.length < 4)) {
+              errors.push('drift-check.foreign-host-prefixes entries must be narrow absolute directory prefixes (no roots, home directories, traversal or globs)');
+            }
+          }
+        }
+      }
+    }
+    sections['drift-check'] = { valid: errors.length === 0, errors };
+  }
+
+  // ── paths (optional; host-local path overrides — #653) ───────────────────────
+  {
+    const errors = [];
+    const paths = obj.paths;
+    if (paths !== undefined && paths !== null) {
+      if (!isPlainObject(paths)) {
+        errors.push('paths must be an object when present');
+      } else {
+        for (const key of ['vault-dir', 'baseline-path', 'namespace-map-path', 'confidential-names-file', 'projects-root']) {
+          const v = paths[key];
+          if (v !== undefined && v !== null && typeof v !== 'string') {
+            errors.push(`paths.${key} must be a string`);
+          }
+        }
+      }
+    }
+    sections.paths = { valid: errors.length === 0, errors };
+  }
+
+  // ── dispatcher (optional; host-local dispatcher autonomy override — #679) ─────
+  // Loose validation only (mirrors `paths`): the resolver enum-validates the
+  // value (resolveDispatcherAutonomy in config/dispatcher-autonomy.mjs), so an
+  // invalid string here falls through to the next precedence tier rather than
+  // failing the whole owner.yaml load.
+  {
+    const errors = [];
+    const dispatcher = obj.dispatcher;
+    if (dispatcher !== undefined && dispatcher !== null) {
+      if (!isPlainObject(dispatcher)) {
+        errors.push('dispatcher must be an object when present');
+      } else if (
+        dispatcher.autonomy !== undefined &&
+        dispatcher.autonomy !== null &&
+        typeof dispatcher.autonomy !== 'string'
+      ) {
+        errors.push('dispatcher.autonomy must be a string');
+      }
+    }
+    sections.dispatcher = { valid: errors.length === 0, errors };
+  }
+
+  // ── vault-integration (optional; host-local gate switch — SO#1448) ──────────
+  // STRICT enum validation, unlike `dispatcher`: a typo like `mode: of` must not
+  // fall through to the committed `strict` silently while the operator believes
+  // the host is off. An invalid section is dropped (and reported) on its own —
+  // `paths` and every other section survive (#820 per-section tolerance).
+  {
+    const errors = [];
+    const vi = obj['vault-integration'];
+    if (vi !== undefined && vi !== null) {
+      if (!isPlainObject(vi)) {
+        errors.push('vault-integration must be an object when present');
+      } else {
+        if (vi.enabled !== undefined && vi.enabled !== null && typeof vi.enabled !== 'boolean') {
+          errors.push(`vault-integration.enabled must be a boolean, got: ${typeof vi.enabled}`);
+        }
+        if (
+          vi.mode !== undefined &&
+          vi.mode !== null &&
+          !VALID_VAULT_INTEGRATION_MODES.includes(vi.mode)
+        ) {
+          errors.push(
+            `vault-integration.mode must be one of ${VALID_VAULT_INTEGRATION_MODES.join(', ')}, got: ${JSON.stringify(vi.mode)}`,
+          );
+        }
+      }
+    }
+    sections['vault-integration'] = { valid: errors.length === 0, errors };
+  }
+
+  // ── learnings (optional; host-local store role — #1516) ─────────────────────
+  // STRICT enum like vault-integration: an invalid `learnings` section (typo
+  // `store-role: inbx`) is dropped here like any optional section. The store-
+  // role resolver (learnings/store-role.mjs) checks droppedSections and
+  // treats present-but-dropped as `invalid`, so canonical-store writes refuse
+  // instead of the host silently staying a writer that rewrites a synced store.
+  {
+    const errors = [];
+    const lr = obj.learnings;
+    if (lr !== undefined && lr !== null) {
+      if (!isPlainObject(lr)) {
+        errors.push('learnings must be an object when present');
+      } else {
+        // A misspelt key (`store_role: inbox`) must not read as "store-role
+        // absent" and fall back to writer (#1686): any key but `store-role`
+        // invalidates the section, so the resolver reports the role invalid.
+        for (const key of Object.keys(lr)) {
+          if (key !== 'store-role' && key !== 'inbox-repos') {
+            errors.push(
+              `learnings has unknown key ${JSON.stringify(key)} (only store-role and inbox-repos are allowed)`,
+            );
+          }
+        }
+        // inbox-repos (#1754): repo roots whose stores are inbox on this host.
+        // Every entry must be absolute or `~/`-prefixed — a relative entry
+        // would resolve against whatever cwd the writer runs in. A bad entry
+        // invalidates the whole section (fail-closed), never just that entry.
+        const repos = lr['inbox-repos'];
+        if (repos !== undefined && repos !== null) {
+          if (!Array.isArray(repos)) {
+            errors.push('learnings.inbox-repos must be a list of repo-root paths');
+          } else {
+            repos.forEach((entry, i) => {
+              if (typeof entry !== 'string' || entry.trim() === '') {
+                errors.push(`learnings.inbox-repos[${i}] must be a non-empty string`);
+              } else if (/[\0\r\n]/.test(entry)) {
+                errors.push(`learnings.inbox-repos[${i}] must not contain NUL, CR or LF`);
+              } else if (entry !== entry.trim()) {
+                errors.push(`learnings.inbox-repos[${i}] must not contain leading or trailing whitespace`);
+              } else if (!isAbsolute(entry) && !entry.startsWith('~/')) {
+                errors.push(
+                  `learnings.inbox-repos[${i}] must be absolute or start with ~/, got: ${JSON.stringify(entry)}`,
+                );
+              }
+            });
+          }
+        }
+        if (
+          lr['store-role'] !== undefined &&
+          lr['store-role'] !== null &&
+          !VALID_LEARNINGS_STORE_ROLES.includes(lr['store-role'])
+        ) {
+          errors.push(
+            `learnings.store-role must be one of ${VALID_LEARNINGS_STORE_ROLES.join(', ')}, got: ${JSON.stringify(lr['store-role'])}`,
+          );
+        }
+      }
+    }
+    sections.learnings = { valid: errors.length === 0, errors };
+  }
+
+  // ── hooks (optional; host-local hook profile — #1881) ──────────────────────
+  // STRICT like learnings: a misspelt key (`profil: strict`) must not read as
+  // "profile absent", so any key but profile/disabled invalidates the section
+  // and the default profile applies.
+  {
+    const errors = [];
+    const hk = obj.hooks;
+    if (hk !== undefined && hk !== null) {
+      if (!isPlainObject(hk)) {
+        errors.push('hooks must be an object when present');
+      } else {
+        for (const key of Object.keys(hk)) {
+          if (key !== 'profile' && key !== 'disabled') {
+            errors.push(`hooks has unknown key ${JSON.stringify(key)} (only profile and disabled are allowed)`);
+          }
+        }
+        if (hk.profile !== undefined && hk.profile !== null && !VALID_HOOK_PROFILES.includes(hk.profile)) {
+          errors.push(
+            `hooks.profile must be one of ${VALID_HOOK_PROFILES.join(', ')}, got: ${JSON.stringify(hk.profile)}`,
+          );
+        }
+        const disabled = hk.disabled;
+        if (disabled !== undefined && disabled !== null) {
+          if (!Array.isArray(disabled)) {
+            errors.push('hooks.disabled must be a list of hook names');
+          } else {
+            disabled.forEach((entry, i) => {
+              if (typeof entry !== 'string' || !HOOK_NAME_RE.test(entry)) {
+                errors.push(`hooks.disabled[${i}] must be a hook name like pre-bash-templates-first`);
+              } else if (SAFETY_HOOKS.includes(entry.toLowerCase())) {
+                errors.push(`hooks.disabled[${i}] names the safety hook ${entry}, which only SO_DISABLED_HOOKS can switch off`);
+              }
+            });
+          }
+        }
+      }
+    }
+    sections.hooks = { valid: errors.length === 0, errors };
+  }
+
+  // ── notifications (optional; per-user notification switches — #1936) ──────
+  // STRICT on keys like hooks: `stopp: false` must not read as "stop absent"
+  // and leave the notification on without a word. Values go through
+  // parseSwitch, the same reader the hook uses.
+  {
+    const errors = [];
+    const nt = obj.notifications;
+    if (nt !== undefined && nt !== null) {
+      if (!isPlainObject(nt)) {
+        errors.push('notifications must be an object when present');
+      } else {
+        for (const key of Object.keys(nt)) {
+          if (key !== 'stop') {
+            errors.push(`notifications has unknown key ${JSON.stringify(key)} (only stop is allowed)`);
+          }
+        }
+        if (nt.stop !== undefined && nt.stop !== null && parseSwitch(nt.stop) === undefined) {
+          errors.push(`notifications.stop must be true or false (or on/off), got: ${JSON.stringify(nt.stop)}`);
+        }
+      }
+    }
+    sections.notifications = { valid: errors.length === 0, errors };
+  }
+
+  // ── agent-caps (optional; host-local agent caps and memory brake) ────────
+  // STRICT on keys: `proces-starting: 2` must not read as "absent" and leave
+  // the default in force without a word. Values are judged by the resolver
+  // (config/agent-caps.mjs), which warns per value and keeps the other keys.
+  {
+    const errors = [];
+    const ac = obj['agent-caps'];
+    if (ac !== undefined && ac !== null) {
+      if (!isPlainObject(ac)) {
+        errors.push('agent-caps must be an object when present');
+      } else {
+        for (const key of Object.keys(ac)) {
+          if (!VALID_AGENT_CAP_KEYS.includes(key)) {
+            errors.push(`agent-caps has unknown key ${JSON.stringify(key)} (allowed: ${VALID_AGENT_CAP_KEYS.join(', ')})`);
+          }
+        }
+      }
+    }
+    sections['agent-caps'] = { valid: errors.length === 0, errors };
+  }
+
+  // ── vaults (optional; N named vaults for walk-up resolution — #700) ──────────
+  // Drop-and-WARN on malformed entries is handled by parseNamedVaults() in
+  // named-vault-resolver.mjs. Here we only validate the container shape to
+  // prevent clearly invalid config from passing silently.
+  // Absent or null → backward-compat no-op (no validation errors).
+  {
+    const errors = [];
+    const vaults = obj.vaults;
+    if (vaults !== undefined && vaults !== null) {
+      if (!Array.isArray(vaults)) {
+        errors.push('vaults must be an array when present');
+      } else {
+        for (let i = 0; i < vaults.length; i++) {
+          const entry = vaults[i];
+          if (entry === null || entry === undefined) {
+            errors.push(`vaults[${i}] must not be null`);
+            continue;
+          }
+          if (!isPlainObject(entry)) {
+            errors.push(`vaults[${i}] must be an object`);
+            continue;
+          }
+          // Required string fields: name, suffix, root
+          for (const field of ['name', 'suffix', 'root']) {
+            if (typeof entry[field] !== 'string' || entry[field].trim() === '') {
+              errors.push(`vaults[${i}].${field} must be a non-empty string`);
+            }
+          }
+          // Optional match sub-object
+          if (entry.match !== undefined && entry.match !== null) {
+            if (!isPlainObject(entry.match)) {
+              errors.push(`vaults[${i}].match must be an object when present`);
+            } else if (
+              entry.match['org-prefix'] !== undefined &&
+              typeof entry.match['org-prefix'] !== 'string'
+            ) {
+              errors.push(`vaults[${i}].match.org-prefix must be a string`);
+            }
+          }
+        }
+      }
+    }
+    sections.vaults = { valid: errors.length === 0, errors };
+  }
+
+  // ── baselines (optional; N named plan-baselines for per-context resolution — #819) ──
+  // Cousin of vaults: above. Drop-and-WARN on malformed entries is handled by
+  // parseBaselines() in named-baseline-resolver.mjs; here we validate the container
+  // + entry shape to prevent clearly invalid config from passing silently.
+  // Divergences from vaults: the match key is `path-prefix` (a local FILESYSTEM
+  // directory tree, not a git-remote org slug), `path` replaces root+suffix, and
+  // `match` is REQUIRED (a baseline with no path-prefix can never be selected).
+  // Absent or null → backward-compat no-op (no validation errors).
+  {
+    const errors = [];
+    const baselines = obj.baselines;
+    if (baselines !== undefined && baselines !== null) {
+      if (!Array.isArray(baselines)) {
+        errors.push('baselines must be an array when present');
+      } else {
+        for (let i = 0; i < baselines.length; i++) {
+          const entry = baselines[i];
+          if (entry === null || entry === undefined) {
+            errors.push(`baselines[${i}] must not be null`);
+            continue;
+          }
+          if (!isPlainObject(entry)) {
+            errors.push(`baselines[${i}] must be an object`);
+            continue;
+          }
+          // Required string fields: name, path
+          for (const field of ['name', 'path']) {
+            if (typeof entry[field] !== 'string' || entry[field].trim() === '') {
+              errors.push(`baselines[${i}].${field} must be a non-empty string`);
+            }
+          }
+          // Required match sub-object with a non-empty path-prefix string.
+          if (!isPlainObject(entry.match)) {
+            errors.push(`baselines[${i}].match must be an object`);
+          } else if (
+            typeof entry.match['path-prefix'] !== 'string' ||
+            entry.match['path-prefix'].trim() === ''
+          ) {
+            errors.push(`baselines[${i}].match.path-prefix must be a non-empty string`);
+          }
+        }
+      }
+    }
+    sections.baselines = { valid: errors.length === 0, errors };
+  }
+
+  // ── vault-dirs (optional; per-directory vault-dir — agents/vault#319) ────────
+  // Same entry shape as baselines: (and parsed by the same parseBaselines() with
+  // section 'vault-dirs'), except `name` is optional. List section: surfaced via
+  // sectionWarnings, never dropped — the resolver drops bad entries itself.
+  {
+    const errors = [];
+    const vaultDirs = obj['vault-dirs'];
+    if (vaultDirs !== undefined && vaultDirs !== null) {
+      if (!Array.isArray(vaultDirs)) {
+        errors.push('vault-dirs must be an array when present');
+      } else {
+        for (let i = 0; i < vaultDirs.length; i++) {
+          const entry = vaultDirs[i];
+          if (!isPlainObject(entry)) {
+            errors.push(`vault-dirs[${i}] must be an object`);
+            continue;
+          }
+          if (typeof entry.path !== 'string' || entry.path.trim() === '') {
+            errors.push(`vault-dirs[${i}].path must be a non-empty string`);
+          }
+          if (
+            entry.name !== undefined &&
+            entry.name !== null &&
+            (typeof entry.name !== 'string' || entry.name.trim() === '')
+          ) {
+            errors.push(`vault-dirs[${i}].name must be a non-empty string when present`);
+          }
+          if (!isPlainObject(entry.match)) {
+            errors.push(`vault-dirs[${i}].match must be an object`);
+          } else if (
+            typeof entry.match['path-prefix'] !== 'string' ||
+            entry.match['path-prefix'].trim() === ''
+          ) {
+            errors.push(`vault-dirs[${i}].match.path-prefix must be a non-empty string`);
+          }
+        }
+      }
+    }
+    sections['vault-dirs'] = { valid: errors.length === 0, errors };
+  }
+
+  const errors = SECTION_ORDER.flatMap((name) => sections[name].errors);
+  return { sections, errors };
+}
+
+/**
+ * Validate a raw owner config object. Pure function — never throws, never reads
+ * or writes any file. Thin wrapper over `validateOwnerSections` (#820) —
+ * preserves the original `{ valid, errors }` contract unchanged.
+ *
+ * @param {unknown} obj
+ * @returns {{ valid: boolean, errors: string[] }}
+ */
+export function validateOwnerConfig(obj) {
+  const { errors } = validateOwnerSections(obj);
+  return { valid: errors.length === 0, errors };
+}
+
+// ---------------------------------------------------------------------------
+// Loader
+// ---------------------------------------------------------------------------
+
+/**
+ * Load owner.yaml from disk. Returns defaults when the file is absent or
+ * contains invalid content, populating `errors` in the latter case.
+ *
+ * Per-section tolerance (#820): an invalid REQUIRED section (owner, tone,
+ * efficiency, hardware-sharing) still discards the whole file (legacy
+ * behaviour, unchanged). An invalid OPTIONAL object section (paths,
+ * dispatcher, vault-integration, drift-check, learnings) is instead replaced by its default value — the rest of the
+ * file survives, `source` becomes `'partial'`, and the drop is reported via
+ * `droppedSections` + a stderr WARN. OPTIONAL list sections (vaults,
+ * baselines, vault-dirs) are passed through UNTOUCHED even when strict-invalid — their
+ * consumers already run a lenient parse-at-point-of-use pass — and are
+ * surfaced only via `sectionWarnings` (never dropped, never counted towards
+ * `'partial'`).
+ *
+ * MERGE RULE for the whole-file discard (GitLab #1244). The discard returns
+ * `getDefaults()` — but a VALID optional object section is merged back on top
+ * of its default (`{...defaults[name], ...parsed[name]}`), key by key. `source`
+ * stays `'defaults'` and `errors` still carries every required-section error,
+ * so no existing caller's branch changes; what changes is that a host-local
+ * path the operator DID declare correctly is no longer thrown away because an
+ * unrelated section (e.g. `tone:`) is malformed. That silent loss was a
+ * fail-OPEN path for the owner-leakage scanner's CP11 rule: a partial
+ * owner.yaml carrying only `owner:` + `paths.confidential-names-file:` made the
+ * scanner report PASS while matching nothing. An INVALID optional section is
+ * still replaced by its default and is now reported via `droppedSections` on
+ * this branch too (previously only on the required-valid branch), so a consumer
+ * can tell "not configured" from "configured but unusable".
+ *
+ * Defensive — never throws.
+ *
+ * When `js-yaml` cannot be resolved (no `node_modules`), returns defaults with
+ * `source: 'defaults'`, `reason: 'yaml-parser-missing'` and one explanatory
+ * entry in `errors` — never throws, never crashes the importing hook (GH#62/#63).
+ * When the file exists but cannot be turned into an object at all (unreadable,
+ * YAML syntax error, non-mapping top level) the same shape is returned with
+ * `reason: 'unparseable'`: in that state NOTHING about the file's contents is
+ * knowable, which is the distinction CP11 needs in order to fail CLOSED rather
+ * than assume "nothing configured".
+ *
+ * Dropped sections report rawKeys for mapping entries with non-null values
+ * (blank strings are omitted). Values themselves are never copied into rawKeys.
+ *
+ * @param {{ path?: string }} [opts]
+ * @returns {{
+ *   config: object,
+ *   source: 'file'|'defaults'|'partial',
+ *   errors: string[],
+ *   reason?: 'yaml-parser-missing'|'unparseable',
+ *   droppedSections?: Array<{ section: string, errors: string[], rawKeys: string[] }>,
+ *   sectionWarnings?: Array<{ section: string, errors: string[] }>,
+ * }}
+ *
+ * SEC-008 (SO#1785): `hardware-sharing.hash-salt` is a per-host secret. The
+ * returned config carries it as a NON-enumerable accessor, so JSON.stringify,
+ * util.inspect (default and `%o`/showHidden), object spread, Object.keys/entries
+ * and structuredClone of the result no longer print or copy it, while
+ * `cfg['hardware-sharing']['hash-salt']` and validateOwnerConfig(cfg) still
+ * read it. A YAML parse error names line and column only — never js-yaml's
+ * reason or source snippet, both of which can quote owner.yaml text.
+ * CEILING (BV-004): direct property access, `inspect(x, { showHidden: true,
+ * getters: true })` and calling the `get` of Object.getOwnPropertyDescriptor(s)
+ * still reveal the salt by design (readers need it). {@link hideHashSalt} must
+ * stay the single exit point — revisit if a return path is added that bypasses
+ * this wrapper.
+ */
+export function loadOwnerConfig(opts = {}) {
+  const result = loadOwnerConfigUnredacted(opts);
+  hideHashSalt(result.config);
+  return result;
+}
+
+/**
+ * Make `hardware-sharing.hash-salt` a non-enumerable accessor in place
+ * (SEC-008, SO#1785). An accessor, not a data property: util.inspect with
+ * `showHidden` (what `%o` uses) prints hidden DATA values, but shows a hidden
+ * accessor as `[Getter/Setter]` unless `getters: true` is passed. Only ever
+ * called on objects loadOwnerConfig built for this call (a fresh parse or a
+ * fresh getDefaults()), so no shared object is mutated.
+ *
+ * @param {object} config
+ */
+function hideHashSalt(config) {
+  const hw = isPlainObject(config) ? config['hardware-sharing'] : undefined;
+  if (!isPlainObject(hw) || !Object.prototype.hasOwnProperty.call(hw, 'hash-salt')) return;
+  let salt = hw['hash-salt'];
+  Object.defineProperty(hw, 'hash-salt', {
+    get() {
+      return salt;
+    },
+    set(v) {
+      salt = v;
+    },
+    enumerable: false,
+    configurable: true,
+  });
+}
+
+/** Describe a rejected optional section using the original parsed mapping. */
+function describeDroppedSection(section, errors, raw) {
+  const rawKeys = isPlainObject(raw)
+    ? Object.entries(raw)
+      .filter(([, value]) =>
+        value !== undefined && value !== null && (typeof value !== 'string' || value.trim() !== '')
+      )
+      .map(([key]) => key)
+    : [];
+  return { section, errors, rawKeys };
+}
+
+/**
+ * Body of {@link loadOwnerConfig} before the salt is hidden. Internal: every
+ * caller goes through the exported wrapper.
+ *
+ * @param {{ path?: string }} opts
+ */
+function loadOwnerConfigUnredacted(opts) {
+  const filePath = opts.path ?? resolveOwnerYamlPath();
+
+  if (!existsSync(filePath)) {
+    return { config: getDefaults(), source: 'defaults', errors: [] };
+  }
+
+  let raw;
+  try {
+    raw = readFileSync(filePath, 'utf8');
+  } catch (err) {
+    return {
+      config: getDefaults(),
+      source: 'defaults',
+      reason: 'unparseable',
+      errors: [`failed to read owner.yaml: ${err.message}`],
+    };
+  }
+
+  const yaml = getYaml();
+  if (!yaml) {
+    warnYamlMissing();
+    return {
+      config: getDefaults(),
+      source: 'defaults',
+      reason: 'yaml-parser-missing',
+      errors: [
+        "yaml-parser-missing: 'js-yaml' is not installed, so owner.yaml could not be parsed (run 'npm install' in the plugin directory)",
+      ],
+    };
+  }
+
+  let parsed;
+  try {
+    // js-yaml 5 (#2015): a source without a document throws; keep the v4 'not a mapping' path.
+    parsed = yamlHasDocument(raw) ? yaml.load(raw) : undefined;
+  } catch (err) {
+    return {
+      config: getDefaults(),
+      source: 'defaults',
+      reason: 'unparseable',
+      errors: [describeYamlError(err)],
+    };
+  }
+
+  if (!isPlainObject(parsed)) {
+    return {
+      config: getDefaults(),
+      source: 'defaults',
+      reason: 'unparseable',
+      errors: ['owner.yaml must contain a YAML mapping at the top level'],
+    };
+  }
+
+  const { sections, errors: allErrors } = validateOwnerSections(parsed);
+
+  // Any REQUIRED section invalid → whole-file discard (#820), EXCEPT that a
+  // VALID optional object section is merged back onto its default (#1244 — see
+  // the MERGE RULE in the JSDoc above). `source` stays 'defaults' and `errors`
+  // is unchanged, so every existing caller branch is untouched; only the
+  // discarded-but-valid `paths:`/`dispatcher:` keys survive, which is what stops
+  // CP11 from going silently inert on a partial owner.yaml.
+  const requiredInvalid = REQUIRED_SECTIONS.some((name) => !sections[name]?.valid);
+  if (requiredInvalid) {
+    const discardConfig = getDefaults();
+    const discardDropped = [];
+    for (const name of OPTIONAL_OBJECT_SECTIONS) {
+      const sec = sections[name];
+      if (sec?.valid && isPlainObject(parsed[name])) {
+        discardConfig[name] = { ...discardConfig[name], ...parsed[name] };
+      } else if (sec && !sec.valid) {
+        // Present but malformed — already replaced by its default above. Report
+        // it so a consumer can distinguish "not configured" from "unusable".
+        discardDropped.push(describeDroppedSection(name, sec.errors, parsed[name]));
+      }
+    }
+    // `vault-dirs:` (agents/vault#319) survives the discard too, raw — exactly as
+    // on the required-valid branch below; parseBaselines() drops bad entries at
+    // point-of-use. Dropping it would hand a repo under a declared prefix the
+    // host-wide `paths.vault-dir` (which DOES survive above): the silent vault
+    // override #319 exists to prevent, triggered by an unrelated `tone:` typo.
+    if (parsed['vault-dirs'] !== undefined && parsed['vault-dirs'] !== null) {
+      discardConfig['vault-dirs'] = parsed['vault-dirs'];
+    }
+    const discardResult = { config: discardConfig, source: 'defaults', errors: allErrors };
+    if (discardDropped.length > 0) discardResult.droppedSections = discardDropped;
+    return discardResult;
+  }
+
+  // All REQUIRED sections valid — tolerate malformed OPTIONAL sections instead
+  // of discarding the whole file (#820).
+  const defaults = getDefaults();
+  const config = { ...parsed };
+  const droppedSections = [];
+  const sectionWarnings = [];
+
+  for (const name of OPTIONAL_OBJECT_SECTIONS) {
+    const sec = sections[name];
+    if (sec && !sec.valid) {
+      // A section without a default (vault-integration) is removed, not set to
+      // `undefined`: js-yaml's dump rejects undefined values on a write-back.
+      if (defaults[name] === undefined) delete config[name];
+      else config[name] = defaults[name];
+      droppedSections.push(describeDroppedSection(name, sec.errors, parsed[name]));
+      const firstError = sec.errors[0] ?? 'invalid section';
+      console.warn(
+        `WARN owner-yaml: dropping owner.yaml section "${name}" (${firstError}); using defaults`,
+      );
+    }
+  }
+
+  for (const name of OPTIONAL_LIST_SECTIONS) {
+    const sec = sections[name];
+    if (sec && !sec.valid) {
+      // Raw pass-through — deliberate defense-in-depth; parseNamedVaults()/
+      // parseBaselines() run their own lenient drop-and-WARN at point-of-use.
+      sectionWarnings.push({ section: name, errors: sec.errors });
+      const firstError = sec.errors[0] ?? 'invalid entries';
+      console.warn(
+        `WARN owner-yaml: owner.yaml section "${name}" has invalid entries (${firstError}); ` +
+          'lenient consumers will drop bad entries at point-of-use',
+      );
+    }
+  }
+
+  const result = {
+    config,
+    source: droppedSections.length > 0 ? 'partial' : 'file',
+    errors: allErrors,
+  };
+  if (droppedSections.length > 0) result.droppedSections = droppedSections;
+  if (sectionWarnings.length > 0) result.sectionWarnings = sectionWarnings;
+  return result;
+}
+
+/**
+ * Describe a js-yaml load failure by position only (SEC-008, SO#1785):
+ * YAMLException.message appends a code-frame snippet of the source lines, and
+ * `reason` itself interpolates source text at many js-yaml sites (e.g.
+ * `unidentified alias "<name>"`, `unknown tag !<<tag>>`, some unquoted), so a
+ * salt starting with `*` or `!` would be echoed. Neither is used; only the
+ * 0-based `mark.line`/`mark.column`, reported 1-based.
+ *
+ * @param {unknown} err
+ * @returns {string}
+ */
+function describeYamlError(err) {
+  const mark = err?.mark;
+  if (Number.isInteger(mark?.line) && Number.isInteger(mark?.column)) {
+    return `YAML parse error at line ${mark.line + 1}, column ${mark.column + 1}`;
+  }
+  return 'YAML parse error';
+}
+
+/**
+ * Return `config` unchanged, or — when its `hardware-sharing.hash-salt` is an
+ * own non-enumerable property (the accessor from {@link hideHashSalt}) — a
+ * shallow copy whose salt VALUE is an enumerable data property again, so
+ * yaml.dump writes it.
+ *
+ * @param {object} config
+ * @returns {object}
+ */
+function withEnumerableHashSalt(config) {
+  const hw = config['hardware-sharing'];
+  if (!isPlainObject(hw)) return config;
+  const desc = Object.getOwnPropertyDescriptor(hw, 'hash-salt');
+  if (!desc || desc.enumerable) return config;
+  return { ...config, 'hardware-sharing': { ...hw, 'hash-salt': hw['hash-salt'] } };
+}
+
+// ---------------------------------------------------------------------------
+// Writer
+// ---------------------------------------------------------------------------
+
+/**
+ * Validate `config` and write it as YAML to disk. Creates parent directories
+ * if they do not exist. Validates before writing — returns errors without
+ * touching the filesystem when validation fails.
+ *
+ * Synchronous. Defensive — never throws.
+ *
+ * When `js-yaml` cannot be resolved (no `node_modules`), returns
+ * `{ written: false, reason: 'yaml-parser-missing', errors: [...] }` — the file
+ * is left untouched rather than half-written (GH#62/#63).
+ *
+ * A config returned by loadOwnerConfig carries `hardware-sharing.hash-salt` as
+ * a non-enumerable property (SEC-008, SO#1785). yaml.dump only sees enumerable
+ * keys, so such a config is dumped from a shallow copy with the salt made
+ * enumerable again — otherwise a load→write round trip would silently drop the
+ * salt. The caller's object is not mutated.
+ *
+ * @param {object} config
+ * @param {{ path?: string }} [opts]
+ * @returns {{ written: boolean, errors: string[], reason?: 'yaml-parser-missing' }}
+ */
+export function writeOwnerConfig(config, opts = {}) {
+  const filePath = opts.path ?? resolveOwnerYamlPath();
+
+  const validation = validateOwnerConfig(config);
+  if (!validation.valid) {
+    return { written: false, errors: validation.errors };
+  }
+
+  const dir = dirname(filePath);
+  try {
+    // 0o700 on every level this call creates: under umask 000 (WSL default) a
+    // bare mkdir left the private config dir 0777, and check-owner-leakage then
+    // refuses every owner policy beside it (#1629). An EXISTING dir keeps its mode.
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+  } catch (err) {
+    return {
+      written: false,
+      errors: [`failed to create directory ${dir}: ${err.message}`],
+    };
+  }
+
+  const yaml = getYaml();
+  if (!yaml) {
+    warnYamlMissing();
+    return {
+      written: false,
+      reason: 'yaml-parser-missing',
+      errors: [
+        "yaml-parser-missing: 'js-yaml' is not installed, so owner.yaml could not be written (run 'npm install' in the plugin directory)",
+      ],
+    };
+  }
+
+  let yamlStr;
+  try {
+    yamlStr = yaml.dump(withEnumerableHashSalt(config), { lineWidth: 120, noRefs: true });
+  } catch (err) {
+    return { written: false, errors: [`failed to serialise config to YAML: ${err.message}`] };
+  }
+
+  try {
+    writeFileSync(filePath, yamlStr, { encoding: 'utf8', mode: 0o600 });
+    // mode only applies on creation; an owner.yaml left 0666 by an older
+    // writer would stay rewritable by other users (paths.*, salt) (#1632).
+    try { chmodSync(filePath, 0o600); } catch { /* best effort */ }
+  } catch (err) {
+    return { written: false, errors: [`failed to write owner.yaml: ${err.message}`] };
+  }
+
+  return { written: true, errors: [] };
+}

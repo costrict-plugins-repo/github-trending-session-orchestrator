@@ -1,0 +1,22 @@
+---
+name: wave-executor
+description: Use this skill when executing the agreed session plan in waves with role-based execution and parallel subagents. Handles inter-wave quality checks, plan adaptation, and progress tracking. Core orchestration engine for feature and deep sessions. Triggered by /go command.
+metadata:
+  user-invocable: "false"
+  tags: orchestration, execution, agents, waves
+  model: inherit
+  model-preference: opus
+  model-preference-codex: gpt-6.2-sol
+  model-preference-cursor: claude-sonnet-4-6
+---
+
+# wave-executor
+
+> **Portable mirror — generated, do not edit.** The canonical workflow lives at
+> [`skills/wave-executor/SKILL.md`](../../../skills/wave-executor/SKILL.md); read that file for the full instructions.
+> This mirror carries only agentskills.io-spec-legal frontmatter so harnesses that
+> discover skills under `.agents/skills/` can find and route to the skill.
+>
+> Regenerate with `node scripts/generate-agents-skills.mjs`.
+
+Read the linked document in full and follow its complete workflow, including prechecks and stop conditions. Resolve its link relative to this SKILL.md, not the project working directory. The plugin root is three directories above this file. Resolve package paths such as `skills/` and `scripts/` from that root and relative links in the canonical document from its own directory. Keep the user’s project as the target of project operations.

@@ -1,0 +1,827 @@
+import { existsSync, readFileSync, statSync } from 'node:fs';
+import { resolve, sep } from 'node:path';
+
+const MANIFEST_KEYS = new Set([
+  'name',
+  'version',
+  'description',
+  'keywords',
+  'skills',
+  'commands',
+  'mcpServers',
+  'apps',
+  'hooks',
+  'interface',
+]);
+
+const INTERFACE_KEYS = new Set([
+  'displayName',
+  'shortDescription',
+  'longDescription',
+  'developerName',
+  'category',
+  'capabilities',
+  'websiteUrl',
+  'websiteURL',
+  'privacyPolicyUrl',
+  'privacyPolicyURL',
+  'termsOfServiceUrl',
+  'termsOfServiceURL',
+  // #1930: the OpenAI plugin directory asks for a support contact page
+  // (developers.openai.com/plugins/deploy/submission-errors, read 2026-11-03).
+  'supportUrl',
+  'supportURL',
+  'defaultPrompt',
+  'brandColor',
+  'composerIcon',
+  'logo',
+  'logoDark',
+  'screenshots',
+]);
+
+const REQUIRED_CODEX_EVENTS = [
+  'SessionStart',
+  'PreToolUse',
+  'PostToolUse',
+  'SubagentStart',
+  'SubagentStop',
+  'Stop',
+  'SessionEnd',
+];
+
+/**
+ * Every hook event the Codex runtime knows, MEASURED — not quoted from release
+ * notes. Read out of the `codex` binary shipped as codex-cli **0.144.4**
+ * (`@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex`,
+ * 2026-09-06), which embeds one JSON Schema pair per event:
+ *
+ *   strings -a <codex> | grep '"title": "'
+ *     -> pre-tool-use / post-tool-use / permission-request / pre-compact
+ *        / post-compact / session-start / subagent-start / subagent-stop
+ *        / user-prompt-submit / stop   .command.{input,output}   (10 pairs)
+ *
+ * The same binary carries the manifest deserializer's key list
+ * (`PreToolUse PermissionRequest PostToolUse PreCompact PostCompact
+ * SessionStart SubagentStart SubagentStop` + the substring-deduped `Stop` /
+ * `UserPromptSubmit`) directly beside its `unexpected map key` error string —
+ * so an event key outside this set is rejected, and rejecting one key rejects
+ * the manifest that carries it.
+ *
+ * **`SessionEnd` was NOT in it at 0.144.4, and `Interrupt` still is not in
+ * this set.** Re-measured 2026-11-02 on codex-cli 0.160.1: both exist now
+ * (the binary embeds `session-end.command.input` and `interrupt.command.{input,
+ * output}`, 12 events in all), and `SessionEnd` fires at the end of a
+ * `codex exec` run with `{session_id, transcript_path (null when ephemeral),
+ * cwd, hook_event_name, reason: "other"}` and no `source` key. `SessionEnd` is
+ * therefore wired since #1919, which raises the Codex minimum to **0.160**:
+ * 0.144.4 rejects the key (and with it the whole manifest), 0.160.1 fires it,
+ * and the first version in between that accepts it is UNMEASURED — the 0.160
+ * floor is the measured one, not a tight one. `Interrupt` stays out: it is
+ * unmeasured as a firing event and nothing here handles it. Async hooks
+ * (0.148+) are still unmeasured; re-measure against the shipped binary before
+ * widening this set, never against a changelog.
+ */
+export const CODEX_NATIVE_EVENTS = new Set([
+  'SessionStart',
+  'UserPromptSubmit',
+  'PreToolUse',
+  'PermissionRequest',
+  'PostToolUse',
+  'PreCompact',
+  'PostCompact',
+  'SubagentStart',
+  'SubagentStop',
+  'Stop',
+  'SessionEnd',
+]);
+
+/**
+ * Claude hook events this repo wires that Codex (0.160 minimum) has no counterpart for.
+ * DERIVED from {@link CODEX_NATIVE_EVENTS} rather than hand-listed, so a new
+ * Claude event is forbidden on Codex by construction until someone measures it
+ * into the native set above.
+ */
+const FORBIDDEN_CODEX_EVENTS = new Set(
+  ['SessionEnd', 'PostToolUseFailure', 'PostToolBatch', 'CwdChanged', 'Interrupt']
+    .filter((event) => !CODEX_NATIVE_EVENTS.has(event)),
+);
+
+/**
+ * The tool-name vocabulary Codex puts in `tool_name`, measured at 0.144.4 from
+ * the same binary. This is the load-bearing incompatibility, and it is NOT the
+ * one the older comments in `check-hooks-symmetry.mjs` claimed.
+ *
+ * `pre-tool-use.command.input` REQUIRES `tool_name` and `tool_input` (alongside
+ * `cwd`, `hook_event_name`, `model`, `permission_mode`, `session_id`,
+ * `tool_use_id`, `transcript_path`, `turn_id`) — so the payload fields ARE
+ * delivered. What differs is their VALUES: Codex has no `Bash`, `Edit`, `Write`
+ * or `MultiEdit` tool (`strings -a <codex> | grep -c '"Bash"'` -> 0). Every
+ * PreToolUse guard in `hooks/` opens with an equality gate on one of those four
+ * names and returns `emitAllow()` otherwise, so wiring one here yields a
+ * handler that runs, matches nothing, and allows everything — false
+ * enforcement, which is worse than a registered gap.
+ *
+ * The adapter this actually needs is a tool-name MAP (shell/exec_command/
+ * unified_exec -> Bash, apply_patch -> Edit/Write), not a payload bridge.
+ *
+ * PARTLY REFUTED for the shell tool (#1669), measured 2026-10-20 on
+ * codex-cli 0.160.1 with a logging PreToolUse hook under `codex exec`: the
+ * hook payload of a shell call carries `"tool_name":"Bash"` and
+ * `"tool_input":{"command":"<string>"}` — Codex already maps its shell tool to
+ * the Claude name at the hook boundary. These names are the MODEL-facing tool
+ * vocabulary, not the hook `tool_name` values. Bash-gated handlers need no
+ * map; the apply_patch -> Edit/Write side was not re-measured.
+ *
+ * #1913 (2026-11-01): the Edit/Write PreToolUse guards are reached on Codex
+ * through the adapter `hooks/codex-apply-patch-guard.mjs` (matcher
+ * `apply_patch`), which parses the patch and runs each guard as a child process
+ * on a synthesized Edit/Write payload per touched file. The `apply_patch`
+ * payload shape is derived from binary strings and a contributor report, not
+ * from a logged payload (see `scripts/lib/codex/apply-patch-parse.mjs`).
+ */
+export const CODEX_TOOL_NAMES = Object.freeze([
+  'shell',
+  'exec_command',
+  'unified_exec',
+  'apply_patch',
+  'update_plan',
+  'view_image',
+]);
+
+/**
+ * Hook handlers that read an Edit/Write `tool_input.file_path` payload. Codex
+ * emits `apply_patch` payloads of a different shape, so wiring one of these
+ * DIRECTLY into hooks-codex.json produces a handler that silently never fires.
+ * The PreToolUse ones (enforce-scope, config-protection) run on Codex through
+ * `hooks/codex-apply-patch-guard.mjs` instead (#1913); the PostToolUse ones have
+ * no adapter. Exported so the contract test can assert the census rather than
+ * re-list it.
+ */
+export const DISALLOWED_EDIT_HANDLERS = [
+  'enforce-scope.mjs',
+  'config-protection.mjs',
+  'post-edit-validate.mjs',
+  'post-tooluse-frontend-slop.mjs',
+  'post-edit-import-probe.mjs',
+];
+
+/**
+ * Manifest `timeout` (seconds) of every Codex PreToolUse handler. Codex counts
+ * it from the moment it starts the hook, and a hook it kills ends as Failed —
+ * the tool call then runs unguarded. An external tester measured on Windows 11
+ * with codex-cli 0.167.0: at 5 s, 74 of 81 PreToolUse hook starts ended Failed;
+ * with the same manifest at 30 s, 97 of 99 completed and blocked. 15 s is a
+ * mitigation between the two, NOT measured on Windows by this project; on
+ * macOS the Bash guards finish in about 90–110 ms, so the ceiling costs nothing
+ * there, while a hung guard still stalls a tool call for at most 15 s instead
+ * of 30. The manifest format has no per-platform timeout (only `command` and
+ * `commandWindows` differ), so the value is shared. `BUDGET_MS` in
+ * hooks/codex-apply-patch-guard.mjs must stay below it. Revisit trigger: a
+ * Windows run at 15 s with Failed PreToolUse starts, or a Codex release with a
+ * per-platform timeout field.
+ */
+export const CODEX_PRE_TOOL_USE_TIMEOUT_S = 15;
+
+const CODEX_HOOK_WRAPPER_COMMAND =
+  /^SO_PLATFORM=codex CODEX_PLUGIN_ROOT="\$\{PLUGIN_ROOT\}" sh "\$\{PLUGIN_ROOT\}\/hooks\/run-node\.sh"(?: --fail-closed)? "\$\{PLUGIN_ROOT\}\/hooks\/([A-Za-z0-9_-]+(?:\/[A-Za-z0-9_-]+)*\.mjs)"$/;
+
+/**
+ * Parse the exact trusted Codex hook wrapper grammar.
+ *
+ * @param {unknown} command
+ * @returns {{handlerRelativePath: string} | null}
+ */
+export function parseCodexHookWrapperCommand(command) {
+  if (typeof command !== 'string') return null;
+  const match = command.match(CODEX_HOOK_WRAPPER_COMMAND);
+  return match ? { handlerRelativePath: match[1] } : null;
+}
+
+// Native Windows entry (#1849): the POSIX wrapper above fails under cmd.exe,
+// which Codex uses for hooks on Windows (`%COMSPEC% /C`, codex-rs
+// hooks/src/engine/command_runner.rs @26ad281f). Every handler therefore also
+// carries a `commandWindows` of exactly this shape: the `set` stops cmd.exe
+// from finding a `node` planted in the session directory before PATH, and the
+// bootstrap loads hooks/codex-win.cjs only from an absolute PLUGIN_ROOT.
+const CODEX_HOOK_WINDOWS_COMMAND =
+  /^set NoDefaultCurrentDirectoryInExePath=1&& node -e "require\(require\('path'\)\.join\(require\('path'\)\.isAbsolute\(process\.env\.PLUGIN_ROOT\|\|''\)\?process\.env\.PLUGIN_ROOT:process\.exit\(1\),'hooks','codex-win\.cjs'\)\)" ([A-Za-z0-9_-]+(?:\/[A-Za-z0-9_-]+)*\.mjs)$/;
+
+/**
+ * Parse the exact trusted native-Windows Codex hook command grammar (#1849).
+ *
+ * @param {unknown} command
+ * @returns {{handlerRelativePath: string} | null}
+ */
+export function parseCodexHookWindowsCommand(command) {
+  if (typeof command !== 'string') return null;
+  const match = command.match(CODEX_HOOK_WINDOWS_COMMAND);
+  return match ? { handlerRelativePath: match[1] } : null;
+}
+
+/**
+ * Validate the tracked Codex plugin manifest and hook surface.
+ *
+ * @param {{pluginRoot: string, expectedBaseVersion: string}} options
+ * @returns {{ok: boolean, errors: Array<{path: string, rule: string, message: string}>}}
+ */
+export function validateCodexPluginContract({ pluginRoot, expectedBaseVersion }) {
+  const errors = [];
+  const root = resolve(String(pluginRoot ?? ''));
+
+  if (typeof pluginRoot !== 'string' || pluginRoot.trim() === '') {
+    addError(errors, '$.pluginRoot', 'non-empty-string', 'pluginRoot must be a non-empty string');
+    return { ok: false, errors };
+  }
+  if (typeof expectedBaseVersion !== 'string' || expectedBaseVersion.trim() === '') {
+    addError(
+      errors,
+      '$.expectedBaseVersion',
+      'non-empty-string',
+      'expectedBaseVersion must be a non-empty string',
+    );
+  }
+
+  const manifest = readJson(
+    resolve(root, '.codex-plugin', 'plugin.json'),
+    '.codex-plugin/plugin.json',
+    errors,
+  );
+  if (manifest !== null) validateManifest(manifest, root, expectedBaseVersion, errors);
+
+  const hooksFile = readJson(
+    resolve(root, 'hooks', 'hooks-codex.json'),
+    'hooks/hooks-codex.json',
+    errors,
+  );
+  if (hooksFile !== null) validateHooksFile(hooksFile, root, expectedBaseVersion, errors);
+
+  return { ok: errors.length === 0, errors };
+}
+
+function validateManifest(manifest, root, expectedBaseVersion, errors) {
+  if (!isRecord(manifest)) {
+    addError(errors, '$.manifest', 'object', '.codex-plugin/plugin.json must contain an object');
+    return;
+  }
+
+  rejectUnknownKeys(manifest, MANIFEST_KEYS, '$.manifest', errors);
+
+  if (manifest.name !== 'session-orchestrator') {
+    addError(errors, '$.manifest.name', 'exact-value', 'name must equal "session-orchestrator"');
+  }
+  requireNonEmptyString(manifest.description, '$.manifest.description', errors);
+  validateVersion(manifest.version, expectedBaseVersion, errors);
+  validateStringArray(manifest.keywords, '$.manifest.keywords', errors, { requireNonEmpty: true });
+
+  validatePathCollection(manifest.skills, '$.manifest.skills', 'directory', root, errors, {
+    required: true,
+  });
+  // Native [] suppresses Codex's conventional commands/ fallback. Nonempty
+  // paths would register automatic aliases beside our generated skill surface.
+  if (Object.hasOwn(manifest, 'commands') && (!Array.isArray(manifest.commands) || manifest.commands.length !== 0)) {
+    addError(errors, '$.manifest.commands', 'disabled-command-discovery', 'commands must be an empty array to disable automatic command conversion');
+  }
+  validateMcpServers(manifest.mcpServers, root, errors);
+  if (manifest.apps !== undefined) {
+    validateContractPath(manifest.apps, '$.manifest.apps', 'file', root, errors);
+  }
+  validatePathCollection(manifest.hooks, '$.manifest.hooks', 'file', root, errors, {
+    required: true,
+  });
+  validateInterface(manifest.interface, root, errors);
+}
+
+function validateVersion(version, expectedBaseVersion, errors) {
+  if (typeof version !== 'string') {
+    addError(errors, '$.manifest.version', 'version', 'version must be a string');
+    return;
+  }
+
+  const match = version.match(/^([^+]+)\+codex\.(\d{14})$/);
+  if (!match) {
+    addError(
+      errors,
+      '$.manifest.version',
+      'codex-cachebuster',
+      'version must use <base>+codex.<YYYYMMDDHHmmss>',
+    );
+    return;
+  }
+
+  if (match[1] !== expectedBaseVersion) {
+    addError(
+      errors,
+      '$.manifest.version',
+      'base-version',
+      `version base '${match[1]}' must equal package version '${expectedBaseVersion}'`,
+    );
+  }
+  if (!isUtcTimestamp(match[2])) {
+    addError(
+      errors,
+      '$.manifest.version',
+      'utc-cachebuster',
+      `Codex cachebuster '${match[2]}' is not a valid UTC timestamp`,
+    );
+  }
+}
+
+function isUtcTimestamp(value) {
+  const parts = value.match(/^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})$/);
+  if (!parts) return false;
+  const [, year, month, day, hour, minute, second] = parts.map(Number);
+  const date = new Date(Date.UTC(year, month - 1, day, hour, minute, second));
+  return (
+    date.getUTCFullYear() === year &&
+    date.getUTCMonth() === month - 1 &&
+    date.getUTCDate() === day &&
+    date.getUTCHours() === hour &&
+    date.getUTCMinutes() === minute &&
+    date.getUTCSeconds() === second
+  );
+}
+
+function validateMcpServers(value, root, errors) {
+  if (value === undefined) {
+    addError(errors, '$.manifest.mcpServers', 'required', 'mcpServers is required');
+    return;
+  }
+  if (isRecord(value)) return;
+  validateContractPath(value, '$.manifest.mcpServers', 'file', root, errors);
+}
+
+function validateInterface(value, root, errors) {
+  if (!isRecord(value)) {
+    addError(errors, '$.manifest.interface', 'object', 'interface must be an object');
+    return;
+  }
+
+  rejectUnknownKeys(value, INTERFACE_KEYS, '$.manifest.interface', errors);
+  for (const key of [
+    'displayName',
+    'shortDescription',
+    'longDescription',
+    'developerName',
+    'category',
+    'brandColor',
+  ]) {
+    if (value[key] !== undefined)
+      requireNonEmptyString(value[key], `$.manifest.interface.${key}`, errors);
+  }
+  for (const key of [
+    'websiteUrl',
+    'websiteURL',
+    'privacyPolicyUrl',
+    'privacyPolicyURL',
+    'termsOfServiceUrl',
+    'termsOfServiceURL',
+    'supportUrl',
+    'supportURL',
+  ]) {
+    if (value[key] !== undefined)
+      validateHttpsUrl(value[key], `$.manifest.interface.${key}`, errors);
+  }
+  if (value.capabilities !== undefined) {
+    validateStringArray(value.capabilities, '$.manifest.interface.capabilities', errors);
+  }
+  validateDefaultPrompts(value.defaultPrompt, errors);
+
+  if (value.composerIcon === undefined) {
+    addError(
+      errors,
+      '$.manifest.interface.composerIcon',
+      'required',
+      'interface.composerIcon is required',
+    );
+  } else {
+    validateComposerIcon(value.composerIcon, root, errors);
+  }
+  for (const key of ['logo', 'logoDark']) {
+    if (value[key] !== undefined) {
+      validateContractPath(value[key], `$.manifest.interface.${key}`, 'file', root, errors);
+    }
+  }
+  if (value.screenshots !== undefined) {
+    validatePathCollection(
+      value.screenshots,
+      '$.manifest.interface.screenshots',
+      'file',
+      root,
+      errors,
+    );
+  }
+}
+
+function validateComposerIcon(value, root, errors) {
+  const path = '$.manifest.interface.composerIcon';
+  const errorCount = errors.length;
+  validateContractPath(value, path, 'file', root, errors);
+  if (errors.length !== errorCount) return;
+
+  const target = resolve(root, value.slice(2));
+  let content;
+  try {
+    content = readFileSync(target, 'utf8');
+  } catch (error) {
+    addError(
+      errors,
+      path,
+      'read-file',
+      `cannot read composerIcon file '${value}': ${error.message}`,
+    );
+    return;
+  }
+
+  const trimmed = content.trimStart();
+  if (!trimmed.startsWith('<?xml') && !trimmed.startsWith('<svg')) {
+    addError(
+      errors,
+      path,
+      'svg-content',
+      `composerIcon file '${value}' must begin with <?xml or <svg after trimming`,
+    );
+  }
+}
+
+function validateDefaultPrompts(value, errors) {
+  if (value === undefined) return;
+  const prompts = typeof value === 'string' ? [value] : value;
+  if (!Array.isArray(prompts) || prompts.length === 0 || prompts.length > 3) {
+    addError(
+      errors,
+      '$.manifest.interface.defaultPrompt',
+      'prompt-list',
+      'defaultPrompt must contain one to three strings',
+    );
+    return;
+  }
+  prompts.forEach((prompt, index) => {
+    if (typeof prompt !== 'string' || prompt.trim() === '' || [...prompt].length > 128) {
+      addError(
+        errors,
+        `$.manifest.interface.defaultPrompt[${index}]`,
+        'prompt-string',
+        'default prompts must be non-empty strings of at most 128 characters',
+      );
+    }
+  });
+}
+
+function validateHooksFile(value, root, expectedBaseVersion, errors) {
+  if (!isRecord(value)) {
+    addError(errors, '$.hooksFile', 'object', 'hooks/hooks-codex.json must contain an object');
+    return;
+  }
+
+  rejectUnknownKeys(value, new Set(['description', 'hooks']), '$.hooksFile', errors);
+  requireNonEmptyString(value.description, '$.hooksFile.description', errors);
+  if (!isRecord(value.hooks)) {
+    addError(errors, '$.hooksFile.hooks', 'object', 'hooks must be an object');
+    return;
+  }
+
+  const eventNames = Object.keys(value.hooks).sort();
+  for (const required of REQUIRED_CODEX_EVENTS) {
+    if (!Object.hasOwn(value.hooks, required)) {
+      addError(
+        errors,
+        `$.hooksFile.hooks.${required}`,
+        'required-event',
+        `required Codex event '${required}' is missing`,
+      );
+    }
+  }
+  for (const eventName of eventNames) {
+    if (FORBIDDEN_CODEX_EVENTS.has(eventName)) {
+      addError(
+        errors,
+        `$.hooksFile.hooks.${eventName}`,
+        'unsupported-event',
+        `Claude-only event '${eventName}' is unsupported by Codex 0.160`,
+      );
+    } else if (!REQUIRED_CODEX_EVENTS.includes(eventName)) {
+      addError(
+        errors,
+        `$.hooksFile.hooks.${eventName}`,
+        'unknown-event',
+        `event '${eventName}' is outside the curated Codex project surface`,
+      );
+    }
+  }
+
+  for (const eventName of REQUIRED_CODEX_EVENTS) {
+    const groups = value.hooks[eventName];
+    if (groups === undefined) continue;
+    if (!Array.isArray(groups)) {
+      addError(
+        errors,
+        `$.hooksFile.hooks.${eventName}`,
+        'array',
+        `event '${eventName}' must contain an array of matcher groups`,
+      );
+      continue;
+    }
+    groups.forEach((group, groupIndex) => {
+      validateMatcherGroup(group, eventName, groupIndex, root, expectedBaseVersion, errors);
+    });
+  }
+
+  validateSessionStartSurface(value.hooks.SessionStart, expectedBaseVersion, errors);
+}
+
+function validateSessionStartSurface(groups, expectedBaseVersion, errors) {
+  if (!Array.isArray(groups)) return;
+  const handlers = groups.flatMap((group) => (Array.isArray(group?.hooks) ? group.hooks : []));
+  const commands = handlers
+    .filter((handler) => handler?.type === 'command' && typeof handler.command === 'string')
+    .map((handler) => handler.command);
+  const expectedBanner = sessionStartBannerCommand(expectedBaseVersion);
+
+  if (!commands.includes(expectedBanner)) {
+    addError(
+      errors,
+      '$.hooksFile.hooks.SessionStart',
+      'versioned-banner',
+      `SessionStart must include the exact versioned banner for v${expectedBaseVersion}`,
+    );
+  }
+  const hasSessionStartHandler = commands.some(
+    (command) =>
+      parseCodexHookWrapperCommand(command)?.handlerRelativePath === 'on-session-start.mjs',
+  );
+  if (!hasSessionStartHandler) {
+    addError(
+      errors,
+      '$.hooksFile.hooks.SessionStart',
+      'session-start-handler',
+      'SessionStart must invoke on-session-start.mjs through run-node.sh',
+    );
+  }
+}
+
+function sessionStartBannerText(version) {
+  return `🎯 Session Orchestrator v${version} — /session [housekeeping|feature|deep] | /plan [new|feature|retro] | /discovery [scope] | /evolve [analyze|review|list]`;
+}
+
+function sessionStartBannerCommand(version) {
+  return `echo '${sessionStartBannerText(version)}'`;
+}
+
+// cmd.exe treats the banner's `|` as a pipe even inside single quotes, and its
+// `echo` writes the OEM code page, so the Windows banner prints through node
+// (#1849), with the same cwd-search guard as every handler.
+function sessionStartBannerWindowsCommand(version) {
+  return `set NoDefaultCurrentDirectoryInExePath=1&& node -e "console.log('${sessionStartBannerText(version)}')"`;
+}
+
+function validateMatcherGroup(group, eventName, groupIndex, root, expectedBaseVersion, errors) {
+  const groupPath = `$.hooksFile.hooks.${eventName}[${groupIndex}]`;
+  if (!isRecord(group)) {
+    addError(errors, groupPath, 'object', 'matcher group must be an object');
+    return;
+  }
+  if (group.matcher !== undefined && typeof group.matcher !== 'string') {
+    addError(errors, `${groupPath}.matcher`, 'string', 'matcher must be a string');
+  }
+  if (!Array.isArray(group.hooks)) {
+    addError(errors, `${groupPath}.hooks`, 'array', 'matcher group hooks must be an array');
+    return;
+  }
+  group.hooks.forEach((handler, handlerIndex) => {
+    validateHandler(
+      handler,
+      `${groupPath}.hooks[${handlerIndex}]`,
+      eventName,
+      root,
+      expectedBaseVersion,
+      errors,
+    );
+  });
+}
+
+function validateHandler(handler, path, eventName, root, expectedBaseVersion, errors) {
+  if (!isRecord(handler)) {
+    addError(errors, path, 'object', 'hook handler must be an object');
+    return;
+  }
+  if (handler.type !== 'command') {
+    addError(
+      errors,
+      `${path}.type`,
+      'synchronous-command',
+      `handler type '${String(handler.type)}' is unsupported; use 'command'`,
+    );
+    return;
+  }
+  if (handler.async === true) {
+    addError(errors, `${path}.async`, 'synchronous', 'Codex project handlers must be synchronous');
+  } else if (handler.async !== undefined && typeof handler.async !== 'boolean') {
+    addError(errors, `${path}.async`, 'boolean', 'async must be a boolean when present');
+  }
+  if (typeof handler.command !== 'string' || handler.command.trim() === '') {
+    addError(errors, `${path}.command`, 'non-empty-string', 'command must be a non-empty string');
+    return;
+  }
+
+  const command = handler.command;
+  if (eventName === 'SessionStart' && command === sessionStartBannerCommand(expectedBaseVersion)) {
+    if (handler.commandWindows !== sessionStartBannerWindowsCommand(expectedBaseVersion)) {
+      addError(
+        errors,
+        `${path}.commandWindows`,
+        'windows-entry',
+        'the banner must carry the exact native Windows banner command',
+      );
+    }
+    return;
+  }
+  const parsed = parseCodexHookWrapperCommand(command);
+  if (parsed === null) {
+    addError(
+      errors,
+      `${path}.command`,
+      'trusted-wrapper',
+      'command must exactly match the trusted Codex run-node.sh wrapper grammar',
+    );
+    return;
+  }
+
+  const { handlerRelativePath } = parsed;
+  validateWindowsEntry(handler.commandWindows, handlerRelativePath, path, root, errors);
+  if (eventName === 'PreToolUse' && handler.timeout !== CODEX_PRE_TOOL_USE_TIMEOUT_S) {
+    addError(
+      errors,
+      `${path}.timeout`,
+      'pre-tool-use-timeout',
+      `a Codex PreToolUse handler needs timeout ${CODEX_PRE_TOOL_USE_TIMEOUT_S}; a Codex kill at a shorter ceiling lets the tool call run unguarded (74 of 81 starts at 5 s on Windows)`,
+    );
+  }
+  if (DISALLOWED_EDIT_HANDLERS.includes(handlerRelativePath)) {
+    addError(
+      errors,
+      `${path}.command`,
+      'unsupported-edit-payload',
+      `${handlerRelativePath} does not support canonical Codex apply_patch payloads; Edit/Write PreToolUse guards are reached through hooks/codex-apply-patch-guard.mjs (#1913)`,
+    );
+  }
+
+  const handlerPath = resolve(root, 'hooks', handlerRelativePath);
+  if (!existsSync(handlerPath) || !safeIsType(handlerPath, 'file')) {
+    addError(
+      errors,
+      `${path}.command`,
+      'handler-file',
+      `referenced handler 'hooks/${handlerRelativePath}' must exist as a file`,
+    );
+  }
+}
+
+// Without commandWindows a handler never starts on native Windows (#1849); a
+// second, unchecked command would be an untrusted path past the wrapper rule.
+function validateWindowsEntry(commandWindows, handlerRelativePath, path, root, errors) {
+  if (typeof commandWindows !== 'string') {
+    addError(
+      errors,
+      `${path}.commandWindows`,
+      'windows-entry',
+      'every Codex handler needs a commandWindows native Windows entry (#1849)',
+    );
+    return;
+  }
+  const parsed = parseCodexHookWindowsCommand(commandWindows);
+  if (parsed === null) {
+    addError(
+      errors,
+      `${path}.commandWindows`,
+      'trusted-windows-wrapper',
+      'commandWindows must exactly match the trusted codex-win.cjs entry grammar',
+    );
+    return;
+  }
+  if (parsed.handlerRelativePath !== handlerRelativePath) {
+    addError(
+      errors,
+      `${path}.commandWindows`,
+      'windows-entry-mismatch',
+      `commandWindows starts '${parsed.handlerRelativePath}' but command starts '${handlerRelativePath}'`,
+    );
+  }
+  const launcher = resolve(root, 'hooks', 'codex-win.cjs');
+  if (!existsSync(launcher) || !safeIsType(launcher, 'file')) {
+    addError(errors, `${path}.commandWindows`, 'handler-file', "the Windows entry 'hooks/codex-win.cjs' must exist as a file");
+  }
+}
+
+function validatePathCollection(value, path, kind, root, errors, options = {}) {
+  if (value === undefined) {
+    if (options.required) addError(errors, path, 'required', `${path} is required`);
+    return;
+  }
+  const paths = Array.isArray(value) ? value : [value];
+  if (paths.length === 0) {
+    addError(errors, path, 'non-empty-paths', `${path} must contain at least one path`);
+    return;
+  }
+  paths.forEach((entry, index) => {
+    validateContractPath(
+      entry,
+      Array.isArray(value) ? `${path}[${index}]` : path,
+      kind,
+      root,
+      errors,
+    );
+  });
+}
+
+function validateContractPath(value, path, kind, root, errors) {
+  if (typeof value !== 'string' || value.trim() === '') {
+    addError(errors, path, 'path-string', `${path} must be a non-empty string path`);
+    return;
+  }
+  if (!value.startsWith('./')) {
+    addError(errors, path, 'relative-path', `${path} must start with './'`);
+    return;
+  }
+
+  const relative = value.slice(2);
+  if (relative === '' || relative.split(/[\\/]/).includes('..')) {
+    addError(errors, path, 'no-traversal', `${path} must not be './' or contain '..' traversal`);
+    return;
+  }
+
+  const target = resolve(root, relative);
+  if (target !== root && !target.startsWith(`${root}${sep}`)) {
+    addError(errors, path, 'within-plugin-root', `${path} must resolve inside pluginRoot`);
+    return;
+  }
+  if (!existsSync(target)) {
+    addError(errors, path, 'exists', `${path} target '${value}' does not exist`);
+    return;
+  }
+  if (!safeIsType(target, kind)) {
+    addError(errors, path, kind, `${path} target '${value}' must be a ${kind}`);
+  }
+}
+
+function safeIsType(path, kind) {
+  try {
+    const stats = statSync(path);
+    return kind === 'directory' ? stats.isDirectory() : stats.isFile();
+  } catch {
+    return false;
+  }
+}
+
+function validateHttpsUrl(value, path, errors) {
+  if (typeof value === 'string') {
+    try {
+      if (new URL(value).protocol === 'https:') return;
+    } catch {
+      // Report the shared validation error below.
+    }
+  }
+  addError(errors, path, 'https-url', `${path} must be an absolute https URL`);
+}
+
+function validateStringArray(value, path, errors, options = {}) {
+  if (!Array.isArray(value) || (options.requireNonEmpty && value.length === 0)) {
+    addError(errors, path, 'string-array', `${path} must be an array of strings`);
+    return;
+  }
+  value.forEach((entry, index) => {
+    if (typeof entry !== 'string' || entry.trim() === '') {
+      addError(errors, `${path}[${index}]`, 'non-empty-string', `${path} entries must be strings`);
+    }
+  });
+}
+
+function requireNonEmptyString(value, path, errors) {
+  if (typeof value !== 'string' || value.trim() === '') {
+    addError(errors, path, 'non-empty-string', `${path} must be a non-empty string`);
+  }
+}
+
+function rejectUnknownKeys(value, allowed, path, errors) {
+  for (const key of Object.keys(value).sort()) {
+    if (!allowed.has(key)) {
+      addError(errors, `${path}.${key}`, 'unknown-key', `unsupported key '${key}'`);
+    }
+  }
+}
+
+function readJson(path, label, errors) {
+  try {
+    return JSON.parse(readFileSync(path, 'utf8'));
+  } catch (error) {
+    addError(errors, label, 'read-json', `cannot read valid JSON: ${error.message}`);
+    return null;
+  }
+}
+
+function isRecord(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function addError(errors, path, rule, message) {
+  errors.push({ path, rule, message });
+}

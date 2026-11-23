@@ -1,0 +1,703 @@
+/**
+ * file-lock.mjs — shared POSIX file-lock primitive (issue #630).
+ *
+ * Consolidates the five self-contained tmp + linkSync lock implementations that
+ * had accreted across the codebase (agent-status.mjs, memory-proposals/store.mjs,
+ * and the state-lock / staging-fence / session-lock blocks of session-lock.mjs).
+ * Each copy independently re-implemented the same skeleton:
+ *
+ *   1. exclusive acquisition guard via `linkSync(tmp, lock + '.acquire')`;
+ *   2. atomic create-or-fail via `linkSync(tmp, lock)` (POSIX mutex);
+ *   3. on EEXIST → read + parse the existing body;
+ *   4. same-host + dead-PID (or unparseable) → guarded override + WARN;
+ *   5. release the acquisition guard; live/cross-host holders wait until a deadline;
+ *   6. owner-guarded primary-lock release.
+ *
+ * This module is the single home for that skeleton. It is a near-PURE primitive:
+ * it imports ONLY scripts/lib/io.mjs (for writeJsonAtomicSync), the two host
+ * identity helpers from scripts/lib/host-identity.mjs (#1072 — `os.hostname()`
+ * is not stable on a single machine), and Node stdlib.
+ * It does NOT import session-lock.mjs — instead `isPidAliveOnHost` is MOVED here
+ * and re-exported from session-lock.mjs, so the dependency edge points
+ * file-lock → io, never the reverse (no import cycle).
+ *
+ * Behavior-preservation contract (issue #630 is a PURE dedup refactor):
+ *   - Lock file paths, body shapes, timeouts, poll cadences, override channels
+ *     (console.warn vs process.stderr.write), and result-object reasons are
+ *     reproduced EXACTLY by the call-site options. The primitive carries no
+ *     opinion of its own — every divergence between the five copies is a knob.
+ *   - Cross-host locks are NEVER auto-overridden (PSA-003 hard invariant).
+ *   - Overrides always go through writeJsonAtomicSync (tmp + renameSync).
+ *   - #1284 serializes acquisition and takeover: a stale observation must not
+ *     replace a different process's newly acquired lock.
+ *   - #1285 serializes owner-guarded release with takeover: release runs its
+ *     read → owner-match → unlink under the same `${lock}.acquire` guard, so an
+ *     old holder's delayed release can never delete the lock a successor took
+ *     over after the old lease expired.
+ *
+ * Lease semantics (`staleCheck: 'mtime' | 'heartbeat'`): lease expiry prevents
+ * a STUCK lock; it does NOT protect the critical section. After `staleMs` the
+ * next acquirer takes over whether or not the old holder is still running, and
+ * neither mode renews the lease (`heartbeat` ages from `acquiredAt`, `mtime`
+ * from the file's last write). A `not-owner` release under a lease mode means
+ * YOUR lease expired during your critical section and a successor may have run
+ * concurrently — keep critical sections well below `staleMs`.
+ *
+ * No external dependencies — Node 20+ stdlib + io.mjs only.
+ */
+
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import crypto from 'node:crypto';
+
+import { writeJsonAtomicSync } from './io.mjs';
+import { hostnamesMatch, lockHostCandidate, stableHostname } from './host-identity.mjs';
+
+// ---------------------------------------------------------------------------
+// PID liveness (moved here from session-lock.mjs in #630)
+// ---------------------------------------------------------------------------
+
+/**
+ * Check whether a PID corresponds to a live process on this host.
+ * Returns true when the process exists (even if we lack kill permission).
+ * Returns false when the process does not exist (ESRCH).
+ *
+ * @forensic
+ * This is a SAME-HOST PID liveness probe (POSIX `process.kill(pid, 0)`,
+ * signal-0). It is NOT the discovery-path liveness check. Since Epic #583
+ * (W1-D1/W1-D4) the discovery decision tree uses heartbeat-age via
+ * `isLockLive` (session-lock.mjs) instead, because the `pid` recorded on a
+ * session.lock is the *ephemeral hook subprocess* PID — that process exits
+ * ~500ms after the SessionStart hook returns, so a signal-0 probe of it reports
+ * "dead" while the semantic owner (the Claude harness) is still alive (the D2
+ * production defect). Cross-host callers MUST pass `null` for the liveness slot
+ * and never call this function. Remaining same-host callers use it only for the
+ * short-lived state-lock / staging-fence-lock / agent-status / memory-proposals
+ * stale-override path, where the recorded PID IS the live writer's PID.
+ *
+ * @param {number} pid  Process ID to probe via the POSIX signal-0 trick.
+ * @returns {boolean}   true when a process with the given PID exists; false
+ *                      when no such process exists or the probe failed.
+ *
+ * @remarks
+ * PID-recycle trade-off (#560 Q3 L2 — deep-2115 session-reviewer):
+ *
+ *  - On Unix, `process.kill(pid, 0)` returns true if ANY process exists with
+ *    that PID, including a recycled one. The kernel does not distinguish the
+ *    original lock-holder from a fresh process that happens to have inherited
+ *    the same numeric PID after the lock-holder's death.
+ *  - On a long session where the lock-holder died abnormally AND the OS reused
+ *    its PID before TTL expiry, this function returns `true` even though the
+ *    original lock-holder is gone. The lock is then perceived as held by a
+ *    "live" process that is actually unrelated to the original writer.
+ *  - Impact: a stale lock waits the full TTL before being reclaimed by the
+ *    timeout path. Fail-open posture means correctness is preserved — only
+ *    operational latency is affected, and the missed race-detection is
+ *    bounded to one incident per stale-lock event.
+ *  - Trade-off accepted: the alternative would require recording a UUID or
+ *    boot-nonce alongside the PID and comparing both fields on stale-detection.
+ *    That adds complexity to the lock body, parse path, and every
+ *    acquire/release branch for a single-missed-race-per-incident impact.
+ *    Current trade-off is operationally sound at our scale.
+ */
+export function isPidAliveOnHost(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    if (err.code === 'ESRCH') return false;
+    if (err.code === 'EPERM') return true; // process exists, we just lack permission
+    return false;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Parse a lock-file body. Returns null on any malformed input. The required
+ * fields are configurable so a single parser serves both the 3-field shape
+ * ({pid, host, acquiredAt}) used by agent-status / memory-proposals and the
+ * 4-field shape ({pid, host, acquiredAt, holder}) used by the state-lock /
+ * staging-fence locks. The primitive only ever inspects `pid` and `host`, so
+ * the minimal contract enforced here is `{ pid: number, host: string }`.
+ *
+ * @param {string} raw
+ * @returns {object|null}
+ */
+function parseBody(raw) {
+  try {
+    const obj = JSON.parse(raw);
+    if (
+      obj &&
+      typeof obj === 'object' &&
+      !Array.isArray(obj) &&
+      typeof obj.pid === 'number' &&
+      typeof obj.host === 'string'
+    ) {
+      return obj;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Resolve whether an existing lock body is stale relative to the requested
+ * stale-check policy. Cross-host bodies are NEVER stale here (PSA-003 — we
+ * cannot signal a remote process). Returns a `{ stale, reason }` pair.
+ *
+ * @param {object} existing — parsed lock body (non-null).
+ * @param {'pid'|'heartbeat'|'mtime'|'none'} staleCheck
+ * @param {number|undefined} staleMs — TTL for heartbeat/mtime checks.
+ * @param {string|undefined} lockPath — needed for mtime stat.
+ * @param {number} [minStaleAgeMs=0] — optional PID takeover mtime floor.
+ * @returns {{ stale: boolean, reason: string }}
+ */
+function isExistingStale(existing, staleCheck, staleMs, lockPath, minStaleAgeMs = 0) {
+  // #1072: compare on the normalised/alias-aware identity, never on a raw
+  // `os.hostname()` string. A raw comparison reports `cross-host` for THIS
+  // machine's own lock whenever the hostname has flipped spelling since it was
+  // written, and `cross-host` disables stale detection entirely (below) — the
+  // lock then survives its holder for the full timeout. `host_id` is preferred
+  // when present because it is already normalised; `host` is the pre-#1072
+  // fallback, so old lock files need no migration. `lockHostCandidate` owns
+  // that choice for all six lock-family call sites — and falls back on an
+  // EMPTY `host_id` too, which a bare `??` would have short-circuited into a
+  // false `cross-host` verdict against this machine's own lock.
+  const sameHost = hostnamesMatch(lockHostCandidate(existing), os.hostname());
+  if (!sameHost) return { stale: false, reason: 'cross-host' };
+
+  if (staleCheck === 'none') return { stale: false, reason: 'live' };
+
+  if (staleCheck === 'pid') {
+    if (minStaleAgeMs > 0) {
+      // Opt-in crash-recovery floor: test the CURRENT generation while the
+      // caller owns .acquire, never an earlier observation before that guard.
+      if (!Number.isSafeInteger(existing.pid) || existing.pid <= 0 || existing.pid > 0x7fffffff) {
+        return { stale: false, reason: 'live' };
+      }
+      try {
+        const st = fs.lstatSync(lockPath);
+        if (!st.isFile() || !(Date.now() - st.mtimeMs >= minStaleAgeMs)) {
+          return { stale: false, reason: 'live' };
+        }
+      } catch {
+        return { stale: false, reason: 'live' };
+      }
+    }
+    const pidIsNumber = typeof existing.pid === 'number';
+    const dead = pidIsNumber && !isPidAliveOnHost(existing.pid);
+    return dead
+      ? { stale: true, reason: `dead pid ${existing.pid}` }
+      : { stale: false, reason: 'live' };
+  }
+
+  if (staleCheck === 'heartbeat') {
+    const ts = Date.parse(existing.acquiredAt ?? existing.lastHeartbeat ?? '');
+    if (!Number.isFinite(ts) || typeof staleMs !== 'number') {
+      return { stale: false, reason: 'live' };
+    }
+    const age = Date.now() - ts;
+    return age > staleMs
+      ? { stale: true, reason: `heartbeat age ${age}ms > ${staleMs}ms` }
+      : { stale: false, reason: 'live' };
+  }
+
+  if (staleCheck === 'mtime') {
+    if (typeof staleMs !== 'number' || !lockPath) {
+      return { stale: false, reason: 'live' };
+    }
+    let mtimeMs;
+    try {
+      mtimeMs = fs.statSync(lockPath).mtimeMs;
+    } catch {
+      return { stale: false, reason: 'live' };
+    }
+    const age = Date.now() - mtimeMs;
+    return age > staleMs
+      ? { stale: true, reason: `mtime age ${Math.round(age)}ms > ${staleMs}ms` }
+      : { stale: false, reason: 'live' };
+  }
+
+  return { stale: false, reason: 'live' };
+}
+
+/**
+ * Atomically create the lock file via tmp + linkSync (POSIX create-or-fail).
+ * The winner creates the hard link; every loser gets EEXIST.
+ *
+ * @param {string} lockPath
+ * @param {object} body
+ * @param {{ indent?: number|null, tmpPrefix: string }} fmt
+ * @returns {{ ok: true } | { ok: false, reason: 'exists' }
+ *   | { ok: false, reason: 'fs-error', error: string, code?: string }}
+ */
+function createExclusive(lockPath, body, fmt) {
+  const dir = path.dirname(lockPath);
+  let tmpFile;
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    const suffix = crypto.randomBytes(8).toString('hex');
+    tmpFile = path.join(dir, `${fmt.tmpPrefix}.create.tmp.${suffix}`);
+    fs.writeFileSync(tmpFile, serializeBody(body, fmt.indent), 'utf8');
+  } catch (err) {
+    if (tmpFile) {
+      try { fs.unlinkSync(tmpFile); } catch { /* best-effort */ }
+    }
+    return { ok: false, reason: 'fs-error', error: err?.message ?? String(err), code: err?.code };
+  }
+
+  try {
+    fs.linkSync(tmpFile, lockPath);
+    return { ok: true };
+  } catch (err) {
+    if (err.code === 'EEXIST') return { ok: false, reason: 'exists' };
+    return { ok: false, reason: 'fs-error', error: err?.message ?? String(err), code: err?.code };
+  } finally {
+    try { fs.unlinkSync(tmpFile); } catch { /* best-effort */ }
+  }
+}
+
+/**
+ * Serialize a lock body. `indent === null` → compact (no whitespace, no
+ * trailing newline) to reproduce agent-status / memory-proposals exactly.
+ * Numeric indent → pretty-printed with a trailing newline (state / staging).
+ *
+ * @param {object} body
+ * @param {number|null} indent
+ * @returns {string}
+ */
+function serializeBody(body, indent) {
+  if (indent === null || indent === undefined) {
+    return JSON.stringify(body);
+  }
+  return JSON.stringify(body, null, indent) + '\n';
+}
+
+/**
+ * Create the exclusive `${lockPath}.acquire` sibling guard that serializes every
+ * acquisition, takeover and owner-guarded release pass on `lockPath` (#1284,
+ * #1285). The caller owns the guard only when `ok` is true and must unlink it
+ * in a `finally`; an existing guard is NEVER replaced (see tryAcquireFileLock).
+ *
+ * @param {string} lockPath
+ * @param {string} tmpPrefix — tmp-file prefix; `.acquire` is appended.
+ * @returns {ReturnType<typeof createExclusive>}
+ */
+function createAcquireGuard(lockPath, tmpPrefix) {
+  return createExclusive(`${lockPath}.acquire`, {
+    pid: process.pid,
+    host: os.hostname(),
+    acquiredAt: new Date().toISOString(),
+    kind: 'acquisition-guard',
+  }, { indent: 2, tmpPrefix: `${tmpPrefix}.acquire` });
+}
+
+// ---------------------------------------------------------------------------
+// Exported primitive
+// ---------------------------------------------------------------------------
+
+/**
+ * Attempt ONE exclusive lock acquisition pass.
+ *
+ * On EEXIST the existing body is read and parsed; if it is stale per the
+ * configured `staleCheck` policy (or unparseable), the lock is atomically
+ * overridden via writeJsonAtomicSync and a WARN is emitted. A live holder or a
+ * cross-host body returns `{ acquired: false, reason: 'held' }`.
+ *
+ * Every acquisition pass owns the exclusive sibling `${lockPath}.acquire`
+ * from before create/read through any takeover. This prevents a waiter from
+ * reading an old holder, observing its exit, then replacing a newer holder.
+ * Owner-guarded releases (releaseFileLock) take the SAME guard for their
+ * read → owner-match → unlink pass (#1285), so a release can never unlink a
+ * lock that a takeover replaced after the releaser read its own body.
+ * All contenders must use this guarded implementation; legacy writers that
+ * ignore the sibling guard cannot participate safely in the same protocol.
+ *
+ * Crash-liveness tradeoff: the guard is held only for one synchronous pass
+ * (acquire or release), not for the caller's critical section. If its owner
+ * dies during a pass or cleanup fails, the guard remains: acquire attempts
+ * return `held` immediately (withFileLock's normal deadline bounds polling) and
+ * owner-guarded releases return `busy` after their bounded retry, leaving the
+ * primary lock to its stale policy. Even a dead-PID or malformed
+ * guard is NEVER stolen, because stale-guard replacement would repeat the same
+ * race. Recovery requires quiescing every process that can acquire this lock,
+ * verifying the guard is abandoned, then explicitly removing only that sibling.
+ * The primary lock retains its existing stale/host/owner protections.
+ *
+ * The `signalVanished` knob reproduces memory-proposals/store.mjs's distinct
+ * third state: when the lock file disappears between the EEXIST and the read
+ * (concurrent release race), `{ acquired: false, reason: 'vanished' }` is
+ * returned so the caller defers WITHOUT any override side-effect (preserves the
+ * C9 8-worker double-holder invariant). When `signalVanished` is false the
+ * ENOENT-on-read race collapses into `{ acquired: false, reason: 'held' }`
+ * (state-lock / staging-fence / agent-status behavior).
+ *
+ * @param {string} lockPath  Absolute path to the lock file.
+ * @param {object} [opts]
+ * @param {'pid'|'heartbeat'|'mtime'|'none'} [opts.staleCheck='pid']
+ * @param {number} [opts.staleMs]            — TTL for heartbeat/mtime staleCheck.
+ * @param {number} [opts.minStaleAgeMs=0]    — optional mtime floor for PID
+ *        takeover, checked under .acquire. Positive values also keep malformed
+ *        bodies and invalid PIDs held; same-host dead PID is still required.
+ *        Does not reclaim .acquire itself. Default preserves legacy behavior.
+ * @param {object} [opts.meta]               — extra fields merged into the body.
+ * @param {string} [opts.holder]             — holder label (added to body when set).
+ * @param {boolean} [opts.signalVanished=false]
+ * @param {number|null} [opts.indent]        — body serialization: null=compact, number=pretty.
+ * @param {string} [opts.tmpPrefix]          — tmp-file prefix for create + override.
+ * @param {(msg: string) => void} [opts.warn] — override-WARN sink (default console.warn).
+ * @param {(reason: string, lockPath: string, existing: object|null) => string} [opts.warnMessage]
+ *        — build the WARN string from the stale reason, path, and the parsed
+ *        existing body (null when the body was unparseable). The reason token is
+ *        'unparseable body' | 'dead pid <n>' | 'heartbeat age ...' | 'mtime age ...'.
+ * @returns {{ acquired: true, body: object }
+ *   | { acquired: false, reason: 'held'|'vanished'|'fs-error', existing?: object|null, error?: string, code?: string }}
+ */
+export function tryAcquireFileLock(lockPath, opts = {}) {
+  const guardPath = `${lockPath}.acquire`;
+  const guard = createAcquireGuard(lockPath, opts.tmpPrefix ?? '.file.lock');
+  if (!guard.ok) {
+    return guard.reason === 'exists'
+      ? { acquired: false, reason: 'held', existing: null }
+      : { acquired: false, reason: 'fs-error', error: guard.error, code: guard.code };
+  }
+
+  try {
+    return tryAcquireGuardedFileLock(lockPath, opts);
+  } finally {
+    // Only this pass can own/remove this guard; no acquisition path replaces
+    // it. An unlink failure deliberately leaves subsequent attempts blocked.
+    try { fs.unlinkSync(guardPath); } catch { /* fail closed; see recovery above */ }
+  }
+}
+
+/**
+ * Caller must hold the acquisition guard throughout this synchronous pass.
+ * @returns {ReturnType<typeof tryAcquireFileLock>}
+ */
+function tryAcquireGuardedFileLock(lockPath, opts) {
+  const {
+    staleCheck = 'pid',
+    staleMs,
+    meta,
+    holder,
+    signalVanished = false,
+    indent = null,
+    tmpPrefix = '.file.lock',
+    warn = (msg) => console.warn(msg),
+    warnMessage = (reason, lp) => `⚠ file-lock: overriding stale lock (${reason}) at ${lp}`,
+  } = opts;
+  const minStaleAgeMs = Number.isFinite(opts.minStaleAgeMs) && opts.minStaleAgeMs > 0
+    ? opts.minStaleAgeMs : 0;
+
+  // The stale-override path writes via writeJsonAtomicSync. The original copies
+  // diverged on override formatting: agent-status / state-lock / staging-fence
+  // override pretty-printed (indent 2) regardless of create format, while
+  // memory-proposals overrode compact. writeJsonAtomicSync always appends a
+  // trailing newline; with overrideIndent:null it emits `JSON.stringify(body)\n`
+  // (compact + newline). The trailing newline is parse-transparent (JSON.parse
+  // ignores it), so this is behavior-identical for every consumer.
+  const overrideIndent = opts.overrideIndent !== undefined ? opts.overrideIndent : (indent ?? 2);
+
+  const body = {
+    pid: process.pid,
+    // `host` stays the RAW hostname (on-the-wire field other readers pin);
+    // `host_id` is the additive normalised twin the comparisons above use.
+    host: os.hostname(),
+    host_id: stableHostname(),
+    acquiredAt: new Date().toISOString(),
+    ...(meta && typeof meta === 'object' ? meta : {}),
+  };
+  if (typeof holder === 'string' && holder.length > 0) {
+    body.holder = holder;
+  }
+
+  const fmt = { indent, tmpPrefix };
+
+  let created;
+  try {
+    created = createExclusive(lockPath, body, fmt);
+  } catch (err) {
+    return { acquired: false, reason: 'fs-error', error: err?.message ?? String(err), code: err?.code };
+  }
+  if (created.ok) return { acquired: true, body };
+  if (created.reason === 'fs-error') {
+    return { acquired: false, reason: 'fs-error', error: created.error, code: created.code };
+  }
+
+  // reason === 'exists' — inspect the holder.
+  let raw;
+  try {
+    raw = fs.readFileSync(lockPath, 'utf8');
+  } catch (err) {
+    if (err.code === 'ENOENT') {
+      // Lock vanished between linkSync-EEXIST and read — a concurrent
+      // release-then-reacquire race. We lost; never override.
+      return signalVanished
+        ? { acquired: false, reason: 'vanished' }
+        : { acquired: false, reason: 'held', existing: null };
+    }
+    return { acquired: false, reason: 'fs-error', error: err?.message ?? String(err), code: err?.code };
+  }
+
+  const existing = parseBody(raw);
+
+  // Unparseable contents → treat as stale and override (only safe move).
+  if (existing === null) {
+    if (minStaleAgeMs > 0) return { acquired: false, reason: 'held', existing: null };
+    warn(warnMessage('unparseable body', lockPath, null));
+    const replaced = writeJsonAtomicSync(lockPath, body, { tmpPrefix, indent: overrideIndent });
+    if (replaced.ok) return { acquired: true, body };
+    return { acquired: false, reason: 'fs-error', error: replaced.error, code: replaced.code ?? undefined };
+  }
+
+  const { stale, reason } = isExistingStale(existing, staleCheck, staleMs, lockPath, minStaleAgeMs);
+  if (stale) {
+    warn(warnMessage(reason, lockPath, existing));
+    const replaced = writeJsonAtomicSync(lockPath, body, { tmpPrefix, indent: overrideIndent });
+    if (replaced.ok) return { acquired: true, body };
+    return { acquired: false, reason: 'fs-error', error: replaced.error, code: replaced.code ?? undefined };
+  }
+
+  // Live holder OR cross-host → caller polls.
+  return { acquired: false, reason: 'held', existing };
+}
+
+/**
+ * Release a lock file.
+ *
+ * With `ownerGuard: true` (default) the file is unlinked ONLY when we own it:
+ * the recorded `holder` matches `opts.holder` (when provided), else PID + host
+ * match. This reproduces the agent-status / state-lock / staging-fence owner
+ * guard (PSA-003: never delete a lock another holder owns).
+ *
+ * Guaranteed (#1285): the owner-guarded read → owner-match → unlink runs under
+ * the same `${lockPath}.acquire` guard as acquisition and takeover, so an old
+ * holder's release can never delete a replacement's lock. Without the guard, a
+ * holder that read its own body, then paused while its lease expired and a
+ * successor took over, unlinked the successor's lock and let a third process
+ * acquire beside a live holder. Under `staleCheck: 'mtime' | 'heartbeat'`, a
+ * `not-owner` answer means your lease expired during your critical section —
+ * see the module header § Lease semantics. The guard is never stolen: when it
+ * stays taken past the budget the release returns `busy` and leaves the lock
+ * untouched for its stale policy to reclaim.
+ *
+ * With `ownerGuard: false` the file is unlinked unconditionally, ENOENT
+ * ignored — reproducing memory-proposals/store.mjs's `releaseProposalsLock`.
+ * That path takes no guard (its callers never run a takeover).
+ *
+ * @param {string} lockPath
+ * @param {object} [opts]
+ * @param {string} [opts.holder]            — expected holder for the owner guard.
+ * @param {boolean} [opts.ownerGuard=true]
+ * @param {number} [opts.guardTimeoutMs=1000] — owner-guarded path only: how long
+ *        to retry for the `.acquire` guard before answering `busy`.
+ * @param {(errToken: string) => void} [opts.warn] — sink for unexpected fs
+ *        errors on the ownerGuard:false path. Receives the raw
+ *        `err.code ?? err.message` token; the call-site formats the message.
+ * @returns {{ ok: true }
+ *   | { ok: false, reason: 'not-found'|'not-owner'|'busy'|'fs-error', error?: string, code?: string }}
+ */
+export function releaseFileLock(lockPath, opts = {}) {
+  const { holder, ownerGuard = true, warn, guardTimeoutMs } = opts;
+
+  if (ownerGuard === false) {
+    // Unconditional unlink; ENOENT ignored. Other fs errors surfaced via warn.
+    // The warn callback receives the raw `err.code ?? err.message` token so the
+    // call-site controls the surrounding message format.
+    try {
+      fs.unlinkSync(lockPath);
+      return { ok: true };
+    } catch (err) {
+      if (err.code === 'ENOENT') return { ok: true };
+      if (typeof warn === 'function') warn(err.code ?? err.message);
+      return { ok: false, reason: 'fs-error', error: err?.message ?? String(err), code: err?.code };
+    }
+  }
+
+  // Nothing to release → answer without the guard. Taking it would create the
+  // lock's directory (createExclusive mkdirs) and contend with live acquirers
+  // for a pass that can never unlink anything. Only ENOENT short-cuts; every
+  // other stat error falls through to the guarded read, which reports it.
+  try {
+    fs.statSync(lockPath);
+  } catch (err) {
+    if (err.code === 'ENOENT') return { ok: false, reason: 'not-found' };
+  }
+
+  const budget = typeof guardTimeoutMs === 'number' && guardTimeoutMs >= 0
+    ? guardTimeoutMs
+    : DEFAULT_RELEASE_GUARD_MS;
+  const deadline = Date.now() + budget;
+  for (;;) {
+    const guard = createAcquireGuard(lockPath, '.file.lock');
+    if (guard.ok) break;
+    if (guard.reason === 'fs-error') return { ok: false, reason: 'fs-error', error: guard.error, code: guard.code };
+    // Never steal the guard (same rule as acquisition): wait, then give up.
+    if (Date.now() >= deadline) return { ok: false, reason: 'busy' };
+    sleepSync(RELEASE_GUARD_POLL_MS);
+  }
+
+  try {
+    return releaseGuardedFileLock(lockPath, holder);
+  } finally {
+    // Only this pass owns the guard; an unlink failure fails closed exactly
+    // like the acquisition path (see tryAcquireFileLock § recovery).
+    try { fs.unlinkSync(`${lockPath}.acquire`); } catch { /* fail closed */ }
+  }
+}
+
+/**
+ * Budget for an owner-guarded release to obtain the `.acquire` guard.
+ *
+ * CEILING (BV-004): a live contender holds the guard for one synchronous pass
+ * (a handful of fs syscalls), so the wait is normally sub-millisecond; the full
+ * 1000 ms is only spent on an ABANDONED guard (owner crashed mid-pass), where
+ * waiting longer cannot help. REVISIT if a `busy` release is ever observed on a
+ * host without a crash.
+ */
+const DEFAULT_RELEASE_GUARD_MS = 1000;
+/** Poll cadence while a release waits for the `.acquire` guard. */
+const RELEASE_GUARD_POLL_MS = 5;
+
+/**
+ * Caller must hold the acquisition guard throughout this synchronous pass.
+ * @returns {ReturnType<typeof releaseFileLock>}
+ */
+function releaseGuardedFileLock(lockPath, holder) {
+  let raw;
+  try {
+    raw = fs.readFileSync(lockPath, 'utf8');
+  } catch (err) {
+    if (err.code === 'ENOENT') return { ok: false, reason: 'not-found' };
+    return { ok: false, reason: 'fs-error', error: err?.message ?? String(err), code: err?.code };
+  }
+
+  const lock = parseBody(raw);
+  if (lock === null) {
+    // Unparseable — refuse to delete; some other process may be writing now.
+    return { ok: false, reason: 'not-owner' };
+  }
+
+  const expectedHolder = typeof holder === 'string' && holder.length > 0 ? holder : null;
+  const ownerMatch = expectedHolder !== null
+    ? lock.holder === expectedHolder
+    // #1072: a raw hostname comparison here makes a process unable to release
+    // its OWN lock after the hostname flips spelling mid-session.
+    : lock.pid === process.pid && hostnamesMatch(lockHostCandidate(lock), os.hostname());
+
+  if (!ownerMatch) return { ok: false, reason: 'not-owner' };
+
+  try {
+    fs.unlinkSync(lockPath);
+    return { ok: true };
+  } catch (err) {
+    if (err.code === 'ENOENT') return { ok: false, reason: 'not-found' };
+    return { ok: false, reason: 'fs-error', error: err?.message ?? String(err), code: err?.code };
+  }
+}
+
+/**
+ * Synchronous busy-wait sleep via Atomics.wait on a throwaway buffer — a
+ * portable, CPU-cheap sleep used by the `sync` variant of withFileLock (the
+ * agent-status no-throw hot path that must not leak async timers). Falls back
+ * to a tight spin if SharedArrayBuffer is unavailable.
+ * @param {number} ms
+ */
+function sleepSync(ms) {
+  const end = Date.now() + ms;
+  try {
+    const sab = new Int32Array(new SharedArrayBuffer(4));
+    Atomics.wait(sab, 0, 0, ms);
+  } catch {
+    while (Date.now() < end) { /* spin */ }
+  }
+}
+
+/**
+ * Async poll-sleep. Promise-returning so the loop does not block the event loop.
+ * @param {number} ms
+ */
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * High-level wrapper: acquire `lockPath` (polling until a deadline), run `fn`,
+ * and release in a finally. The acquire pass delegates to tryAcquireFileLock,
+ * so every stale-override / cross-host / vanished knob is honored here too.
+ *
+ * Returns the value of `fn()`. On acquire timeout or fs-error returns a
+ * structured failure (callers that want a throw should branch on it — the
+ * existing session-lock wrappers keep their own throw-translation). `fn` errors
+ * propagate after the lock is released.
+ *
+ * @param {string} lockPath
+ * @param {(body: object) => (T | Promise<T>)} fn  — receives the acquired body.
+ * @param {object} [opts]
+ * @param {number} [opts.timeoutMs=10000]
+ * @param {number} [opts.pollMs=100]
+ * @param {boolean} [opts.sync=false]  — true → synchronous busy-wait poll +
+ *        synchronous fn (agent-status variant). false → async poll.
+ * @param {boolean} [opts.ownerGuard=true]  — passed to releaseFileLock.
+ * @param {(release: ReturnType<typeof releaseFileLock>) => void} [opts.onRelease]
+ *        — receives the releaseFileLock result from the finally (#1336). The
+ *        only reader of `busy` / `not-owner` (a lease that expired mid-`fn`);
+ *        the return value of withFileLock is unchanged. A throwing callback is
+ *        swallowed so it can mask neither `value` nor an error thrown by `fn`.
+ * @param {...*} [opts.acquireOpts]  — remaining keys forwarded to tryAcquireFileLock.
+ * @returns {Promise<{ ok: true, value: T }
+ *   | { ok: false, reason: 'timeout'|'fs-error', error?: string, code?: string, existing?: object|null }>}
+ * @template T
+ */
+export async function withFileLock(lockPath, fn, opts = {}) {
+  const {
+    timeoutMs = 10000,
+    pollMs = 100,
+    sync = false,
+    ownerGuard = true,
+    onRelease,
+    ...acquireOpts
+  } = opts;
+
+  const effectiveTimeout = typeof timeoutMs === 'number' && timeoutMs >= 0 ? timeoutMs : 10000;
+  const effectivePoll = typeof pollMs === 'number' && pollMs > 0 ? pollMs : 100;
+  const deadline = Date.now() + effectiveTimeout;
+
+  let acquired;
+  // First iteration runs unconditionally so timeoutMs:0 still attempts once.
+  for (;;) {
+    const attempt = tryAcquireFileLock(lockPath, acquireOpts);
+    if (attempt.acquired) {
+      acquired = attempt;
+      break;
+    }
+    if (attempt.reason === 'fs-error') {
+      return { ok: false, reason: 'fs-error', error: attempt.error, code: attempt.code };
+    }
+    if (Date.now() >= deadline) {
+      return { ok: false, reason: 'timeout', existing: attempt.existing ?? null };
+    }
+    if (sync) {
+      sleepSync(effectivePoll);
+    } else {
+      await delay(effectivePoll);
+    }
+  }
+
+  const releaseHolder = acquired.body.holder;
+  try {
+    const value = await fn(acquired.body);
+    return { ok: true, value };
+  } finally {
+    const released = releaseFileLock(lockPath, { holder: releaseHolder, ownerGuard });
+    if (typeof onRelease === 'function') {
+      try { onRelease(released); } catch { /* diagnostic sink — never masks fn */ }
+    }
+  }
+}

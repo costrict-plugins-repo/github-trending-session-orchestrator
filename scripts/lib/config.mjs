@@ -1,0 +1,701 @@
+/**
+ * config.mjs — Session Config reader for CLAUDE.md / AGENTS.md.
+ *
+ * Thin orchestrator. All parsing logic lives in scripts/lib/config/:
+ *   coercers.mjs          — value coercion helpers (_coerceString, _coerceInteger, …)
+ *   section-extractor.mjs — _extractConfigSection + _parseKV
+ *   vault-sync.mjs        — _parseVaultSync
+ *   drift-check.mjs       — _parseDriftCheck
+ *   docs-orchestrator.mjs — _parseDocsOrchestrator
+ *   vault-staleness.mjs   — _parseVaultStaleness
+ *   moc-staleness.mjs     — _parseMocStaleness
+ *   context-coverage.mjs  — _parseContextCoverage
+ *   worktree-orphans.mjs  — _parseWorktreeOrphans
+ *   events-rotation.mjs   — _parseEventsRotation
+ *   vault-integration.mjs — _parseVaultIntegration + _parseResourceThresholds
+ *
+ * One parser lives OUTSIDE that directory: `_parseExpressPath` in
+ * scripts/lib/express-path.mjs, alongside the express-path decision it configures.
+ * See that module's header for the reason and the revisit trigger.
+ *
+ * Originally ported from parse-config.sh (v2) plus its helper libs
+ * config-yaml-parser.sh and config-json-coercion.sh. Windows + CRLF safe.
+ *
+ * Part of v3.0.0 migration (Epic #124, issue #132).
+ * Split into per-section parsers: issue #284.
+ */
+
+// Per-section parsers and coercers
+import {
+  _getVal,
+  _coerceString,
+  _coerceInteger,
+  _coerceFloat,
+  _coerceBoolean,
+  _coerceList,
+  _coerceEnum,
+  _coerceObject,
+  _coerceBoolObject,
+  _coerceMaxTurns,
+} from './config/coercers.mjs';
+
+import { _extractConfigSection, _parseKV } from './config/section-extractor.mjs';
+import { _parseVaultSync } from './config/vault-sync.mjs';
+import { _parseDriftCheck } from './config/drift-check.mjs';
+import { _parseDocsOrchestrator } from './config/docs-orchestrator.mjs';
+import { _parseVaultStaleness } from './config/vault-staleness.mjs';
+import { _parseDocsStaleness } from './config/docs-staleness.mjs';
+import { _parseMocStaleness } from './config/moc-staleness.mjs';
+import { _parseContextCoverage } from './config/context-coverage.mjs';
+import { _parseWorktreeOrphans } from './config/worktree-orphans.mjs';
+import { _parseEventsRotation } from './config/events-rotation.mjs';
+import { _parseVaultIntegration, _parseResourceThresholds } from './config/vault-integration.mjs';
+import { _parseTest } from './config/test.mjs';
+import { _parseGitlabPortfolio } from './config/gitlab-portfolio.mjs';
+import { _parseWaveReviewers } from './config/wave-reviewers.mjs';
+import { _parseCrossRepo } from './config/cross-repo.mjs';
+import { _parsePersonaGateWave } from './config/persona-gate-wave.mjs';
+import { _parseVaultMirrorQuality } from './config/vault-mirror-quality.mjs';
+import { _parseColdStart } from './config/cold-start.mjs';
+import { _parseAutoDream } from './config/auto-dream.mjs';
+import { _parseStateMdLock } from './config/state-md-lock.mjs';
+import { _parseHandoverGate } from './config/handover-gate.mjs';
+import { _parseContextThreshold } from './config/context-threshold.mjs';
+import { _parseAgentCaps } from './config/agent-caps.mjs';
+import { _parseIssueBudget } from './config/issue-budget.mjs';
+import { _parseHealthEndpoints, _parseEcosystemHealthBlockEnabled } from './config/health-endpoints.mjs';
+import { _parseBrokenWindow } from './config/broken-window.mjs';
+import { _parseSlopcheck } from './config/slopcheck.mjs';
+import { _parseDesignReview } from './config/design-review.mjs';
+import { _parseDiscoveryValidator } from './config/discovery-validator.mjs';
+import { _parseReaper } from './config/reaper.mjs';
+import { _parseGate } from './config/gate.mjs';
+import { _parseTemplatesFirst } from './config/templates-first.mjs';
+import { _parseVerificationAutoFix } from './config/verification-auto-fix.mjs';
+import { _parseDialectic } from './config/dialectic.mjs';
+import { _parseEval } from './config/eval.mjs';
+import { _parseSecurityDelta } from './config/security-delta.mjs';
+import { _parseMemory } from './config/memory.mjs';
+import { _parseReconcile } from './config/reconcile.mjs';
+import { _parseCustomPhases } from './config/custom-phases.mjs';
+import { _parseRemoteHosts } from './config/remote-hosts.mjs';
+import { _parseEvolve, _parseEvolveDecay } from './config/evolve.mjs';
+import { _parseSkillEvolution } from './config/skill-evolution.mjs';
+import { _parseDispatcherAutonomy, resolveDispatcherAutonomy } from './config/dispatcher-autonomy.mjs';
+import { loadHostPaths, resolveHostPath, resolveVaultIntegrationHost } from './config/host-paths.mjs';
+import { resolveNamedBaseline } from './named-baseline-resolver.mjs';
+import { expandTilde } from './common.mjs';
+
+/**
+ * Resolve `vault-dir` and report which tier produced it (agents/vault#319).
+ *
+ * Precedence (highest first): SO_VAULT_DIR env > owner.yaml `vault-dirs:`
+ * path-prefix match against the cwd > owner.yaml `paths.vault-dir` > committed.
+ * The env tier stays on top because tests/setup/vault-guard.mjs relies on it to
+ * shadow every host-local vault for the whole suite.
+ *
+ * Lives here, not in config/host-paths.mjs: host-paths.mjs is a direct CP11
+ * helper of check-owner-leakage.mjs, whose standalone vendored copy carries only
+ * its three direct helpers. The named-baseline-resolver import edge would make
+ * CP11 fail closed there (tests/husky/pre-commit-owner-leakage.test.mjs).
+ *
+ * The two owner.yaml tiers (`match`, `owner`) come back tilde-expanded: owner.yaml
+ * is host-local and `~/…` is the natural way to write a path there, but consumers
+ * such as vault-mirror.mjs `existsSync(resolve(vaultDir))` would read a literal
+ * `~` as `<cwd>/~/…`. The `env` and `committed` tiers keep their pass-through;
+ * vault-mirror.mjs expands its `--vault-dir` at entry for every tier anyway.
+ *
+ * `cwd` in the ctx is a test-only DI seam; production reads `process.cwd()`.
+ *
+ * Exported for vault writers that read only the `vault-integration` block and
+ * cannot afford `parseSessionConfig`, which throws on an invalid value in any
+ * unrelated block (scripts/vault-backfill.mjs, #1094).
+ *
+ * @param {string|null|undefined} committed — value the committed Session Config produced
+ * @param {{ env?: Record<string, string|undefined>, ownerConfig?: object, cwd?: string }} [ctx] — from loadHostPaths()
+ * @returns {{ value: string|null|undefined, source: 'env'|'match'|'owner'|'committed' }}
+ */
+export function resolveVaultDir(committed, { env = process.env, ownerConfig, cwd } = {}) {
+  const isNonBlank = (v) => typeof v === 'string' && v.trim() !== '';
+
+  const envVal = env?.SO_VAULT_DIR;
+  if (isNonBlank(envVal)) return { value: envVal, source: 'env' };
+
+  const matched = resolveNamedBaseline({
+    cwd: cwd ?? process.cwd(),
+    ownerConfig,
+    env,
+    section: 'vault-dirs',
+    envKey: 'SO_VAULT_DIR',
+  });
+  if (matched.source === 'match' && isNonBlank(matched.path)) {
+    return { value: expandTilde(matched.path), source: 'match' };
+  }
+
+  const ownerVal = ownerConfig?.paths?.['vault-dir'];
+  if (isNonBlank(ownerVal)) return { value: expandTilde(ownerVal), source: 'owner' };
+
+  return { value: committed, source: 'committed' };
+}
+// express-path lives one level UP from config/ (see its module header for why):
+// the parser is a sibling of config/state-md-lock.mjs in every respect except
+// its directory. Only the pure parser is imported here — `evaluateExpressPath`
+// and its telemetry stay out of this module's import graph by construction.
+import { _parseExpressPath } from './express-path.mjs';
+
+// Re-export the two functions that external callers import directly from this module.
+export { _coerceEnum, _coerceCollisionRisk } from './config/coercers.mjs';
+
+// readConfigFile lives in the dependency-free leaf config/io.mjs so that
+// config/cross-repo.mjs (and other parsers) can import it without forming a
+// cycle back through config.mjs (issue #664). Re-exported here unchanged for
+// back-compat — every existing `import { readConfigFile } from '.../config.mjs'`
+// caller keeps working.
+//
+// ORCHESTRATOR-LEVEL CALLERS ONLY — config sub-parsers MUST import from
+// ./config/io.mjs directly to avoid re-forming the import cycle that #664
+// broke. Any *.mjs under scripts/lib/config/ that imports from '../config.mjs'
+// is a cycle regression (see tests/lib/config/cycle-guard.test.mjs).
+export { readConfigFile } from './config/io.mjs';
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+/**
+ * Parse ## Session Config block from markdown content.
+ * Applies all defaults for missing keys.
+ * @param {string} mdContent — full CLAUDE.md content
+ * @param {{ hostPaths?: { env?: Record<string, string|undefined>, ownerConfig?: object, cwd?: string } }} [opts]
+ *   — `hostPaths` injects the host-local resolution context (issue #653). Tests MUST pass a
+ *   hermetic ctx (e.g. `{ env: {}, ownerConfig: undefined }`) when asserting COMMITTED values:
+ *   the default reads the real `owner.yaml`, so a host-local `paths:` override would otherwise
+ *   bleed into fixture assertions (incident: 2026-07-03 Full-Gate red after the operator set
+ *   `paths.baseline-path` host-locally). `cwd` feeds the `baselines:` (#819) and
+ *   `vault-dirs:` (agents/vault#319) match tiers — a test-only DI seam; production
+ *   always resolves it from `process.cwd()`.
+ * @returns {object} config object with EXACT same shape as parse-config.sh stdout
+ * @throws if any enum value is invalid
+ */
+export function parseSessionConfig(mdContent, { hostPaths } = {}) {
+  const sectionLines = _extractConfigSection(mdContent);
+  const kv = _parseKV(sectionLines);
+
+  // Host-local path resolution context (issue #653): env-var > owner.yaml paths[key] >
+  // committed default. Loaded once so vault-dir + baseline-path resolve without
+  // re-reading disk. Applied AFTER sub-parsers run (see vault-integration/vault-sync
+  // overrides below) to keep the parsers pure for claude-md-drift-check's raw-value parity.
+  const hostCtx = hostPaths ?? loadHostPaths();
+
+  // String fields
+  const vcs = _coerceString(kv, 'vcs', undefined);
+  const gitlabHost = _coerceString(kv, 'gitlab-host', undefined);
+  // `mirror` keeps an explicit `none` as the string 'none' instead of the
+  // generic _coerceString null (#1034): session-end Phase 4.4 must tell an
+  // explicit opt-out (`mirror: none` → never push) from an absent key
+  // (null → push when a `github` remote exists, the pre-#1034 behaviour).
+  const mirror = _getVal(kv, 'mirror', undefined) === 'none' ? 'none' : _coerceString(kv, 'mirror', undefined);
+  const special = _coerceString(kv, 'special', undefined);
+  const pencil = _coerceString(kv, 'pencil', undefined);
+  const testCommand = _coerceString(kv, 'test-command', 'npm test');
+  const typecheckCommand = _coerceString(kv, 'typecheck-command', 'npm run typecheck');
+  const lintCommand = _coerceString(kv, 'lint-command', 'npm run lint');
+  const baselineRef = _coerceString(kv, 'baseline-ref', undefined);
+  const baselineProjectId = _coerceString(kv, 'baseline-project-id', undefined);
+  // plan-baseline-path precedence (#819, extending #653):
+  //   1. SO_BASELINE_PATH env  (highest — resolveNamedBaseline yields to it, so
+  //      resolveHostPath's env tier below returns it)
+  //   2. baselines: match against cwd  (per-context — the new tier)
+  //   3. owner.yaml paths.baseline-path (legacy — resolveHostPath)
+  //   4. committed Session Config value (fallback — resolveHostPath)
+  // Hosts WITHOUT a `baselines:` array behave byte-identically to pre-#819: the
+  // resolver returns the null-fallback and resolution falls straight through to
+  // resolveHostPath's env > owner.yaml > committed chain. `hostCtx.cwd` is only
+  // ever set by tests; production reads process.cwd().
+  const planBaselinePath = (() => {
+    const baselineMatch = resolveNamedBaseline({
+      cwd: hostCtx.cwd ?? process.cwd(),
+      ownerConfig: hostCtx.ownerConfig,
+      env: hostCtx.env,
+    });
+    if (
+      baselineMatch.source === 'match' &&
+      typeof baselineMatch.path === 'string' &&
+      baselineMatch.path.trim() !== ''
+    ) {
+      return baselineMatch.path;
+    }
+    return resolveHostPath(
+      'baseline-path',
+      _coerceString(kv, 'plan-baseline-path', undefined),
+      hostCtx,
+    );
+  })();
+  const planDefaultVisibility = _coerceString(kv, 'plan-default-visibility', 'internal');
+  const planPrdLocation = _coerceString(kv, 'plan-prd-location', 'docs/prd/');
+  const planRetroLocation = _coerceString(kv, 'plan-retro-location', 'docs/retro/');
+
+  // Integer fields
+  const agentsPerWave = _coerceInteger(kv, 'agents-per-wave', 6);
+  const waves = _coerceInteger(kv, 'waves', 5);
+  const recentCommits = _coerceInteger(kv, 'recent-commits', 20);
+  const issueLimit = _coerceInteger(kv, 'issue-limit', 50);
+  const staleBranchDays = _coerceInteger(kv, 'stale-branch-days', 7);
+  const staleIssueDays = _coerceInteger(kv, 'stale-issue-days', 30);
+  const ssotFreshnessDays = _coerceInteger(kv, 'ssot-freshness-days', 5);
+  const pluginFreshnessDays = _coerceInteger(kv, 'plugin-freshness-days', 30);
+  const memoryCleanupThreshold = _coerceInteger(kv, 'memory-cleanup-threshold', 5);
+  const memoryCleanupSoftLimit = _coerceInteger(kv, 'memory-cleanup-soft-limit', 180);
+  const learningExpiryDays = _coerceInteger(kv, 'learning-expiry-days', 30);
+  const learningsSurfaceTopN = _coerceInteger(kv, 'learnings-surface-top-n', 15);
+  const groundingInjectionMaxFiles = _coerceInteger(kv, 'grounding-injection-max-files', 3);
+  const discoveryConfidenceThreshold = _coerceInteger(kv, 'discovery-confidence-threshold', 60);
+  // discovery-parallelism: bounded 1..16, silent fallback to default 5 (matches events-rotation pattern)
+  const discoveryParallelism = (() => {
+    const raw = _getVal(kv, 'discovery-parallelism', '5');
+    if (!/^\d+$/.test(raw)) return 5;
+    const n = parseInt(raw, 10);
+    if (n < 1 || n > 16) return 5;
+    return n;
+  })();
+
+  // Float fields
+  const learningDecayRate = _coerceFloat(kv, 'learning-decay-rate', 0.05, 0.0, 1.0);
+
+  // Boolean fields
+  const persistence = _coerceBoolean(kv, 'persistence', true);
+  // ecosystem-health has TWO spellings and only the scalar one reaches `kv`:
+  // the wizard writes a valueless `ecosystem-health:` header opening a block,
+  // which carries no `key: value` pair and is therefore invisible to the KV
+  // map (#1174). Scalar wins when present; otherwise the block form decides.
+  const ecosystemHealth =
+    _getVal(kv, 'ecosystem-health', undefined) !== undefined
+      ? _coerceBoolean(kv, 'ecosystem-health', false)
+      : (_parseEcosystemHealthBlockEnabled(mdContent) ?? false);
+  // discovery-on-close alone accepts `auto` (= true) and defaults to true when
+  // absent: the template recommends `auto` and the 2026-07-29 doc decision made
+  // close-time discovery the default. Other booleans stay strict (#1340).
+  // Ceiling (BV-004): a one-key tri-state kept inline; revisit (move into
+  // coercers.mjs as a shared auto-boolean coercer) when a second key accepts `auto`.
+  const discoveryOnCloseRaw = (_getVal(kv, 'discovery-on-close', 'auto')).toLowerCase();
+  if (!['true', 'false', 'auto'].includes(discoveryOnCloseRaw)) {
+    throw new Error(
+      `config.mjs: invalid boolean for 'discovery-on-close': '${_getVal(kv, 'discovery-on-close', '')}' (expected true, false or auto)`,
+    );
+  }
+  const discoveryOnClose = discoveryOnCloseRaw !== 'false';
+  const reasoningOutput = _coerceBoolean(kv, 'reasoning-output', false);
+  const groundingCheck = _coerceBoolean(kv, 'grounding-check', true);
+  const allowDestructiveOps = _coerceBoolean(kv, 'allow-destructive-ops', false);
+  const resourceAwareness = _coerceBoolean(kv, 'resource-awareness', true);
+  const enableHostBanner = _coerceBoolean(kv, 'enable-host-banner', true);
+  // heavy-repo / worktree-cleanup: HR-003 preflight fields (templates/shared/.claude/rules/heavy-repo.md),
+  // documented but previously unwired — silently dropped by the parser (baseline issue #60).
+  const heavyRepo = _coerceBoolean(kv, 'heavy-repo', false);
+  // offload-first (#1465): route offloadable wave roles to a ready remote host
+  // even on a `proceed` resource verdict (consumed by wave-resource-gate.mjs).
+  const offloadFirst = _coerceBoolean(kv, 'offload-first', false);
+
+  // List fields
+  const crossRepos = _coerceList(kv, 'cross-repos', undefined);
+  const ssotFiles = _coerceList(kv, 'ssot-files', undefined);
+  const discoveryProbes = _coerceList(kv, 'discovery-probes', '[all]');
+  const discoveryExcludePaths = _coerceList(kv, 'discovery-exclude-paths', '[]');
+  const worktreeExclude = _coerceList(
+    kv,
+    'worktree-exclude',
+    '[node_modules, dist, build, .next, .nuxt, coverage, .cache, .turbo, .vercel, out]'
+  );
+
+  // Enum fields
+  const enforcement = _coerceEnum(kv, 'enforcement', 'warn', ['strict', 'warn', 'off']);
+  const isolation = _coerceEnum(kv, 'isolation', 'auto', ['worktree', 'none', 'auto']);
+  const discoverySeverityThreshold = _coerceEnum(kv, 'discovery-severity-threshold', 'low', ['critical', 'high', 'medium', 'low']);
+  // worktree-cleanup: HR-003 (baseline issue #60). NOTE: 'aggressive' currently behaves
+  // identically to 'default' at runtime — the per-wave aggressive sweep is a tracked
+  // follow-up (see docs/session-config-reference.md). This wires the parser + value only.
+  const worktreeCleanup = _coerceEnum(kv, 'worktree-cleanup', 'default', ['default', 'aggressive']);
+
+  // remote-hosts: opt-in ssh-reachable hosts heavy roles may be offloaded to (#1160).
+  // Parsed HERE, before agent-mapping, because the `ssh:<alias>` channel below
+  // validates its target against the declared aliases. Defaults to [].
+  const remoteHosts = _parseRemoteHosts(mdContent);
+
+  // Object fields
+  const agentMapping = _coerceObject(kv, 'agent-mapping');
+  if (agentMapping !== null) {
+    // Validate role keys against canonical list from skills/_shared/config-reading.md
+    const ALLOWED_ROLES = ['impl', 'test', 'db', 'ui', 'security', 'compliance', 'docs', 'perf'];
+    // Dispatch channels a mapping value may name via a `<channel>:<target>`
+    // prefix (#1150). Without a colon the value is a plain agent name and is
+    // dispatched natively, exactly as before.
+    //   impl: code-implementer      → native Agent dispatch (unchanged)
+    //   impl: cursor:composer-2.5   → foreign model over the Cursor channel
+    //   test: ssh:build-host        → same Claude, another host (#1160)
+    // An unknown prefix is a typo or a channel this build cannot route, and
+    // must fail loudly: silently accepting it would dispatch to an agent that
+    // does not exist, which surfaces only as an empty wave much later.
+    const KNOWN_CHANNELS = ['cursor', 'session-orchestrator', 'ssh'];
+    // Accumulate every defect, then report once. A config with two bad entries
+    // must name BOTH — throwing on the first one makes the operator re-run the
+    // parse per defect, and each re-run hides the ones behind it.
+    const invalidKeys = [];
+    const valueProblems = [];
+    for (const [k, v] of Object.entries(agentMapping)) {
+      if (!ALLOWED_ROLES.includes(k)) {
+        invalidKeys.push(k);
+        continue;
+      }
+      if (typeof v !== 'string' || v === '') {
+        valueProblems.push(`role '${k}' has invalid value '${v}' (expected non-empty string)`);
+        continue;
+      }
+      const colonIdx = v.indexOf(':');
+      if (colonIdx !== -1) {
+        const channel = v.slice(0, colonIdx).trim();
+        const target = v.slice(colonIdx + 1).trim();
+        if (!KNOWN_CHANNELS.includes(channel)) {
+          valueProblems.push(
+            `role '${k}' names unknown channel '${channel}' in value '${v}' ` +
+              `(known channels: ${KNOWN_CHANNELS.join(', ')}; a value without ':' is a plain agent name)`
+          );
+        } else if (target === '') {
+          valueProblems.push(
+            `role '${k}' has channel '${channel}' but no target in value '${v}' ` +
+              `(expected '${channel}:<model-or-agent>')`
+          );
+        } else if (channel === 'ssh' && !remoteHosts.some((h) => h.alias === target)) {
+          // An ssh target is a host ALIAS, and the only place aliases are declared
+          // is the remote-hosts: block. An undeclared alias would reach argv as
+          // `-H <target>` and fail at connect time, one wave too late.
+          const declared = remoteHosts.map((h) => h.alias).join(', ') || 'none';
+          valueProblems.push(
+            `role '${k}' names ssh host '${target}' which is not declared in remote-hosts: ` +
+              `(declared: ${declared})`
+          );
+        }
+      }
+    }
+    const problems = [];
+    if (invalidKeys.length > 0) {
+      problems.push(
+        `invalid role key(s): ${invalidKeys.join(', ')} (allowed: ${ALLOWED_ROLES.join(', ')})`
+      );
+    }
+    problems.push(...valueProblems);
+    if (problems.length > 0) {
+      // Still fail loud — only the reporting shape changed, never the verdict.
+      throw new Error(`config.mjs: agent-mapping ${problems.join('; ')}`);
+    }
+  }
+  const enforcementGates = _coerceBoolObject(kv, 'enforcement-gates');
+
+  // Special field
+  const maxTurns = _coerceMaxTurns(kv);
+
+  // vault-integration: parsed from full content (block-scoped, avoids the
+  // pre-#593 KV-name collision where `enabled:` was shared with 15+ other
+  // blocks like docs-orchestrator/vault-staleness/slopcheck).
+  // Host-local overrides — applied here, NOT inside _parseVaultIntegration, so
+  // claude-md-drift-check (which calls the parser directly) keeps seeing raw values.
+  //   - the enabled/mode switch (SO#1448): env SO_VAULT_INTEGRATION > owner.yaml
+  //     `vault-integration:` > committed, LOWER-ONLY; `host-override` names the tier.
+  //   - vault-dir (#653, agents/vault#319): env > owner.yaml `vault-dirs:` cwd match >
+  //     owner.yaml paths.vault-dir > committed; `vault-dir-source` names the tier.
+  const vaultIntegration = resolveVaultIntegrationHost(_parseVaultIntegration(mdContent), hostCtx);
+  const vaultIntegrationDir = resolveVaultDir(vaultIntegration['vault-dir'], hostCtx);
+  vaultIntegration['vault-dir'] = vaultIntegrationDir.value;
+  vaultIntegration['vault-dir-source'] = vaultIntegrationDir.source;
+
+  // resource-thresholds sub-keys (v3.1.0 env-aware — issue #166)
+  const resourceThresholds = _parseResourceThresholds(kv);
+
+  // vault-sync: parsed from full content (can live outside Session Config)
+  const vaultSync = _parseVaultSync(mdContent);
+  // Host-local override (issue #653) — same resolver as vault-integration above, so the
+  // two blocks cannot disagree about which vault this repo writes to (agents/vault#319).
+  vaultSync['vault-dir'] = resolveVaultDir(vaultSync['vault-dir'], hostCtx).value;
+
+  // drift-check: parsed from full content (standalone top-level block)
+  const driftCheck = _parseDriftCheck(mdContent);
+
+  // docs-orchestrator: parsed from full content (standalone top-level block)
+  const docsOrchestrator = _parseDocsOrchestrator(mdContent);
+
+  // vault-staleness: parsed from full content (standalone top-level block)
+  const vaultStaleness = _parseVaultStaleness(mdContent);
+  // docs-staleness: parsed from full content (standalone top-level block, #781)
+  const docsStaleness = _parseDocsStaleness(mdContent);
+  // moc-staleness: parsed from full content (standalone top-level block, #831/B2)
+  const mocStaleness = _parseMocStaleness(mdContent);
+  // context-coverage: parsed from full content (standalone top-level block, #831/B4)
+  const contextCoverage = _parseContextCoverage(mdContent);
+  // worktree-orphans: parsed from full content (standalone top-level block, #831/B5)
+  const worktreeOrphans = _parseWorktreeOrphans(mdContent);
+
+  // events-rotation: parsed from full content (standalone top-level block)
+  const eventsRotation = _parseEventsRotation(mdContent);
+
+  // express-path: parsed from full content (standalone top-level block, #214/#1119).
+  // Documented in docs/session-config-template.md § Express Path and
+  // docs/session-config-reference.md § Express Path (#214) since #214, but never in the key schema —
+  // measured 2026-08-23, a probe carrying `express-path:\n  enabled: false` produced
+  // 88 keys and none of them was `express-path`. The key was dropped even when it
+  // stood in the file, so the documented default was prose rather than a value.
+  const expressPath = _parseExpressPath(mdContent);
+
+  // vault-mirror.quality: parsed from full content (PRD F1.2 / issue #504)
+  const vaultMirror = _parseVaultMirrorQuality(mdContent);
+
+  // cold-start: parsed from full content (PRD F1.3 / issue #500)
+  const coldStart = _parseColdStart(mdContent);
+
+  // auto-dream: parsed from full content (issue #566). The `min-confidence`
+  // field is consumed by `collectProposals()` at session-end Phase 3.6.3 as a
+  // SECOND confidence gate above `memory.proposals.confidence-floor`.
+  const autoDream = _parseAutoDream(mdContent);
+
+  // state-md-lock: parsed from full content (PRD gsd Pattern 1 / issues #517, #518)
+  const stateMdLock = _parseStateMdLock(mdContent);
+
+  // handover-gate: parsed from full content (PRD 2026-07-07 /close
+  // Handover-Alignment-Gate — Epic #724)
+  const handoverGate = _parseHandoverGate(mdContent);
+
+  // context-threshold: per-session context hints at prepare-k / handover-k
+  // (#1960). Consumer: hooks/post-tool-context-threshold.mjs (reads it inline).
+  const contextThreshold = _parseContextThreshold(mdContent);
+
+  // agent-caps: committed raw values, so the key counts as known inside the
+  // block. The hook resolves env > owner.yaml > these > default itself.
+  const agentCaps = _parseAgentCaps(mdContent);
+
+  // issue-budget: per-session issue-creation cap (QUANTITY gate). Distinct from
+  // discovery-severity-threshold / discovery-confidence-threshold above, which
+  // are per-finding QUALITY filters and cannot bound creation volume. Enforced
+  // by hooks/pre-bash-issue-budget.mjs + scripts/lib/spiral-carryover.mjs.
+  const issueBudget = _parseIssueBudget(mdContent);
+
+  // broken-window-budget: parsed from full content (#730/H5 — session-end Phase 2.6)
+  const brokenWindow = _parseBrokenWindow(mdContent);
+
+  // slopcheck: parsed from full content (PRD gsd Pattern 2 / issues #517, #520)
+  const slopcheck = _parseSlopcheck(mdContent);
+
+  // design-review: default-on UI-touch review trigger + close gate (#1452)
+  const designReview = _parseDesignReview(mdContent);
+
+  // skill-evolution: opt-in skill self-evolution autonomy block (OpenSpace C1 / issue #646)
+  const skillEvolution = _parseSkillEvolution(mdContent);
+
+  // dispatcher-autonomy: opt-in cross-repo dispatcher autonomy block (Epic #673 / issue #679).
+  // Parser stays pure (raw committed value) for claude-md-drift-check raw-value parity;
+  // the host-local override (env > owner.yaml > committed > off) is overlaid onto the
+  // FINAL object only — mirroring the vault-dir host-override pattern above. Reuses the
+  // already-loaded hostCtx.ownerConfig so owner.yaml is not read twice.
+  const dispatcherAutonomy = _parseDispatcherAutonomy(mdContent);
+  dispatcherAutonomy.autonomy = resolveDispatcherAutonomy({
+    committed: dispatcherAutonomy.autonomy,
+    ownerConfig: hostCtx.ownerConfig,
+  });
+
+  // discovery-validator: parsed from full content (PSA-006 enforcement / issue #567)
+  const discoveryValidator = _parseDiscoveryValidator(mdContent);
+
+  // reaper: orphan-process watchdog, default OFF (PRD 2026-09-20 Prozessgruppen-Kill
+  // und Waisen-Wächter, Epic #1425 / #1432 B4). Consumed by the two hooks that
+  // trigger the detached scan — post-tool-batch-wave-signal.mjs and on-stop.mjs.
+  const reaper = _parseReaper(mdContent);
+
+  // gate: wall-clock ceiling for gate path B (run-quality-gate.mjs →
+  // gate-*.mjs), which had no timeout at all before #1425 A3. The operator
+  // override SO_GATE_TIMEOUT_MS still wins over this committed value.
+  const gate = _parseGate(mdContent);
+
+  // templates-first: parsed from full content (PRD gsd Pattern 3 / issues #517, #519)
+  const templatesFirst = _parseTemplatesFirst(mdContent);
+
+  // verification-auto-fix: parsed from full content (PRD gsd Pattern 4 / issues #517, #521)
+  const verificationAutoFix = _parseVerificationAutoFix(mdContent);
+
+  // dialectic: parsed from full content (issue #506)
+  const dialectic = _parseDialectic(mdContent);
+
+  // eval: parsed from full content (Standard v1 eval harness, #809 / Epic #803)
+  const evalConfig = _parseEval(mdContent);
+
+  // security-delta: parsed from full content (close-time delta checks, #1769)
+  const securityDelta = _parseSecurityDelta(mdContent);
+
+  // memory: parsed from full content (issue #505 — banner opt-out)
+  const memory = _parseMemory(mdContent);
+
+  // reconcile: parsed from full content (FA4 #697 — config foundation for
+  // FA3 #696 advisory rule-proposal delivery at session-end Phase 3.6.8).
+  const reconcile = _parseReconcile(mdContent);
+
+  // test: parsed from full content (standalone top-level block, /test epic #378)
+  const testConfig = _parseTest(mdContent);
+
+  // gitlab-portfolio: parsed from full content (standalone top-level block, GH #41)
+  const gitlabPortfolio = _parseGitlabPortfolio(mdContent);
+
+  // cross-repo.projects: delegated per-section parser (#478, MED-1)
+  const crossRepoProjects = _parseCrossRepo(mdContent);
+
+  // wave-reviewers: parsed from full content; dual-key shim (persona-reviewers → wave-reviewers, #461)
+  const waveReviewers = _parseWaveReviewers(mdContent);
+  if (waveReviewers.deprecated) {
+    process.stderr.write(
+      "Session Config: 'persona-reviewers' is deprecated — rename to 'wave-reviewers'. " +
+        'Will be removed in v4.0.\n'
+    );
+  }
+
+  // custom-phases: opt-in repo-declared deterministic phases run at session close /
+  // housekeeping with exit-code gating + summary reporting (#637). Defaults to [].
+  const customPhases = _parseCustomPhases(mdContent);
+
+  // evolve.extra-sources: opt-in EXTRA learning sources for /evolve — sidecar JSON
+  // files produced out-of-band by a domain measurement or owner-decision export.
+  // /evolve READS them and emits domain-regression or owner-preference candidates;
+  // it never runs the measurement or export (read-only contract). Returned as 'evolve.extra-sources' (dotted,
+  // mirroring the cross-repo.projects precedent). Defaults to []. (#638)
+  const evolveExtraSources = _parseEvolve(mdContent);
+
+  // evolve.decay: memory time-decay tuning nested UNDER the `evolve:` block (#670).
+  // Adds a recency factor to learning surfacing — stale high-confidence learnings
+  // decay (multiplicative half-life blend, with a catastrophic-loss floor) so they
+  // no longer crowd out fresh signal. Conservative defaults (90-day half-life, 0.1
+  // floor, enabled) make the change degrade gently. Consumed by surfaceTopN's
+  // `opts.decay`. Nested (not a new top-level key) so claude-md-drift-check Check 6
+  // parity is unaffected. Returned as 'evolve.decay' (dotted, mirroring
+  // 'evolve.extra-sources').
+  const evolveDecay = _parseEvolveDecay(mdContent);
+
+  // persona-gate-wave: opt-in mid-wave persona-panel hook (#458). Returns null when absent.
+  // health-endpoints: content-scoped (NOT _coerceList, which bails to null on
+  // any '{' and cannot see the wizard's nested block form at all) — #1174.
+  const healthEndpoints = _parseHealthEndpoints(mdContent);
+
+  const personaGateWave = _parsePersonaGateWave(mdContent);
+  if (personaGateWave !== null && personaGateWave.enabled === true && personaGateWave.mode === 'off') {
+    process.stderr.write(
+      "Session Config: 'persona-gate-wave' has enabled=true but mode=off — the hook will not fire. " +
+        "Set mode to 'warn' or 'strict', or set enabled=false to silence this warning.\n"
+    );
+  }
+
+  return {
+    'agents-per-wave': agentsPerWave,
+    'waves': waves,
+    'recent-commits': recentCommits,
+    'special': special,
+    'vcs': vcs,
+    'gitlab-host': gitlabHost,
+    'mirror': mirror,
+    'cross-repos': crossRepos,
+    'cross-repo.projects': crossRepoProjects,
+    'pencil': pencil,
+    'ecosystem-health': ecosystemHealth,
+    'health-endpoints': healthEndpoints,
+    'issue-limit': issueLimit,
+    'stale-branch-days': staleBranchDays,
+    'stale-issue-days': staleIssueDays,
+    'test-command': testCommand,
+    'typecheck-command': typecheckCommand,
+    'lint-command': lintCommand,
+    'ssot-files': ssotFiles,
+    'ssot-freshness-days': ssotFreshnessDays,
+    'plugin-freshness-days': pluginFreshnessDays,
+    'discovery-on-close': discoveryOnClose,
+    'discovery-probes': discoveryProbes,
+    'discovery-exclude-paths': discoveryExcludePaths,
+    'discovery-severity-threshold': discoverySeverityThreshold,
+    'discovery-confidence-threshold': discoveryConfidenceThreshold,
+    'discovery-parallelism': discoveryParallelism,
+    'persistence': persistence,
+    'memory-cleanup-threshold': memoryCleanupThreshold,
+    'memory-cleanup-soft-limit': memoryCleanupSoftLimit,
+    'learning-expiry-days': learningExpiryDays,
+    'learnings-surface-top-n': learningsSurfaceTopN,
+    'learning-decay-rate': learningDecayRate,
+    'enforcement': enforcement,
+    'isolation': isolation,
+    'max-turns': maxTurns,
+    'baseline-ref': baselineRef,
+    'baseline-project-id': baselineProjectId,
+    'plan-baseline-path': planBaselinePath,
+    'plan-default-visibility': planDefaultVisibility,
+    'plan-prd-location': planPrdLocation,
+    'plan-retro-location': planRetroLocation,
+    'agent-mapping': agentMapping,
+    'enforcement-gates': enforcementGates,
+    'reasoning-output': reasoningOutput,
+    'grounding-injection-max-files': groundingInjectionMaxFiles,
+    'grounding-check': groundingCheck,
+    'allow-destructive-ops': allowDestructiveOps,
+    'resource-awareness': resourceAwareness,
+    'enable-host-banner': enableHostBanner,
+    'heavy-repo': heavyRepo,
+    'offload-first': offloadFirst,
+    'worktree-cleanup': worktreeCleanup,
+    'resource-thresholds': resourceThresholds,
+    'worktree-exclude': worktreeExclude,
+    'vault-integration': vaultIntegration,
+    'vault-mirror': vaultMirror,
+    'cold-start': coldStart,
+    'auto-dream': autoDream,
+    'state-md-lock': stateMdLock,
+    'handover-gate': handoverGate,
+    'context-threshold': contextThreshold,
+    'agent-caps': agentCaps,
+    'issue-budget': issueBudget,
+    'broken-window-budget': brokenWindow,
+    'slopcheck': slopcheck,
+    'design-review': designReview,
+    'skill-evolution': skillEvolution,
+    'dispatcher-autonomy': dispatcherAutonomy,
+    'discovery-validator': discoveryValidator,
+    'reaper': reaper,
+    'gate': gate,
+    'templates-first': templatesFirst,
+    'verification-auto-fix': verificationAutoFix,
+    'dialectic': dialectic,
+    'eval': evalConfig,
+    'security-delta': securityDelta,
+    'memory': memory,
+    'reconcile': reconcile,
+    'vault-sync': vaultSync,
+    'drift-check': driftCheck,
+    'docs-orchestrator': docsOrchestrator,
+    'vault-staleness': vaultStaleness,
+    'docs-staleness': docsStaleness,
+    'moc-staleness': mocStaleness,
+    'context-coverage': contextCoverage,
+    'worktree-orphans': worktreeOrphans,
+    'events-rotation': eventsRotation,
+    'express-path': expressPath,
+    'test': testConfig,
+    'gitlab-portfolio': gitlabPortfolio,
+    'wave-reviewers': waveReviewers,
+    'persona-gate-wave': personaGateWave,
+    'custom-phases': customPhases,
+    'remote-hosts': remoteHosts,
+    'evolve.extra-sources': evolveExtraSources,
+    'evolve.decay': evolveDecay,
+  };
+}
+
+/**
+ * Lookup a config value, falling back to default.
+ * @param {object} config — result of parseSessionConfig
+ * @param {string} key — key name (e.g., "agents-per-wave")
+ * @param {*} defaultValue — fallback if key missing or null
+ * @returns {*} the config value or defaultValue
+ */
+export function getConfigValue(config, key, defaultValue = null) {
+  const val = config[key];
+  if (val === undefined || val === null) return defaultValue;
+  return val;
+}

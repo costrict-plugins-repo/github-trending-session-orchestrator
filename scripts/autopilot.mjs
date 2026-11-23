@@ -1,0 +1,433 @@
+#!/usr/bin/env node
+/**
+ * autopilot.mjs — Phase C-5 headless CLI driver for the /autopilot loop.
+ *
+ * Issue #302 (Phase C-5). Wires real implementations of the four injectable
+ * seams defined by `runLoop` in `scripts/lib/autopilot.mjs` and lets the user
+ * run the autopilot loop unattended from the CLI.
+ *
+ * Usage:
+ *   node scripts/autopilot.mjs --headless [options]
+ *
+ * Flags:
+ *   --headless                  Required. Activates headless mode.
+ *   --max-sessions=N            Max iterations (1..50, default 5).
+ *   --max-hours=H               Max wall-clock hours (0.5..24.0, default 4.0).
+ *   --confidence-threshold=0.X  Mode confidence gate (0.0..1.0, default 0.85).
+ *   --max-tokens=N              Cumulative token budget (0..10000000, default 0 = off). Counts
+ *                               SUBAGENT output tokens only (sessions.jsonl total_token_output,
+ *                               else total_tokens — both subagent-only; coordinator tokens are
+ *                               not counted). One deep session measured ~450k.
+ *   --dry-run                   Emit a single record without spawning sessions.
+ *   --verbose                   Pipe child process stdio (instead of inherit).
+ *
+ * Exit codes:
+ *   0 — clean termination (max-sessions-reached, max-hours-exceeded, or fallback-to-manual).
+ *   1 — uncaught error.
+ *   2 — kill_switch=failed-wave, or missing --headless flag.
+ *
+ * References:
+ *   scripts/lib/autopilot.mjs   — runLoop, parseFlags, writeAutopilotJsonl
+ *   scripts/lib/build-live-signals.mjs — buildLiveSignals
+ *   scripts/lib/mode-selector.mjs      — selectMode
+ *   scripts/lib/resource-probe.mjs     — probe, evaluate
+ *   scripts/lib/session-registry.mjs   — detectPeers
+ *   scripts/lib/session-schema.mjs     — normalizeSession
+ *   "/autopilot Loop Command (Phase C)" (#277/#271; archived in the private Meta-Vault)
+ */
+
+import { randomUUID } from 'node:crypto';
+import { resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+import {
+  runLoop,
+  parseFlags,
+  KILL_SWITCHES,
+} from './lib/autopilot.mjs';
+import { buildLiveSignals } from './lib/build-live-signals.mjs';
+import { surfaceTopN, decayOptsFromConfig } from './lib/learnings/surface.mjs';
+import { selectMode } from './lib/mode-selector.mjs';
+import { probe, evaluate, DEFAULT_RESOURCE_THRESHOLDS } from './lib/resource-probe.mjs';
+import { detectPeers } from './lib/session-registry.mjs';
+import { normalizeSession } from './lib/session-schema.mjs';
+import { isBackfillStub, readCanonicalSessions } from './lib/sessions-canonical.mjs';
+import { resolveEventsLedgerRoot } from './lib/platform.mjs';
+import { resolveLedgerPath } from './lib/ledger-path.mjs';
+import { spawnSync, spawn } from './lib/native-command.mjs';
+
+// ---------------------------------------------------------------------------
+// CLI-level flag extraction
+// ---------------------------------------------------------------------------
+
+const argv = process.argv.slice(2);
+
+/**
+ * Plugin root, resolved from THIS file's own location (`<root>/scripts/autopilot.mjs`
+ * → `<root>`) and never from an env var. The driver is spawned unattended from an
+ * arbitrary cwd, so `--plugin-dir` must name the plugin that owns this very file;
+ * an env-var read would point wherever the operator's shell last happened to point.
+ */
+const PLUGIN_ROOT = resolve(fileURLToPath(new URL('.', import.meta.url)), '..');
+
+const hasHeadless = argv.includes('--headless');
+const hasVerbose = argv.includes('--verbose');
+
+if (!hasHeadless) {
+  process.stderr.write('autopilot: headless mode requires --headless flag\n');
+  process.exit(2);
+}
+
+// Strip CLI-only flags before forwarding to parseFlags (which ignores unknown
+// flags, but being explicit avoids confusion with future parseFlags additions).
+const flagsForParse = argv.filter(
+  (a) => a !== '--headless' && a !== '--verbose'
+);
+
+const { maxSessions, maxHours, confidenceThreshold, maxTokens, dryRun } = parseFlags(flagsForParse);
+
+// ---------------------------------------------------------------------------
+// Session Config (parsed once, shared by thresholds + decay readers)
+// ---------------------------------------------------------------------------
+
+/**
+ * Parse Session Config once by spawning `node scripts/parse-config.mjs`.
+ * Returns the parsed config object, or `null` if the spawn fails / yields
+ * no usable stdout. Callers fall back to their own defaults on `null`.
+ *
+ * @returns {object|null}
+ */
+function loadConfig() {
+  try {
+    const scriptPath = fileURLToPath(new URL('parse-config.mjs', import.meta.url));
+    const result = spawnSync(
+      process.execPath,
+      [scriptPath],
+      { encoding: 'utf8', timeout: 10_000 }
+    );
+    if (result.status !== 0 || !result.stdout) return null;
+    return JSON.parse(result.stdout);
+  } catch {
+    return null;
+  }
+}
+
+const config = loadConfig();
+
+// ---------------------------------------------------------------------------
+// Resource-thresholds from Session Config
+// ---------------------------------------------------------------------------
+
+/**
+ * Read the `resource-thresholds` block from the parsed Session Config. Falls
+ * back to the resource-probe defaults if the field is absent or config is null.
+ *
+ * @returns {object} thresholds object consumable by evaluate()
+ */
+function loadResourceThresholds() {
+  // #1089: this block used to hold its OWN four numbers (2.0 / 0.5 / 85 / 3)
+  // under a comment claiming it "mirrors resource-probe hard-coded values" —
+  // which it did not, and had not for some time. Autopilot therefore judged
+  // every host against a threshold set no other consumer used, and the comment
+  // is what made that invisible. Now sourced from the one canonical definition.
+  const DEFAULTS = { ...DEFAULT_RESOURCE_THRESHOLDS };
+
+  const rt = config && config['resource-thresholds'];
+  if (rt && typeof rt === 'object') {
+    return { ...DEFAULTS, ...rt };
+  }
+  return DEFAULTS;
+}
+
+const thresholds = loadResourceThresholds();
+
+// ---------------------------------------------------------------------------
+// Learnings loader — top-15 active learnings from learnings.jsonl
+// ---------------------------------------------------------------------------
+//
+// Delegates to scripts/lib/learnings/surface.mjs (`surfaceTopN`). Same filter
+// semantics as the original inline implementation: confidence > 0.3 AND
+// (no expires_at OR expires_at > now), sorted by effectiveScore DESC (#670
+// time-decay), then created_at DESC, then sliced to n=15. The `evolve.decay`
+// Session Config block is threaded through `decayOptsFromConfig` so the
+// documented decay knobs (decay-enabled / decay-half-life-days /
+// decay-floor-factor) actually take effect here (#670). Errors swallowed → [].
+
+const surfacedLearnings = await surfaceTopN(
+  resolveLedgerPath('.orchestrator/metrics/learnings.jsonl', process.cwd()), // #1722
+  15,
+  { decay: decayOptsFromConfig(config && config['evolve.decay']) }
+);
+
+// ---------------------------------------------------------------------------
+// Branch detection for autopilot_run_id construction
+// ---------------------------------------------------------------------------
+
+function detectBranch() {
+  try {
+    const result = spawnSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], {
+      encoding: 'utf8',
+      timeout: 5_000,
+    });
+    if (result.status === 0 && result.stdout) {
+      return result.stdout.trim() || null;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+const branch = detectBranch();
+
+// ---------------------------------------------------------------------------
+// sessions.jsonl helpers for sessionRunner
+// ---------------------------------------------------------------------------
+
+// #1592: the child runs with cwd = process.cwd() and its close writes the
+// ledger at resolveEventsLedgerRoot(process.cwd()) (emit-session.mjs) — read
+// the same file, or a run from a linked worktree finds no record.
+const SESSIONS_JSONL_PATH = resolve(resolveEventsLedgerRoot(process.cwd()), '.orchestrator/metrics/sessions.jsonl');
+
+/**
+ * Read the child's canonical record by its raw harness UUID, independent of
+ * semantic session IDs and peer append order. Zero or multiple matches throw;
+ * only the unique record supplies normalized fields and finite token usage.
+ *
+ * A unique record that is a BACKFILL STUB throws too (#1457 F2): a stub is a
+ * placeholder some backfill wrote because the child never closed — no waves,
+ * agents or token totals. Its usage is UNKNOWN, not 0, and its empty
+ * agent_summary/effectiveness would blind the post-session kill-switches as
+ * well, so it fails closed like the zero-match case above: the loop records
+ * kill_switch=failed-wave with a detail naming the stub, instead of counting a
+ * healthy 0-token iteration that silently undercounts --max-tokens.
+ * @returns {{session_id: string, agent_summary?: object, effectiveness?: object,
+ *   usage?: {output_tokens?: number, total_tokens?: number}}}
+ */
+function readOwnSession(childSessionId) {
+  const own = readCanonicalSessions({ filePath: SESSIONS_JSONL_PATH }).filter((r) => r.raw_session_id === childSessionId);
+  if (own.length === 0) {
+    throw new Error(
+      `no session record carries raw_session_id=${childSessionId} (the child wrote none, or none stamped ` +
+        'with its raw id) — refusing to fall back to the ledger tail (#1457)'
+    );
+  }
+  if (own.length > 1) {
+    throw new Error(`ambiguous: ${own.length} canonical records carry raw_session_id=${childSessionId} (#1457)`);
+  }
+  if (isBackfillStub(own[0])) {
+    throw new Error(
+      `the only record with raw_session_id=${childSessionId} is a backfill stub ` +
+        `(_backfill_source=${own[0]._backfill_source}, no waves/agents/token totals) — token usage unknown, ` +
+        'refusing to count it as a 0-token iteration (#1457 F2)'
+    );
+  }
+  const normalized = normalizeSession(own[0]);
+  const result = {
+    session_id: normalized.session_id,
+    agent_summary: normalized.agent_summary,
+    effectiveness: normalized.effectiveness,
+  };
+  const usage = {};
+  if (Number.isFinite(normalized.total_token_output)) usage.output_tokens = normalized.total_token_output;
+  if (Number.isFinite(normalized.total_tokens)) usage.total_tokens = normalized.total_tokens;
+  if (Object.keys(usage).length > 0) result.usage = usage;
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// Shared resource snapshot (updated by peerCounter on every iteration)
+// ---------------------------------------------------------------------------
+
+/** @type {object|null} */
+let cachedProbeSnapshot = null;
+
+// ---------------------------------------------------------------------------
+// DI seam implementations
+// ---------------------------------------------------------------------------
+
+/**
+ * modeSelector — invoked before each iteration.
+ * Signals are assembled once (surfacedLearnings surfaced before the loop),
+ * but buildLiveSignals is called per-iteration to get fresh STATE.md / sessions.
+ *
+ * @returns {Promise<{mode: string, confidence: number, rationale?: string, alternatives?: object[]}>}
+ */
+async function modeSelector() {
+  // `backlogLimit` is intentionally NOT passed: the window default lives once,
+  // in backlog-scan.mjs (`DEFAULT_BACKLOG_LIMIT`). The hand-written 50 that
+  // stood here under-read this repo's own backlog and hid its critical issues.
+  // `repoRoot` is passed EXPLICITLY (#1071) rather than left to the helper's
+  // cwd default: this driver already reads learnings.jsonl relative to the
+  // invocation directory (and sessions.jsonl from that directory's ledger root,
+  // `SESSIONS_JSONL_PATH`, #1592), and an implicit default is the seam where
+  // those roots silently drift apart.
+  const signals = await buildLiveSignals({
+    repoRoot: process.cwd(),
+    learnings: surfacedLearnings,
+  });
+  return selectMode(signals);
+}
+
+/**
+ * sessionRunner — spawns `claude` with the recommended mode and awaits exit.
+ * Sets a fresh raw harness UUID so a peer's later ledger append is never read
+ * as the child's record (emit-session stamps that UUID as `raw_session_id`).
+ * After exit 0, returns its unique canonical record; zero or multiple matches
+ * throw into the loop's failed-wave channel.
+ *
+ * @param {{mode: string, autopilotRunId: string}} args
+ * @returns {Promise<{session_id: string, agent_summary?: object, effectiveness?: object}>}
+ */
+async function sessionRunner({ mode, autopilotRunId }) {
+  const childSessionId = randomUUID();
+
+  await new Promise((res, rej) => {
+    const childStdio = hasVerbose
+      ? ['ignore', 'pipe', 'pipe']
+      : ['ignore', 'inherit', 'inherit'];
+
+    // `session` is a RESERVED terminal-only built-in name under `claude -p`: the
+    // bare `/session <mode>` form answers "/session isn't available in this
+    // environment." and the child exits having done nothing (measured 2026-09-16,
+    // claude 2.1.273 — `commands/session.md` § Headless). Only the namespaced form
+    // resolves, and only when the plugin that defines it is on `--plugin-dir`.
+    const child = spawn(
+      'claude',
+      ['-p', `/session-orchestrator:session ${mode}`, '--plugin-dir', PLUGIN_ROOT, '--session-id', childSessionId],
+      {
+        env: { ...process.env, AUTOPILOT_RUN_ID: autopilotRunId },
+        stdio: childStdio,
+        cwd: process.cwd(),
+      }
+    );
+
+    if (hasVerbose) {
+      child.stdout.pipe(process.stdout);
+      child.stderr.pipe(process.stderr);
+    }
+
+    child.on('error', (err) => rej(err));
+    child.on('close', (code) => {
+      if (code !== 0) {
+        rej(new Error(`claude exit ${code}`));
+      } else {
+        res(undefined);
+      }
+    });
+  });
+
+  return readOwnSession(childSessionId);
+}
+
+/**
+ * resourceEvaluator — returns the latest cached probe verdict.
+ * The cached snapshot is refreshed by peerCounter before each iteration.
+ * Falls back to probing inline if the cache is null (first iteration safety).
+ *
+ * @returns {{verdict: string, reasons: string[], recommended_agents_per_wave_cap: number|null}}
+ */
+function resourceEvaluator() {
+  if (cachedProbeSnapshot === null) {
+    // Synchronous fallback is not possible since probe() is async.
+    // Return a conservative 'warn' so the loop does not mis-gate on missing data.
+    // The real snapshot will be available after peerCounter runs on the next call.
+    return { verdict: 'warn', reasons: ['probe not yet available'], recommended_agents_per_wave_cap: null };
+  }
+  return evaluate(cachedProbeSnapshot, thresholds);
+}
+
+/**
+ * peerCounter — refreshes the resource snapshot AND returns the peer count.
+ * Using this combined approach lets resourceEvaluator remain synchronous as
+ * required by the runLoop contract.
+ *
+ * @param {string} autopilotRunId — self-id to exclude from peer list.
+ * @returns {Promise<number>}
+ */
+async function makePeerCounter(autopilotRunId) {
+  return async () => {
+    const [peers, snapshot] = await Promise.all([
+      detectPeers({ sessionId: autopilotRunId, freshnessMin: 15 }),
+      probe(),
+    ]);
+    cachedProbeSnapshot = snapshot;
+    return peers.length;
+  };
+}
+
+// ---------------------------------------------------------------------------
+// AbortController for SIGINT
+// ---------------------------------------------------------------------------
+
+const controller = new AbortController();
+process.on('SIGINT', () => {
+  controller.abort();
+});
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
+
+async function main() {
+  // Build the autopilotRunId via runLoop's defaultRunId (driven by branch opt).
+  // We don't construct it ourselves — runLoop builds it from branch + timestamp.
+  // We need it for peerCounter BEFORE runLoop starts. So we replicate the
+  // defaultRunId logic here to derive the same id. However, runLoop accepts
+  // an explicit `runId` override, so we just pre-compute one and pass it in.
+  const now = Date.now();
+  function pad2(n) { return n < 10 ? `0${n}` : String(n); }
+  const d = new Date(now);
+  const ymd = `${d.getUTCFullYear()}-${pad2(d.getUTCMonth() + 1)}-${pad2(d.getUTCDate())}`;
+  const hhmm = `${pad2(d.getUTCHours())}${pad2(d.getUTCMinutes())}`;
+  const safeBranch = (branch ?? 'unknown').replace(/[^A-Za-z0-9._-]+/g, '-');
+  const autopilotRunId = `${safeBranch}-${ymd}-${hhmm}-autopilot`;
+
+  const peerCounter = await makePeerCounter(autopilotRunId);
+
+  const state = await runLoop({
+    maxSessions,
+    maxHours,
+    confidenceThreshold,
+    maxTokens,
+    dryRun,
+    modeSelector,
+    sessionRunner,
+    resourceEvaluator,
+    peerCounter,
+    abortSignal: controller.signal,
+    // STALL_TIMEOUT progress marker. `autopilot.jsonl` is written ONCE per
+    // invocation (after the loop), so its mtime belongs to the PREVIOUS run and
+    // fired the kill-switch after iteration 1; the session.lock heartbeat is
+    // refreshed while a session is alive. See stall-sampler.mjs § PRECEDENCE.
+    sessionLockPath: resolve('.orchestrator/session.lock'),
+    runId: autopilotRunId,
+    branch: branch ?? undefined,
+  });
+
+  const sessionIds = state.sessions.join(', ') || '(none)';
+  // #1498: `tokens_unknown_sessions` (#1487 Pkt 4) reached state, return value
+  // and autopilot.jsonl, but no report showed it — so the token total read as
+  // the whole sum. Printed only when non-zero: then the total is a lower bound.
+  const unknownTokens = state.tokens_unknown_sessions > 0
+    ? ` tokens_unknown_sessions=${state.tokens_unknown_sessions} (the token total is a lower bound)`
+    : '';
+  const summary =
+    `${state.autopilot_run_id} ` +
+    `kill_switch=${state.kill_switch ?? 'none'} ` +
+    `iterations=${state.iterations_completed} ` +
+    `sessions=[${sessionIds}] ` +
+    `duration=${state.duration_seconds}s ` +
+    `tokens=${state.total_tokens_used}${unknownTokens}`;
+  process.stdout.write(summary + '\n');
+
+  if (state.kill_switch === KILL_SWITCHES.FAILED_WAVE) {
+    process.exit(2);
+  }
+  process.exit(0);
+}
+
+main().catch((err) => {
+  process.stderr.write(`autopilot: fatal error: ${err?.message ?? String(err)}\n`);
+  process.exit(1);
+});

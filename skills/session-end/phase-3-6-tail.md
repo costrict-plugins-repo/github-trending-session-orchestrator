@@ -1,0 +1,441 @@
+# Phase 3.6.x Tail — Detail Procedures
+
+> Sub-file of the session-end skill. Full, unabridged procedures for the six Phase 3.6.x tail phases (Memory-Proposals, Expired-Sweep, Auto-Dream, Skill-Judge, Auto-Dialectic, Reconcile). The `SKILL.md` § "Phase 3.6.x Tail — Mechanical Skip-Plan (#724)" dispatcher computes a run/skip plan via `scripts/lib/session-end/phase-skip.mjs` (`planTailPhases()`) and loads ONLY the procedures below whose plan entry has `run: true`. Phase headings here match the `phase` id returned by the aggregator (e.g. `### 3.6.3 …`).
+>
+> Platform state-dir + project-instruction-file resolution notes are inherited from `SKILL.md`. For the full close-out flow, see `SKILL.md`.
+
+### 3.6.3 Memory Proposals Collection (#501, F2.1)
+
+> Gate: Skip this phase entirely when ANY of:
+> - `persistence` is `false` in Session Config
+> - `memory.proposals.enabled` is `false` (default: `true`)
+> - `.orchestrator/metrics/proposals.jsonl` does not exist OR contains zero entries
+
+After learnings are written (Phase 3.6) and BEFORE the Skill-Applied Judge (Phase 3.6.6 — Phase 3.6.5 is retired), collect agent-proposed memory entries written during this session and present them to the operator via `AskUserQuestion` multiSelect. Approved entries flow to `learnings.jsonl` with `_provenance: agent-proposed@<wave-id>`. Rejected entries are archived to `.orchestrator/proposals.rejected.log`.
+
+The proposals queue is populated mid-session by wave-executor agents calling `node scripts/memory-propose.mjs --type ... --subject ... --insight ... --evidence ... --confidence ...`. The CLI enforces:
+- Quota per wave (default 5, configurable via `memory.proposals.quota-per-wave`)
+- Confidence floor (default 0.5, configurable via `memory.proposals.confidence-floor`)
+- Wrong-context guard (CLI exits non-zero when STATE.md `status` is not `active`)
+
+#### Coordinator-direct procedure
+
+1. Read Session Config: `memory.proposals.enabled` (default `true`), `memory.proposals.quota-per-wave` (default 5), `memory.proposals.confidence-floor` (default 0.5), `auto-dream.min-confidence` (default 0.5 — issue #566; SECOND gate above the write-time `memory.proposals.confidence-floor`).
+
+2. Invoke `collectProposals` from `scripts/lib/memory-proposals/collector.mjs`, passing the collect-emit confidence floor from Session Config:
+   ```javascript
+   import { collectProposals } from '${PLUGIN_ROOT}/scripts/lib/memory-proposals/collector.mjs';
+   const { queue, stats, perWaveSummaries } = await collectProposals({
+     repoRoot: process.cwd(),
+     // Issue #566: collect-emit confidence floor. Records with
+     // `record.confidence < minConfidence` are dropped from `queue` (but
+     // counted in stats). When the key is absent, defaults to 0.5 via the
+     // `_parseAutoDream` parser.
+     minConfidence: config['auto-dream']?.['min-confidence'],
+   });
+   ```
+
+3. If `queue.length === 0`: log `memory-proposals: queue empty (stats: ${JSON.stringify(stats)})` and continue.
+
+3b. **Relation judgment (#1016)** — enrich each queued proposal with its relation to the existing corpus, BEFORE step 4 renders its label. Without this, the operator approves a proposal without being told that the corpus already holds it, or holds its opposite.
+
+   > **Cadence contrast — read this before the step above and the step below.** Step 2's `collectProposals` and step 3's short-circuit run ONCE per session-end; step 4 batches ONCE per 4 items. **This step runs once per queued proposal.** The pool build is one call; the judgment is per candidate.
+
+   > **Cost, and where it may run.** The pool build is O(N²) over `queue.length + corpus.length` (~13 ms at N=100 records; viability boundary ~N=2000). Session-end and `/evolve` are the only two sanctioned call sites. Never from a wave dispatch, an inter-wave checkpoint, or a hook.
+
+   Skip when `.orchestrator/metrics/learnings.jsonl` is absent or holds fewer than 2 entries — with no corpus there is no relation to judge. Otherwise:
+
+   ```javascript
+   import { buildCandidatePools } from '${PLUGIN_ROOT}/scripts/lib/learnings/candidates.mjs';
+   import { buildJudgmentInput, judgeCandidate, applyVerdict }
+     from '${PLUGIN_ROOT}/scripts/lib/learnings/judgment.mjs';
+
+   const { entries: corpus } = await readLearnings('.orchestrator/metrics/learnings.jsonl');
+   const { pools } = buildCandidatePools([...queue, ...corpus], { now: new Date() });
+   ```
+
+   `pools[]` is `{seed, candidates}` per seed — a bounded, per-seed, non-transitive neighbour set (a neighbour of a neighbour is not a neighbour; there is no clustering pass). For each pool whose `seed` is a QUEUE item (corpus-seeded pools are not this phase's business):
+
+   1. `buildJudgmentInput({ candidate: pool.seed, neighbours: pool.candidates.map((c) => c.record) })`. It returns `null` for a proposal with no usable `id` — leave that item's label bare and move on.
+   2. `judgeCandidate(input, { judge })`. `judge` is the injected verdict provider: the coordinator reads the `input` envelope and returns the JSON object its `output_contract` field describes. There is no subagent type for this — do not dispatch one (#614: a read-only agent that must write its own sidecar never fires; here the COORDINATOR is the judge and the coordinator holds the result).
+   3. `applyVerdict(verdict, effects)` — the single choke point where a judgment may become an effect. In this phase every handler (`refine`, `supersede`, `merge`, `proposeContradiction`) records the relation onto the queue item so step 4 can render it. **None of them writes to disk here**; the only write this phase performs is step 6's `promoteAndClear()`, on the operator's selection.
+
+   **Fail closed — a voided judgment never reaches the operator.** `verdict.ok === false` (any of the eight failure modes: `unparseable`, `partial`, `phantom_id`, `self_reference`, `empty`, `timeout`, `enum_violation`, `duplicate_target`) means no relation was READ, not that none exists. `applyVerdict` refuses the whole batch — including `proposeContradiction`, the AUQ renderer, because rendering a relation from an unreadable judgment IS the claim. The item then falls through to step 4 with its ordinary bare label, exactly as before #1016. Never substitute a default decision, never repair-retry, never surface the failure mode as if it were a verdict. A judge error is logged (`memory-proposals: judgment voided for <id> (${verdict.failureMode})`) and never blocks the close.
+
+   **Label enrichment (step 4 input).** A proposal carrying a relation renders as `[<type-12>] | <subject-40> | conf=X.XX | <decision> <n>` (e.g. `contradict 1`, `merge 2`) with the judgment's `rationale` leading the option description. A proposal with no relation — `skip`, `abstain`, no pool, or a voided verdict — renders exactly as it does today. The operator's selection remains the only gate; the judgment supplies the relation, never the decision.
+
+4. **AUQ pagination logic**: partition the queue into FIFO batches of 4 inline:
+
+   - Empty queue → silent skip (no AUQ rendered).
+   - 1-4 items → single multiSelect call with all items as options.
+   - 5+ items → sequential multiSelect calls in batches of 4 (FIFO order; final batch may have < 4 items).
+
+   ```javascript
+   // Inlined from former scripts/lib/memory-proposals/auq-partition.mjs (PRD F2.2 #502 closed; see #558 M2).
+   const BATCH_SIZE = 4;
+   const batches = [];
+   if (Array.isArray(queue) && queue.length > 0) {
+     for (let i = 0; i < queue.length; i += BATCH_SIZE) {
+       batches.push(queue.slice(i, i + BATCH_SIZE));
+     }
+   }
+   ```
+
+   Then iterate `batches` and emit one `AskUserQuestion` per batch. The verbatim template is `docs/memory-proposal-flow.md` § AUQ Question Template — keep the two in step:
+
+   ```javascript
+   AskUserQuestion({
+     questions: [{
+       header: "Memory",
+       question: "Batch <N> of <M> — which of these learnings should be stored permanently?",
+       options: [
+         // one entry per proposal in this batch (max 4)
+         // label + description formats are LOCKED by D3 — see that file, do not restate them here
+         { label: "[type   ] | subject(40) | conf=X.XX", description: "evidence: <first 60 chars of insight>" },
+         ...
+       ],
+       multiSelect: true
+     }]
+   })
+   ```
+
+   The batch counter moved out of `header` and into the question because `header` is cut off after 12 characters — `Memory — Confirm Proposals (Batch N of M)` reached the operator as `Memory — Con`.
+
+5. After all batches answered, partition the queue into `approved` (any option selected across all batches) and `rejected` (all unselected).
+
+6. Invoke `promoteAndClear` and `archiveRejected` from `scripts/lib/memory-proposals/sink.mjs`:
+   ```javascript
+   import { promoteAndClear, archiveRejected } from '${PLUGIN_ROOT}/scripts/lib/memory-proposals/sink.mjs';
+   const writeResult = await promoteAndClear({ approved, sessionId, repoRoot });
+   const archiveResult = await archiveRejected({ rejected, repoRoot, reason: 'user-declined' });
+   ```
+
+   > **Ordering invariant (#797/#828 — write-before-clear, clear-only-on-confirmed-success) is now enforced IN-CODE.** `promoteAndClear()` composes `writeApproved()` + `clearProposalsJsonl()` behind a single mechanical guard: it calls `writeApproved({ approved, repoRoot, sessionId })` first, computes `expected` from `approved.length`, and clears `proposals.jsonl` (via `clearProposalsJsonl()`) ONLY when `written === expected && errors.length === 0`. There is no separate `writeApproved` → `clearProposalsJsonl` call sequence left for the coordinator to get wrong or reorder — the guard that used to be a prose instruction here is now a load-bearing conditional inside `promoteAndClear()` itself. The coordinator's remaining job is to INSPECT the returned `{ written, expected, errors, cleared, summariesCleared, skippedReason }` and surface a warning when `writeResult.cleared === false`: log `⚠ memory-proposals: ${writeResult.skippedReason} (${writeResult.written}/${writeResult.expected} written) — queue NOT cleared, retry next session-end` and let the discrepancy carry over to the next session's Phase 3.6.3 pass rather than silently losing the un-written proposals. `promoteAndClear()` throws a `TypeError` before calling `writeApproved()` at all when `sessionId` is missing/blank, or when `approved` is omitted alongside an unrecognised key (arg-name-typo guard, mirroring `writeApproved()`'s own #797 guard one layer up) — treat either thrown error the same as a hard stop: nothing was written, nothing was cleared. As defense-in-depth, `clearProposalsJsonl()` (invoked internally by `promoteAndClear()` on the success path) still archives the full pre-clear content of `proposals.jsonl` to `.orchestrator/runtime/proposals-archive.jsonl` before truncating, so even a clear that runs after an undetected write shortfall leaves a recovery copy behind. `archiveRejected()` remains a separate, caller-driven call — it operates on the disjoint rejected subset and has no bearing on whether the approved write succeeded; call it before or after `promoteAndClear()`, order does not matter between the two.
+
+7. Log outcome for Phase 6 Final Report: `memory.proposals: <queued> queued → <approved> approved, <rejected> rejected (dropped: <dropped> quota, <below_floor> below-floor)`.
+
+#### Failure modes
+
+- If `collectProposals` fails (fs error): log warning `⚠ memory-proposals: collect failed (${err}) — skipping`, do not block session close.
+- If `promoteAndClear`'s internal `writeApproved` call reports errors per-record: those errors surface in `writeResult.errors` and the guard skips the clear (`cleared: false`, `skippedReason: 'write-errors'`); log each error, but continue — session close is never blocked.
+- If `promoteAndClear` throws (missing/blank `sessionId`, or `approved` omitted alongside an unrecognised key — #797/#828 arg-typo guard): log the error and treat it as a hard stop for this phase — nothing was written, nothing was cleared, the queue is untouched.
+- If `writeResult.cleared === false` (partial write, `written !== expected`): the internal guard already skipped `clearProposalsJsonl()` — surface `writeResult.skippedReason` in a warning; do not block session close. The queue is retried at the next session-end's Phase 3.6.3 pass.
+- If the internal `clearProposalsJsonl()` call fails on the success path: log warning; do not block. The file may be re-collected at the next session-end, idempotent. A pre-clear archive copy also survives at `.orchestrator/runtime/proposals-archive.jsonl` when the clear DID run.
+
+#### Cross-references
+
+- Spec: issue #501 — memory-proposals (F2.1); no standalone PRD file
+- Modules: `scripts/lib/memory-proposals/{schema,store,collector,sink}.mjs`
+- Relation judgment (step 3b, #1016): `scripts/lib/learnings/candidates.mjs` (`buildCandidatePools`) · `scripts/lib/learnings/judgment.mjs` (`buildJudgmentInput`, `judgeCandidate`, `applyVerdict`, `JUDGMENT_DECISIONS`, `FAILURE_MODES`)
+- CLI: `scripts/memory-propose.mjs` (agents call this)
+- Hook: `hooks/pre-bash-memory-propose-audit.mjs` (audit trail)
+- Coordinator AUQ spec: `docs/memory-proposal-flow.md` (reference doc)
+- Sibling phases: 3.6.5 Auto-Dream (#502), 3.6.6 Skill-Applied Judge (#645 L3), 3.6.7 Auto-Dialectic (#506)
+- Sibling call site of the same judgment pair: `skills/evolve/SKILL.md` § Step 3.3b (the `/evolve` producer for the `-0.2 if contradicted` branch)
+- Issues: #501 (this phase), #1016 (step 3b)
+
+### 3.6.4 Expired-Learnings Sweep (Advisory — Epic #723 B4)
+
+> Best-effort, non-blocking. Skip silently if the sweep script errors or `.orchestrator/metrics/learnings.jsonl` is absent.
+
+**MECHANICAL since 2026-09-09.** This phase is no longer a two-command prose recipe ("run `--json`, then `--apply --json` when `archived > 0`") — that recipe was the reason the apply path had ZERO session-end callers: measured across three consumer repos, 0 sweeps had ever been applied and 628 learnings were resident in the active stores. The dry-run decision already lives in `planTailPhases()`; the APPLY half now lives in `scripts/lib/session-end/tail-runner.mjs`.
+
+After learnings are written (Phase 3.6) and `planTailPhases()` has produced its `plan` (see § "Phase 3.6.x Tail — Mechanical Skip-Plan" in `references/phase-3-documentation-updates.md`), call `runTailPhases` ONCE and read the `3.6.4` slot of its keyed result:
+
+```javascript
+import { runTailPhases } from '${PLUGIN_ROOT}/scripts/lib/session-end/tail-runner.mjs';
+
+const tail = await runTailPhases({ repoRoot: process.cwd(), plan });
+const sweep = tail['3.6.4'];
+// { ran: true, scanned, archived, archivePath } | { ran: false, reason: 'plan-skip' | 'no-plan' | 'store-role-inbox' | 'error', error? }
+```
+
+- `runTailPhases` delegates to `runExpiredSweep({ repoRoot, plan, now })` — the same module's single-phase entry point — and returns a KEYED shape so a caller keeps working when a second phase becomes mechanical. Today exactly one phase is: 3.6.3, 3.6.5–3.6.8 stay coordinator-executed because they are AUQ-gated or need a subagent dispatch a library function cannot make.
+- **Never throws, fails CLOSED.** Any error yields `{ ran: false, reason: 'error' }` and the close proceeds. Stale-past-grace entries move into `.orchestrator/metrics/learnings-archive.jsonl` (append-only, never deleted).
+- **Report** `sweep.ran`, `sweep.scanned` and `sweep.archived` in the Phase 6 Final Report, e.g. `expired-sweep: 12 archived of 640 scanned`. When `ran: false`, report the `reason` instead — a skipped sweep is a stated outcome, never silence. `store-role-inbox` means this host only appends to `learnings-inbox.jsonl` (owner.yaml `learnings.store-role: inbox`, #1516); the writer host sweeps.
+- **The proof it ran is the event `orchestrator.learnings.sweep_applied`** in `.orchestrator/metrics/events.jsonl` (payload source `session-end-3.6.4`, which separates it from the standalone CLI). A close claiming a sweep with no such event did not sweep.
+
+The standalone `node scripts/sweep-expired-learnings.mjs --apply --json` CLI remains available for manual/out-of-session use; it is no longer the session-end path.
+
+### 3.6.5 Auto-Dream Dispatch (#502, F2.2) — RETIRED
+
+> **RETIRED 2026-09-09.** The nudge is replaced by the session-start `maintenance-due` probe (`checkMaintenanceDue`, `scripts/lib/maintenance-due-banner.mjs`), whose `memory-cleanup` signal reuses the very same `shouldDispatchAutoDream` decision — a nudge emitted while the operator is closing down was read by nobody. Its decider is also gone from `planTailPhases()` in `scripts/lib/session-end/phase-skip.mjs`; the heading stays because other docs cite it.
+> The housekeeping session runs `/memory-cleanup` itself (see `skills/session-start/SKILL.md` Phase 7 — the maintenance loop). `scripts/lib/auto-dream.mjs` (`shouldDispatchAutoDream`, `readDreamSignals`, `writePendingDream`, `readPendingDream`, `applyPendingDream`) stays in use: the probe reads it, and `/memory-cleanup --dry-run` / `--apply-pending` still write and consume `.orchestrator/pending-dream.md`. <!-- path-check: example -->
+
+### 3.6.6 Skill-Applied Judge (#645, L3)
+
+> **Default OFF.** Skip this phase — with NO module import and NO sidecar created — unless BOTH gates pass (evaluated in this order):
+> 1. `config['skill-evolution'].judge !== true` → skip (the `judge:` key in the top-level `skill-evolution:` block; default `false`).
+> 2. `persistence === false` in Session Config → skip.
+>
+> When skipped, log `skill-judge: disabled (skill-evolution.judge=false)` (or `persistence=false`) and return. **This is the disabled-path guarantee:** with the judge off, only L1 (`skill-invocations.jsonl`, written by the PreToolUse hook) and L2 (`scripts/lib/skill-health/join.mjs`) records exist — no judgment, no error, zero L3 code executes. Do NOT import `scripts/lib/skill-judge.mjs` on the disabled path.
+
+After learnings are written (Phase 3.6), and when the judge is enabled, run a **bounded, read-only LLM-judge** over this session's selected skills to emit ADVISORY per-skill applied/completed judgments to `.orchestrator/metrics/skill-judgments.jsonl`.
+
+**The #614 distinction (the whole point of L3's Design A):** unlike the 3.6.5 / 3.6.7 nudge-only paths — which cannot dispatch a live subagent because the target read-only agents (`memory-cleanup`, `dialectic-deriver`) cannot write their own sidecars — L3 performs a **LIVE read-only dispatch**. This is #614-safe because the read-only `skill-applied-judge` agent **RETURNS JSON** and the **COORDINATOR writes the sidecar**, not the agent. A read-only agent that returns judgments is allowed; a read-only agent that must write a file is the #614 trap.
+
+**Advisory-only:** the judge output is written with `advisory: true` (schema-rejected otherwise) and **NEVER feeds an auto-action gate** — not a sunset decision, not a C2 repair (`scripts/lib/skill-evolution/*`), not a promotion. Per #645 R9(b) the C2 repair gate stays deterministic; L3 is a signal for humans/dashboards only.
+
+1. Read `config['skill-evolution'].judge` (default `false`), `config['skill-evolution']['judge-budget-tokens']` (default 8000), and `persistence`. Apply the two skip gates above.
+
+2. Determine the **judged set** — only THIS session's selected skills.
+
+   > **Join on the RAW UUID, never on the semantic session id.** The writer is the `PreToolUse` hook `hooks/skill-invocation-telemetry.mjs`, which stamps `session_id` straight from the hook payload (`:190`) — that is the harness UUID. Measured 2026-09-19 over `.orchestrator/metrics/skill-invocations.jsonl` (841 lines): **767 raw UUIDs, 55 semantic ids, 17 null**. Joining on `main-<date>-session-N` therefore matches ~0 rows for a current session, the judged set comes back empty, and the phase reports `empty-input` — a silent no-op indistinguishable from "this session used no skills". The raw id is `process.env.CLAUDE_CODE_SESSION_ID`; it is also the id that names the transcript file in step 3. The repo-global `.orchestrator/session.lock` may name a PEER session (#1664, same class as #1663), so its `session_id` counts only via `resolveSessionIds()`, which returns it only when it is among this process's own ids (`readProcessLocalSessionIds()`) and `null` otherwise. No provable id → empty judged set → `empty-input`, never a judgment of the peer's transcript.
+
+   ```javascript
+   import { readFileSync } from 'node:fs';
+   import { resolveSessionIds } from '${PLUGIN_ROOT}/scripts/lib/state-md.mjs';
+   import { resolveOwnLockRootFor } from '${PLUGIN_ROOT}/scripts/lib/own-lock-root.mjs';
+   import { readProcessLocalSessionIds } from '${PLUGIN_ROOT}/scripts/lib/session-identity/own-session.mjs';
+
+   // Lock id only when provably OWN — never a peer's (#1664), read at the root
+   // holding this process's own lock, not at the cwd (#1730 Pkt 8).
+   const [ownId = null] = readProcessLocalSessionIds();
+   const rawSessionId =
+     (process.env.CLAUDE_CODE_SESSION_ID || '').trim() ||
+     resolveSessionIds({ repoRoot: resolveOwnLockRootFor({ sessionId: ownId }).root }).session_id;
+
+   // No id → no join: `null` would otherwise match the null-session rows.
+   const selectedSkills = !rawSessionId ? [] : [...new Set(
+     readFileSync('.orchestrator/metrics/skill-invocations.jsonl', 'utf8')
+       .split('\n').filter(Boolean)
+       .flatMap((l) => { try { return [JSON.parse(l)]; } catch { return []; } })
+       .filter((r) => r.session_id === rawSessionId && typeof r.skill === 'string')
+       .map((r) => r.skill),
+   )];
+   ```
+
+   If the judged set is empty, `runSkillJudge` returns `status: 'empty-input'` (no dispatch) — log and continue.
+
+3. **Build the evidence window, then invoke `runSkillJudge`.** This is ONE verifying call, not a prose instruction: before #1399 this step named a free variable `transcriptTail` that nothing in the tree produced, so the judge was dispatched with an EMPTY `<untrusted-data-…>` fence. Measured 2026-09-19 at `8f15f77b`: such a prompt is 1387 characters = 346 estimated tokens, well under the 8000-token budget, so the budget gate never caught it — the judge ruled on a transcript it had never seen.
+
+   ```javascript
+   import { buildSkillEvidence } from '${PLUGIN_ROOT}/scripts/lib/skill-evidence-window.mjs';
+   import { runSkillJudge, evidenceBudgetChars } from '${PLUGIN_ROOT}/scripts/lib/skill-judge.mjs';
+   import { appendSkillJudgment } from '${PLUGIN_ROOT}/scripts/lib/skill-judgments-schema.mjs';
+   import { resolveLedgerPath } from '${PLUGIN_ROOT}/scripts/lib/ledger-path.mjs';
+   import path from 'node:path';
+
+   const budgetTokens = config['skill-evolution']['judge-budget-tokens'] ?? 8000;
+   const budget = { input: budgetTokens, output: 4000 };
+
+   // `buildSkillEvidence` resolves ~/.claude/projects/<encoded-repo>/<rawSessionId>.jsonl,
+   // locates each skill's invocation anchors and renders bounded excerpts. Never throws.
+   const evidence = await buildSkillEvidence({
+     repoRoot: process.cwd(),
+     sessionId: rawSessionId,            // RAW UUID — it names the transcript FILE
+     skills: selectedSkills,
+     budgetChars: evidenceBudgetChars(selectedSkills, budget),
+     includeSubagents: true,             // #1412 — see the note below
+   });
+
+   // VERIFY before dispatching — these three numbers are the receipt for this step.
+   console.error(
+     `skill-judge: evidence ${evidence.status} — ${evidence.chars} chars from ` +
+     `${evidence.source.records} records (${evidence.source.malformed_lines} malformed), ` +
+     `skipped: ${JSON.stringify(evidence.skipped)}`,
+   );
+
+   const result = await runSkillJudge({
+     // Claude Code path: wire the real read-only haiku subagent as dispatchAgent.
+     dispatchAgent: ({ model, prompt, maxTokens }) =>
+       Agent({ subagent_type: 'skill-applied-judge', model: 'haiku', prompt, max_tokens: maxTokens }),
+     repoRoot: process.cwd(),
+     sessionId: rawSessionId,
+     evidence,                       // UNTRUSTED excerpts — fenced by the lib
+     selectedSkills,                 // distinct skills from step 2
+     model: 'haiku',
+     budget,
+   });
+   ```
+
+   - `evidence.status` is `no-transcript` (no file for this session id) or `no-evidence` (file read, no invocation anchor found) or `ok`. On the first two the evidence text is `''` and `runSkillJudge` returns `status: 'no-evidence'` **without dispatching** — log and continue, never fabricate a tail to get past it.
+   - `evidence.source.malformed_lines > 0` means the window is a PARTIAL read of the transcript. Log it beside the judgment; a clean verdict over an incompletely-read input is the failure this field exists to expose.
+   - `evidence.truncated === true` or a non-empty `evidence.skipped` means some judged skill got no excerpt — the judge will correctly answer `unknown` for it.
+   - **`includeSubagents: true` is set HERE, not in the library (#1412).** `buildSkillEvidence`'s own default stays `false`, so every other caller keeps the fail-closed behaviour and this one choice is greppable. Without it, a skill dispatched INSIDE a subagent (`<uuid>/subagents/agent-*.jsonl`) has no anchor in the main transcript, the phase reports `no-evidence`, and the reach limit is invisible — `runSkillJudge` correctly does not dispatch, so nothing is mis-judged, but nothing is ever judged either. Cost measured 2026-09-20 over the 3 most recent sessions carrying a `subagents/` dir: records 4.2-5.0x, read time 22 → 175 ms, window size still far under budget.
+   - The extra records are bounded two ways, both inside `renderEvidence`: subagent-only skills share at most `DEFAULT_SUBAGENT_POOL_SHARE` (0.25) of the per-skill pool whenever coordinator-anchored skills are also present, and the shared `### session closing` excerpt is taken from the MAIN transcript's tail (`mainRecordCount`), never from the last subagent file that happens to sit at the end of the concatenated array. Anything that still does not fit is reported in `evidence.skipped` with `truncated: true` — never silently shortened.
+   - **Claude Code path:** `dispatchAgent` wraps the real `Agent({ subagent_type: 'skill-applied-judge', model: 'haiku', … })`. The agent is `sandbox-tier: read-only` and RETURNS one fenced ```json block — it never writes files.
+   - **Codex / Cursor path:** there is no subagent type. Wire `dispatchAgent` as a coordinator-inline call (the coordinator itself reasons over the prompt and returns `{ text }`), keeping the identical `runSkillJudge` signature. Same DI seam, no harness subagent.
+
+4. On `result.status === 'ok'`: the **COORDINATOR** writes each returned judgment to the sidecar. Stamp the per-record metadata (`timestamp`, `event: 'judged'`, `session_id`, `advisory: true`, `model`, `schema_version: 1`) and append:
+
+   ```javascript
+   // In a linked worktree the main checkout's ledger when it is gitignored there (#1722).
+   const judgmentsPath = resolveLedgerPath('.orchestrator/metrics/skill-judgments.jsonl', process.cwd());
+   const nowIso = new Date().toISOString();
+   for (const j of result.judgments) {
+     await appendSkillJudgment(
+       { timestamp: nowIso, event: 'judged', skill: j.skill, session_id: sessionId,
+         applied: j.applied, completed: j.completed, confidence: j.confidence,
+         advisory: true, model: 'haiku' },
+       { path: judgmentsPath },
+     );
+   }
+   ```
+
+   `appendSkillJudgment` re-validates each record; `advisory !== true` is schema-rejected, so a tampered record can never be persisted.
+
+5. On `result.status === 'empty-input'`, `'no-evidence'` or `'budget-exceeded'`: log the status (e.g. `skill-judge: skipped (budget-exceeded used=N budget=M)`, `skill-judge: skipped (no-evidence — ${result.skipped_reason})`) and continue. No sidecar write on any non-ok status, and no dispatch happened on any of them.
+
+6. **Failures are non-fatal.** Any error from the dispatch or write is logged to `.orchestrator/metrics/sweep.log` and the close continues — same posture as Phase 3.6.7. The judge is advisory; a failed judgment must never block session close.
+
+Cross-reference: PRD §A L3 acceptance criteria (#645, epic #643); issue #1399 (the evidence producer + the raw-UUID join); `scripts/lib/skill-evidence-window.mjs` API (`buildSkillEvidence`, `locateSkillAnchors`, `renderEvidence`, `readTranscriptRecords`, `resolveRawSessionId`); `scripts/lib/skill-judge.mjs` API (`runSkillJudge`, `validateModel`, `estimateInputTokens`, `checkBudget`, `buildJudgePrompt`, `evidenceBudgetChars`, `parseJudgeResponse`); `scripts/lib/skill-judgments-schema.mjs` (`appendSkillJudgment`, `readSkillJudgments`, `validateSkillJudgment`); agent `agents/skill-applied-judge.md`.
+
+### 3.6.7 Auto-Dialectic Dispatch (#506, F2.5) — RETIRED
+
+> **RETIRED 2026-09-09.** The nudge is replaced by the session-start `maintenance-due` probe (`checkMaintenanceDue`, `scripts/lib/maintenance-due-banner.mjs`), whose `dialectic` signal reads the side-effect-free `shouldDispatchAutoDialectic` — never a variant that advances the last-run stamp, which would consume the very signal it reports. Its decider is also gone from `planTailPhases()` in `scripts/lib/session-end/phase-skip.mjs`; the heading stays because other docs cite it.
+> The housekeeping session runs `/evolve dialectic` itself (see `skills/session-start/SKILL.md` Phase 7 — the maintenance loop): dry-run first, review `.orchestrator/dialectic-pending.md`, then apply. On that manual path the read-only `dialectic-deriver` agent is dispatched, and `/evolve dialectic` Step 6.4 closes the loop after a successful `--apply` or an explicit discard by calling `writeDialecticLastRun` and `consumeDialecticPending` from `scripts/lib/auto-dialectic.mjs` (`skills/evolve/references/evolve-dialectic-mode.md`); `shouldDispatchAutoDialectic` is read only by the session-start maintenance-due probe. The recording wrapper around that signal, and its `orchestrator.dialectic.nudge_decided` event, were removed in #1288 — nothing emits that event any more. <!-- path-check: example -->
+
+> **Dialectic chain rationale** — design choices in the manual `/evolve --dialectic` chain (`/evolve → runDialecticDeriver → dispatchAgent → Agent`). Session-end no longer auto-dispatches this chain (see #614 — the `evolve` agent never existed); the rationale below applies when you run `/evolve --dialectic` manually:
+> - **/evolve → subagent (not direct invoke):** the manual `/evolve --dialectic` skill spawns a subagent so the dialectic pass runs in a fresh context window — keeping the deriver's input-heavy payload (top-50 learnings + last-10 sessions + 2 peer cards + steering) out of the invoking coordinator's context, and letting the deriver run as Haiku while the coordinator stays Opus.
+> - **/evolve → runDialecticDeriver (not direct dispatchAgent):** /evolve owns argument parsing, config resolution, dry-run/apply gating, error-handling, and sidecar writes; runDialecticDeriver owns the pure derivation pipeline (load → payload → budget-check → dispatch → parse → guard). Separating skill-level orchestration from deriver business logic lets unit tests exercise the deriver without standing up the full evolve skill.
+> - **runDialecticDeriver → dispatchAgent (DI boundary):** per `rules/opt-in-domain/prompt-caching.md:3`, session-orchestrator forbids direct `@anthropic-ai/sdk` imports in business logic (the harness manages caching at the platform layer). dispatchAgent is the injected boundary — the evolve skill wires the real `Agent({...})` harness call at runtime, tests pass a `vi.fn()` mock. Same DI shape as `scripts/lib/autopilot.mjs::runLoop({opts})` (cf. `scripts/dialectic-deriver.mjs:7-16,531`).
+
+### 3.6.8 Reconciliation Rule Proposals (#696, FA3)
+
+> Gate: Skip this phase entirely when ANY of:
+> - `persistence` is `false` in Session Config
+> - `reconcile.enabled` is `false` (default: `false` — opt-in; this is the silent no-op path for all repos that have not opted in)
+> - `.orchestrator/metrics/learnings.jsonl` does not exist OR contains zero entries
+
+After the Skill-Applied Judge (Phase 3.6.6 — Phase 3.6.7 is retired), and when the reconcile engine is enabled, run the **reconciliation engine** to turn high-confidence learnings into conditional-rule proposals and present them to the operator via `AskUserQuestion` multiSelect. Approved proposals flow to `.claude/rules/` via `writeApprovedRules`. Rejected proposals are archived to `.orchestrator/reconcile.rejected.log`. The engine NEVER writes `.claude/rules/` itself — every write is operator-AUQ-gated (#693 FA2/FA3 brandmauer).
+
+#### Coordinator-direct procedure
+
+1. Read Session Config: `reconcile.enabled` (default `false`), `reconcile['rule-expiry-days']` (default `null` — falls back to per-type TTL in the engine), `reconcile['confidence-floor']` (default `0.5`), `reconcile['min-rule-days']` (default `7` — floor window (days) applied to a proposed rule's `expires-at` so a near-dead or already-elapsed natural expiry never produces a born-dead rule, issue #741.1), `reconcile['min-insight-chars']` (default `24` — opt-in minimum insight length gating the eligibility placeholder-insight check, issue #741.2), `reconcile['max-proposals-per-run']` (default `10` — volume brake, issue #900 D; the engine sorts eligible learnings by confidence DESC and proposes at most this many per run). If `reconcile.enabled` is not `true`, log `reconcile: disabled (reconcile.enabled=false)` and skip all remaining steps.
+
+2. Invoke `runReconcileAtSessionEnd` from `scripts/lib/reconcile/engine.mjs`:
+
+   ```javascript
+   import { runReconcileAtSessionEnd } from '${PLUGIN_ROOT}/scripts/lib/reconcile/engine.mjs';
+   const { proposals, rejected, summary, error } = await runReconcileAtSessionEnd({
+     repoRoot: process.cwd(),
+     ruleExpiryDays: config.reconcile['rule-expiry-days'] ?? undefined,
+     minRuleDays: config.reconcile['min-rule-days'] ?? undefined,
+     minInsightChars: config.reconcile['min-insight-chars'] ?? undefined,
+     maxProposalsPerRun: config.reconcile['max-proposals-per-run'] ?? undefined,
+     now: new Date(),
+     // trigger is pinned to 'session-end' IN CODE by runReconcileAtSessionEnd
+     // (#1201 Part A) — this prose block no longer sets it.
+   });
+   ```
+
+   `runReconcile` NEVER throws. If `error` is present on the return value, treat it as a non-fatal failure (see Failure modes below). `proposals` is an array of `{ learningKey, slug, path, content, confidence, candidateId, status: 'proposed' }`; `rejected` carries the ineligible or already-proposed learnings with their audit reasons; `summary` carries `{ eligible, proposed, rejected, errors }` counts.
+
+   > **Note:** `runReconcile` does NOT itself apply a confidence floor — the engine proposes every *eligible* learning and carries each one's `confidence` through. The operator's `reconcile['confidence-floor']` is the **delivery gate**, applied in the next step.
+
+2b. **Apply the confidence floor (delivery gate).** Filter the engine's proposals by `reconcile['confidence-floor']` (default `0.5`) BEFORE the sidecar write and AUQ, so only sufficiently-confident proposals reach the operator:
+
+   ```javascript
+   const floor = config.reconcile['confidence-floor'] ?? 0.5;
+   const surfaced = proposals.filter((p) => typeof p.confidence === 'number' && p.confidence >= floor);
+   ```
+
+   For the remainder of this phase, operate on `surfaced` wherever "proposals" is referenced below. Low-confidence proposals are neither surfaced nor written; they remain eligible in a future session if their confidence rises (the idempotency sidecar does not mark them processed because they were never approved/written).
+
+3. If `surfaced.length === 0`: log `reconcile: 0 proposals above confidence floor (eligible=${summary.eligible}, rejected=${summary.rejected}, floor=${floor})` and continue. No AUQ, no sidecar write.
+
+4. **Write the human-readable proposal sidecar** `.orchestrator/metrics/reconcile-pending.md` so the operator can review raw content outside the AUQ: <!-- path-check: example -->
+
+   ```
+   # Reconciliation Rule Proposals — <ISO timestamp>
+   Session: <sessionId>
+   Engine: ${summary.eligible} eligible → ${summary.proposed} proposed, ${summary.rejected} rejected; ${surfaced.length} above confidence floor
+   
+   ---
+   
+   ## Proposal 1 of N — <slug> (conf=<confidence>)
+   
+   <content>
+   
+   ---
+   
+   ## Proposal 2 of N — ...
+   ```
+
+   Write failures are non-fatal — log WARN and continue to the AUQ.
+
+5. **AUQ pagination logic**: partition proposals into FIFO batches of 4 inline:
+
+   - Empty proposals → silent skip (gate step 3 already handles this).
+   - 1–4 proposals → single multiSelect call with all proposals as options.
+   - 5+ proposals → sequential multiSelect calls in batches of 4 (FIFO order; final batch may have < 4 proposals).
+
+   ```javascript
+   const BATCH_SIZE = 4;
+   const batches = [];
+   if (Array.isArray(surfaced) && surfaced.length > 0) {
+     for (let i = 0; i < surfaced.length; i += BATCH_SIZE) {
+       batches.push(surfaced.slice(i, i + BATCH_SIZE));
+     }
+   }
+   ```
+
+   Iterate `batches` and emit one `AskUserQuestion` per batch:
+
+   ```javascript
+   AskUserQuestion({
+     questions: [{
+       header: "Regeln",
+       question: "Batch <N> of <M> — which rule proposals should be written into .claude/rules/?",
+       options: [
+         // one entry per proposal in this batch (max 4)
+         { label: "<slug-40>", description: "Confidence <confidence>. First 80 chars of the rendered rule text: <…>" },
+         ...
+       ],
+       multiSelect: true
+     }]
+   })
+   ```
+
+   The batch counter moved out of `header` and into the question because `header` is cut off after 12 characters — `Reconciliation — Confirm Rule Proposals (Batch N of M)` reached the operator as `Reconciliati`. The rendered `content` shown in the description is the rule prose that will land on disk.
+
+6. After all batches are answered, partition proposals into `approved` (any option selected across all batches) and `rejected` (all unselected). Proposals the operator rejected join the engine's `rejected` array for archival — each one STAMPED with an explicit `operatorRejected: true` flag first:
+
+   ```javascript
+   // `declined` = the surfaced proposals the operator left unselected across all batches.
+   const operatorRejected = declined.map((item) => ({ ...item, operatorRejected: true }));
+   ```
+
+   The flag is what `writer.mjs`'s `isOperatorRejection()` keys on to decide whether the item gets a TERMINAL sidecar stamp (#1042). Engine-side rejections (the `rejected` array `runReconcile` returned) MUST NOT be stamped — they carry no flag and stay proposable next run. Without the flag the writer falls back to an implicit content-presence heuristic (deprecated, see `writer.mjs`); do not rely on it in new call sites.
+
+7. Invoke `writeApprovedRules` from `scripts/lib/reconcile/writer.mjs`:
+
+   ```javascript
+   import { writeApprovedRules } from '${PLUGIN_ROOT}/scripts/lib/reconcile/writer.mjs';
+   const writeResult = await writeApprovedRules({
+     approved,
+     rejected: [...rejected, ...operatorRejected],
+     repoRoot: process.cwd(),
+     // #1099 — FORWARD BOTH. `decideReconcile()` already resolved them onto its
+     // RUN decision (`scripts/lib/session-end/phase-skip.mjs`, `targets` +
+     // `baselineRoot`); dropping them here silently pins every session to
+     // repo-local writes no matter what `reconcile.targets` says. Absent
+     // `baselineRoot` is the documented no-op path, not an error.
+     targets: decision.targets,
+     baselineRoot: decision.baselineRoot,
+     sessionId,
+   });
+   // writeResult = { written: number, archived: number, errors: string[] }
+   //   on a budget refusal (#1316) additionally: { ok: false, reason: 'instruction-budget-exceeded', axis, current, projected, ceiling, hint }
+   ```
+
+   `writeApprovedRules` is lock-serialised (via `withFileLock` on `.orchestrator/rules.lock`) and writes each approved proposal to the directory its target names — `.claude/rules/<slug>.md` for `repo-local`, `<baselineRoot>/proposals/<slug>.md` for `baseline`. Each target's write root is confined separately; the leaf comes from the renderer-minted `slug`, never from a caller-supplied path. Rejected proposals (engine-rejected + operator-rejected) are archived to `.orchestrator/reconcile.rejected.log` with reason `user-declined` for operator-rejected and the engine's own audit reason for engine-rejected.
+
+8. Log outcome for Phase 6 Final Report: `reconcile: ${surfaced.length} surfaced → ${approved.length} approved (written: ${writeResult.written}), ${operatorRejected.length} operator-declined${writeResult.errors.length > 0 ? `, ${writeResult.errors.length} write-errors (see sweep.log)` : ''}`. On a budget refusal (`writeResult.reason === 'instruction-budget-exceeded'`) log instead `reconcile: budget pre-flight refused the batch (${writeResult.axis} ${writeResult.projected}/${writeResult.ceiling}) — nothing written; consolidate, then re-run /reconcile` — that branch writes nothing to sweep.log.
+
+#### Failure modes
+
+- If `runReconcile` returns an `error` field (top-level exception caught internally): log `⚠ reconcile: engine error (${error}) — skipping`; do not block session close. No AUQ, no sidecar write.
+- If the sidecar write (step 4) fails: log warning `⚠ reconcile: reconcile-pending.md write failed (${err})`; continue to the AUQ regardless.
+- If `writeApprovedRules` returns `ok: false` with `reason: 'instruction-budget-exceeded'` (`BUDGET_REFUSAL_REASON`, #1316): the budget pre-flight refused the WHOLE batch — nothing was written, archived or stamped (operator rejections included, so they resurface on the next run). Log `⚠ reconcile: budget pre-flight refused (${writeResult.axis} ${writeResult.projected}/${writeResult.ceiling}) — consolidate into a thematic rule file (docs/rule-authoring.md § Consolidated rules), then re-run /reconcile` and continue.
+- Otherwise, if `writeApprovedRules` reports per-rule errors in `writeResult.errors`: log each to `.orchestrator/metrics/sweep.log` and continue. Per-rule fault isolation — one failed write does not prevent the others; the budget refusal above is the one batch-wide exception.
+- All failures are non-fatal. Session close is never blocked by reconcile errors — same posture as Phase 3.6.7.
+
+#### Cross-references
+
+- Issues: #696 (FA3 Advisory Delivery), #693 (Epic — Reconciliation Engine), #695 (FA2 engine), #697 (FA4 Guardrails — next phase)
+- Modules: `scripts/lib/reconcile/engine.mjs` (`runReconcile`) · `scripts/lib/reconcile/writer.mjs` (`writeApprovedRules`) · `scripts/lib/config/reconcile.mjs` (`_parseReconcile`)
+- Sibling modules: `scripts/lib/reconcile/{eligibility,emitter,renderer,idempotency}.mjs`
+- Sibling phases: 3.6.3 Memory-Proposals Collection (#501), 3.6.5 Auto-Dream (#502), 3.6.6 Skill-Applied Judge (#645 L3), 3.6.7 Auto-Dialectic (#506)
+- AUQ spec: `.claude/rules/ask-via-tool.md` AUQ-004 (coordinator-only; this AUQ runs in the coordinator, not in a subagent)

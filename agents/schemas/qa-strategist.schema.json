@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://session-orchestrator.dev/agents/qa-strategist.schema.json",
+  "title": "qa-strategist agent output",
+  "description": "Machine-readable summary returned by the qa-strategist agent after a test-coverage gap analysis. Mirrors the Output Format section of agents/qa-strategist.md.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["verdict", "gap_counts", "source_files_reviewed", "test_files_reviewed"],
+  "properties": {
+    "verdict": {
+      "type": "string",
+      "enum": ["PROCEED", "PROCEED_WITH_FOLLOWUPS", "FIX_REQUIRED", "BLOCKED"],
+      "description": "Overall disposition: PROCEED = adequate coverage; PROCEED_WITH_FOLLOWUPS = LOW/MEDIUM gaps only; FIX_REQUIRED = HIGH coverage gap that risks production silent failure; BLOCKED = cannot complete analysis."
+    },
+    "report_path": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Optional. Relative path under .orchestrator/audits/ where the coordinator stores the reviewer's returned human-readable gap report; the read-only reviewer does not write it."
+    },
+    "gap_counts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["high", "med", "low"],
+      "properties": {
+        "high": { "type": "integer", "minimum": 0 },
+        "med": { "type": "integer", "minimum": 0 },
+        "low": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "redundancy_counts": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Over-testing findings — the symmetric counterpart to `gap_counts`. A high count here calls for consolidation/deletion, never for writing more tests.",
+      "properties": {
+        "duplicate": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Tests exercising the same branch with equivalent inputs; all but one can be deleted without losing catch-power."
+        },
+        "worthless": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Tests that still pass when the implementation body is replaced with `throw new Error()` — tautological computations, assert-nothing bodies, overly-generous assertions."
+        },
+        "framework_only": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Tests verifying the language, the framework, or the presence of a string in a document rather than this repo's behaviour."
+        }
+      }
+    },
+    "test_to_src_ratio": {
+      "type": "number",
+      "minimum": 0,
+      "description": "Test LOC divided by source LOC over the reviewed scope. A signal, not a verdict — interpret only alongside `redundancy_counts`."
+    },
+    "source_files_reviewed": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Number of source files examined."
+    },
+    "test_files_reviewed": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Number of test files examined."
+    },
+    "blockers": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Free-text blocker descriptions; empty array when verdict is not BLOCKED."
+    }
+  }
+}

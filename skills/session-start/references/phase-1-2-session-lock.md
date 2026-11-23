@@ -1,0 +1,173 @@
+# Phase 1.2 + 1.2.1: Session Lock Acquire and Peer-Guard
+
+> Sub-file of the session-start skill (#1157 — agentskills.io: SKILL.md core < 500 lines, procedure in `references/`). Extracted VERBATIM from `skills/session-start/SKILL.md`; `SKILL.md` keeps a one-line stub naming this phase and its gate condition.
+
+## Phase 1.2: Session Lock Acquire (#330)
+
+> **See also Phase 0.5 (Parallel-Aware Preamble)** — the cross-worktree detection runs first. This Phase 1.2 handles the single-worktree local-lock semantics that complement the preamble.
+
+> Skip this phase if `persistence` config is `false`.
+
+Acquire a distributed session-lock to detect parallel sessions in the same repo before initializing STATE.md. This prevents two concurrent Claude/Codex sessions from stomping each other's wave state and metrics writes.
+
+**Mechanical wiring (Epic #583, 2026-05-27):** The SessionStart hook (`hooks/on-session-start.mjs` → `hooks/_lib/lock-bootstrap.mjs`) now writes `.orchestrator/session.lock` mechanically BEFORE this skill's prose runs. The prose Phase 1.2 becomes confirmatory — it verifies the lock exists with the expected shape via `readLock({ repoRoot: lockRoot })`, where `lockRoot = resolveOwnLockRootFor({ sessionId }).root` (`scripts/lib/own-lock-root.mjs`, #1730): the checkout whose lock carries the raw id, so a Phase 1.2 run after `EnterWorktree` or a `cd` finds the lock it already holds instead of taking a second one beside the cwd; with no such lock it is the cwd's checkout, as before. Re-call `acquire()` only if `readLock()` returns `null` (mechanical hook failed) OR the existing lock's raw `session_id` does not exactly match the current session's raw id (a rare divergence — surface via AUQ before overwriting). A matching `semantic_session_id`, STATE.md `session`, or owner proof cannot repair that mismatch. The decision flow below still applies to all six outcomes (active / stale / corrupt / unreadable / fs-error / busy) when the prose path needs to acquire. Every `ok: true` from `acquire()` / `forceAcquire()` also rewrites `.orchestrator/runtime/lock-owner-proof.json` for the new lock (#1541), so the `/close` release stays proof-gated; a failed proof write is reported as `result.ownerProof: { ok: false, reason }`, never thrown.
+
+```javascript
+import { acquire, forceAcquire } from 'scripts/lib/session-lock.mjs';
+import { resolveOwnLockRootFor } from 'scripts/lib/own-lock-root.mjs';
+const lockRoot = resolveOwnLockRootFor({ sessionId }).root;
+const result = acquire({ sessionId, mode: sessionType, ttlHours: 4, repoRoot: lockRoot });
+```
+
+Where `sessionId` is the physical raw identity for this invocation: the native harness-provided raw id, or a generated UUID when no trustworthy raw id exists. It is the only value passed to `acquire()` and the only live lock/registry ownership key. `semanticSessionId` may be recorded separately as an attribution/history label and may populate STATE.md `session`; neither label is a substitute for `sessionId`. `sessionType` is the session mode (`housekeeping`, `feature`, or `deep`).
+
+### Decision flow
+
+1. **`result.ok === true`** → lock is held. Continue to Phase 1.5 (Session Continuity). The lock must be released in session-end.
+
+2. **`result.ok === false`** with `reason === 'active'**:
+   - Another Claude/Codex session holds an active lock in this repo.
+   - `existingLock` is `null` only when a lost create race found the winner's lock already gone — call `acquire()` once more instead of prompting.
+   - Present a choice via `AskUserQuestion`:
+     ```js
+     // `ageHours` comes off the acquire() result (age from started_at, #1494) and can be
+     // null when started_at is unparseable — render "start time unreadable" then.
+     const started = ageHours === null ? 'start time unreadable' : `started ${ageHours.toFixed(1)}h ago`;
+     AskUserQuestion({
+       questions: [{
+         question: `Another session holds the lock here — ${started}, mode=${existingLock.mode}, host=${existingLock.host}, pid=${existingLock.pid}. Wait, or take the lock?`,
+         header: "Session lock",
+         multiSelect: false,
+         options: [
+           { label: "Abort (Recommended)", description: "Stop here and let the other session finish, then start again. Nothing is written until it releases the lock, and two sessions sharing one wave state overwrite each other's metrics." },
+           { label: "Force-take the lock", description: "Overwrites the active lock and starts anyway. Only when that session is certainly gone — otherwise both keep writing the same wave state and one of them loses everything." },
+         ],
+       }],
+     });
+     ```
+   - **Codex CLI / Cursor IDE fallback (numbered Markdown list):**
+     ```
+     Another session holds the lock here — started <ageHours>h ago, mode=<mode>, host=<host>, pid=<pid>. Wait, or take the lock?
+     1. Abort (Recommended) — stop here and let the other session finish, then start again; nothing is written until it releases the lock.
+     2. Force-take the lock — overwrites the active lock. Only when that session is certainly gone, otherwise both keep writing the same wave state and one loses everything.
+     Reply with the number of your choice.
+     ```
+   - On **Abort**: exit session-start cleanly with a brief stderr note (`session-lock: aborted — active lock held by session_id=<id>`). Do NOT initialize STATE.md.
+   - On **Force-take**: call `forceAcquire({ sessionId, mode: sessionType, ttlHours: 4, repoRoot: lockRoot })`. Only when it returns `ok: true` does the session hold the lock; any other result follows the decision flow for that result instead (e.g. `busy`). After `ok: true` and once Phase 1.5 initializes STATE.md, append a deviation via `appendDeviation()`:
+     `Force-took session lock from session_id=<existingLock.session_id>, age=<ageHours>h, mode=<existingLock.mode>, pid=<existingLock.pid>`. Continue.
+
+3. **`result.ok === false`** with `reason === 'stale-heartbeat'`:
+   - A stale lock was found (its last heartbeat is older than its ttl). Likely left behind by a session that crashed or was force-killed. The lock's recorded `pid` is NOT consulted — it belongs to the ephemeral hook subprocess that wrote the lock, never to the session; measured 2026-08-23: 7 of 7 recorded pids were dead, including the live heartbeating session's own (#1137).
+   - Present a choice via `AskUserQuestion`:
+     ```js
+     // `heartbeatAgeMinutes` and `ageHours` come straight off the acquire() result (#1137);
+     // `sameHost` is not on the result — compute it first. Use hostnamesMatch, NEVER a raw
+     // `===` against os.hostname(): the hostname flips spelling on a single machine
+     // (measured 2026-08-24: `Mac.home` and `Ferdinands-MacBook-Pro.local` ten minutes apart),
+     // so a raw comparison labels this machine's OWN lock "another machine" (#1072).
+     // `||`, not `??` — an EMPTY-STRING host_id must fall back to `host`, or
+     // hostnamesMatch('', …) is false and this machine reads its own lock as
+     // cross-host. Production uses `lockHostCandidate()` from host-identity.mjs.
+     const sameHost = hostnamesMatch(existingLock.host_id || existingLock.host, os.hostname());
+     // Both figures can be `null`, and a template literal renders null as "null" while
+     // Math.round(null) is 0 — "0 minutes ago" for a lock that NEVER heartbeat. A lock
+     // without `last_heartbeat` is stale because nothing heartbeats it (#595 sunset), not
+     // because its ttl ran out, so the ttl wording branches with it.
+     const started = ageHours === null ? 'start time unreadable' : `started ${ageHours.toFixed(1)}h ago`;
+     // A NEGATIVE heartbeatAgeMinutes is a heartbeat stamped more than 5 minutes in the
+     // future (hand edit, clock stepped back) — not live since #1494, and not "-N minutes ago".
+     const heartbeat = heartbeatAgeMinutes === null
+       ? 'last heartbeat: never (lock has no last_heartbeat), so nothing has kept it alive'
+       : heartbeatAgeMinutes < 0
+         ? `its last heartbeat is stamped ${Math.round(-heartbeatAgeMinutes)} minutes in the future, so nothing proves it alive`
+         : `its ttl=${existingLock.ttl_hours}h has expired, and its last heartbeat was ${Math.round(heartbeatAgeMinutes)} minutes ago`;
+     AskUserQuestion({
+       questions: [{
+         question: `A stale session lock is in the way — ${started} on host=${existingLock.host}${sameHost ? '' : ' (another machine)'}, ${heartbeat}. Reclaim it?`,
+         header: "Stale lock",
+         multiSelect: false,
+         options: [
+           { label: "Reclaim (Recommended)", description: "Overwrites the stale lock and continues, because nothing has refreshed its heartbeat within its time-to-live. When that process is really dead, nothing of the old session is lost." },
+           { label: "Abort — investigate manually", description: "Stops here and writes nothing. The lock file `.orchestrator/session.lock` (it names the process that wrote it) tells you whether that session is still alive." },
+         ],
+       }],
+     });
+     ```
+   - **Codex CLI / Cursor IDE fallback (numbered Markdown list):**
+     ```
+     A stale session lock is in the way — started <ageHours>h ago on <host>, ttl=<ttlHours>h expired, last heartbeat <heartbeatAgeMinutes> minutes ago. Reclaim it?
+     (heartbeatAgeMinutes null → replace the ttl/heartbeat clause with "last heartbeat: never (lock has no last_heartbeat)"; negative → "last heartbeat stamped <N> minutes in the future"; ageHours null → "start time unreadable")
+     1. Reclaim (Recommended) — overwrites the stale lock and continues, because nothing has refreshed its heartbeat within its time-to-live.
+     2. Abort — stops here and writes nothing. The lock file `.orchestrator/session.lock` (it names the process that wrote it) tells you whether that session is still alive.
+     Reply with the number of your choice.
+     ```
+   - On **Reclaim**: call `forceAcquire({ sessionId, mode: sessionType, ttlHours: 4, repoRoot: lockRoot, onlyIfNotLive: true })` — the single-winner takeover (#1494): if another session reclaimed the lock in the meantime, it returns that session's `active` result instead of overwriting it; follow the decision flow for the returned result (likewise for `busy`). Append the deviation only after `ok: true`, once Phase 1.5 initializes STATE.md:
+     `Stale-lock reclaim: replaced lock from session_id=<existingLock.session_id>, age=<ageHours>h, pid=<existingLock.pid>`. Continue.
+   - On **Abort**: exit cleanly.
+
+4. **`result.ok === false`** with `reason === 'corrupt'`:
+   - `.orchestrator/session.lock` contains invalid JSON or fails the lock schema. The SessionStart hook reclaims this case mechanically and prints a stderr warning when no live reclaim tombstone protects the lease.
+   - A failed exclusive restore can leave a partial primary such as `{` beside a live `.session.lock.reclaim.<hex>` tombstone. SessionStart can recover its own lease during acquire or conditional force-refresh. Under `.write`, the lock manager moves the partial file aside, verifies its bytes, and creates the primary exclusively with the caller's mode, TTL and semantic ID. A successor that has claimed the path keeps it. The tombstone is removed only after the restored generation is read back. A foreign live tombstone is reported as `active`.
+   - TTL must be greater than zero and at most 24 hours (six times the 4-hour default). Invalid on-disk TTLs cannot keep a tombstone live.
+   - No AUQ — the answer is derivable (AUQ-001.2). Log `⚠ session-lock: .orchestrator/session.lock was not a valid lock record — reclaiming.`, call `forceAcquire({ sessionId, mode: sessionType, ttlHours: 4, repoRoot: lockRoot, onlyIfNotLive: true })` (an `active` result means another session got there first; any non-ok result, including `busy` or `fs-error`, follows the decision flow for that result instead). Only after `ok: true`, once Phase 1.5 initializes STATE.md, append a deviation: `Corrupt-lock reclaim: replaced an unparseable .orchestrator/session.lock`. Continue.
+
+5. **`result.ok === false`** with `reason === 'unreadable'`:
+   - `.orchestrator/session.lock` exists but cannot be read (`result.error`, e.g. `EACCES`, or `EISDIR` for a directory at the path). Nothing was written, and it is never reclaimed: no lock writer produces such a path, and a directory may hold content nobody here created (PSA-003). The SessionStart hook already printed a stderr WARN and emitted `orchestrator.session.lock.read_anomaly` (`status: 'unreadable'`).
+   - No AUQ — the operator has to inspect the path; nothing the session could pick fixes it (AUQ-001.2). Log `⚠ session-lock: .orchestrator/session.lock exists but cannot be read (<error>). Continuing without lock (degraded mode) — inspect or remove it by hand.`, proceed without a lock, and after Phase 1.5 append a deviation: `Session lock unreadable (<error>) — ran without a lock`.
+
+6. **`result.ok === false`** with `reason === 'fs-error'**:
+   - Filesystem error when writing the lock file. Log `⚠ session-lock: acquire failed — <error>. Continuing without lock (degraded mode).` and proceed without a lock. Do NOT block the session for a transient FS error.
+
+7. **`result.ok === false`** with `reason === 'busy'`:
+   - `.orchestrator/session.lock.write` (or its `.orchestrator/session.lock.write.acquire` guard) stayed held for the whole bounded retry budget, by a live writer or by a guard file a killed writer left behind. Nothing was written and nothing is known about the primary lock's owner or liveness — never treat `busy` as a takeover or as a free lock.
+   - No AUQ (AUQ-001.2). Retry the same call once after a short pause. Still `busy`: log `⚠ session-lock: lock write guard stayed busy (.orchestrator/session.lock.write, .orchestrator/session.lock.write.acquire). Continuing without lock (degraded mode) — a leftover guard file needs inspection by hand.`, proceed without a lock, and after Phase 1.5 append a deviation: `Session lock busy (write guard held) — ran without a lock`.
+
+> **New reasons from P1.2 #570:** When called with the optional `activeSessions` argument, `acquire()` can also return `active-incompatible-exclusive`, `active-compatible-parallel`, or `active-readonly-bypass`. Session-start invokes `acquire()` WITHOUT `activeSessions` (the preamble in Phase 0.5 already handled cross-worktree detection); these new reasons surface only in callers that bypass the preamble. Other entry-points (autopilot, session-plan, wave-executor, session-end) follow the same pattern.
+
+### Cross-host behaviour
+
+When `hostnamesMatch(existingLock.host_id || existingLock.host, os.hostname())` is **false** — never a raw `existingLock.host !== os.hostname()`, which labels this machine's own lock "another machine" the moment the hostname flips spelling (#1072; mirror the Phase-1.2 snippet above) — the lock was written on another machine and nothing local can corroborate its heartbeat. `checkStale()` carries no `pidAlive` field at all (REMOVED in #1151; #1137 had left it as an always-`null` stub) — `heartbeatAgeMinutes` is the magnitude to reason from, and `isLive` the verdict. In this case:
+- For `reason === 'active'`: the recommendation is **Abort** — cross-host locks cannot be verified as dead.
+- For stale reasons: the recommendation is still **Reclaim** only if TTL is clearly expired (>2× ttl_hours). Otherwise default to **Abort**.
+- **Never auto-reclaim cross-host locks** under any circumstance — always present the AUQ and let the user decide.
+- The AUQ question text for cross-host cases should note: `"(cross-host — the heartbeat cannot be corroborated locally)"`. Do NOT phrase it as PID liveness: the pid on a lock belongs to the ephemeral writer subprocess, not the session, and is never probed (#1137/#1151).
+
+## Phase 1.2.1: Peer-Guard (Epic #583 defense-in-depth)
+
+> Skip this phase if `persistence` config is `false`.
+
+After Phase 1.2 acquires (or confirms) the lock, use `findPeers(repoRoot, { mySessionId: callerSessionHint })` for the STATE.md peer guard. `callerSessionHint` is the original semantic attribution label when one exists, otherwise the raw `sessionId`: `findPeers` may translate the semantic hint for the discovered lock/registry surface only after the exact raw binding check in `parallel-aware-preamble.md`, while keeping the original hint for STATE.md. This catches the rare case where lock-based detection missed an active peer (e.g., the peer's `session.lock` was force-deleted by an out-of-band sweep but STATE.md is still `status: active`, OR the peer's registry write succeeded but the lock-bootstrap hook crashed before the lock landed).
+
+```javascript
+import { findPeers } from '$PLUGIN_ROOT/scripts/lib/peer-discovery.mjs';
+// Keep the STATE.md comparison in its original attribution-label space.
+// findPeers performs the guarded semantic→raw translation only for discovered peers.
+const callerSessionHint = semanticSessionId ?? sessionId;
+const { peers } = await findPeers(process.cwd(), { mySessionId: callerSessionHint });
+const peer = peers.find((p) => p.source === 'state-md') ?? null;
+// Phase 1.2.1 consumes only the 'state-md' subset (STATE.md surface only).
+if (peer) {
+  // STATE.md is owned by an active peer — do NOT overwrite.
+  // peer.sessionId, peer.mode, peer.currentWave, peer.ageHours are populated.
+  // Fire the Worktree-Promotion AUQ from parallel-aware-auq.md.
+}
+```
+
+GH#67 note: the `lockSuperseded` advisory-downgrade described in Phase 0.5's outcome handling applies only to the `discovered` peer subset — this phase's `peer` is always `source: 'state-md'`, so a `discovered`-side `lockSuperseded: true` never suppresses this guard; the Worktree-Promotion AUQ still fires exactly as below whenever a live STATE.md peer is found.
+
+### Decision flow
+
+1. **`peer === null`** → no active peer owns STATE.md. Continue to Phase 1.5.
+2. **`peer !== null`** → STATE.md is owned by a live peer session. **Do NOT proceed with the default Phase 1.5/1b STATE.md overwrite.** Fire the Worktree-Promotion AUQ from `skills/_shared/parallel-aware-auq.md` (same options the Phase 0.5 preamble would emit on `PROMOTION_OFFER`).
+   - User picks "Worktree anlegen + starten" → call `enterWorktree({ ..., rawSessionId, reason: 'worktree-promotion' })` from `scripts/lib/autopilot/worktree-pipeline.mjs` — since #1170 this ONE call also releases the source root: it calls `leaveSourceRoot({ repoRoot, sessionId: rawSessionId, semanticSessionId, reason })` from `scripts/lib/session-transition.mjs` internally, on BOTH success exits, so no separate `leaveSourceRoot` call is made at this site. `rawSessionId` is the RAW physical `session_id` read from this root's `.orchestrator/session.lock` via `readLock({ repoRoot })`, never the semantic label and never `current-session.json` (which may describe a peer, #863) — (#1069 process boundary: this site runs AFTER Phase 1.2 already acquired the lock, so the old root MUST be deregistered and its lock released here, or the new worktree's own Phase 1.2 finds a phantom owner). The return value's `left` field carries `leaveSourceRoot()`'s result; it never throws, so on `left.ok !== true` `enterWorktree` itself emits the stderr WARN `enterWorktree: leaveSourceRoot: <reason>` and the promotion continues regardless — the destination worktree already exists, so aborting here would leave exactly the two-live-roots state the call prevents. Then exit Phase 1 immediately (the new worktree's own session-start runs from scratch).
+   - User picks "Manuell — in-place daneben" → append a Deviation describing the missed peer detection, continue to Phase 1.5. STATE.md WILL be overwritten — the user has explicitly accepted that risk.
+   - User picks "Abbrechen" → exit cleanly.
+
+### Soft-gate semantics
+
+This is a SOFT-GATE — the operator can override via the AUQ — but the warning is mandatory and must not be silenced. Treat any `checkPeerStateMd` failure (read error, malformed STATE.md, etc.) as `peer === null` (fail-open: do not block the session for a corrupted STATE.md file; the rest of the parallel-aware machinery still applies).
+
+### Why this complements Phase 1.2
+
+Phase 1.2 owns the `.orchestrator/session.lock` file; Phase 1.2.1 owns the STATE.md frontmatter. The two surfaces can disagree (briefly, during a crash; durably, if a sweep deleted one but not the other). The Peer-Guard treats STATE.md as a second, independent source of truth — if EITHER source says a peer is active, the coordinator must pause before stomping shared state.
+

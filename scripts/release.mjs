@@ -1,0 +1,4723 @@
+#!/usr/bin/env node
+// scripts/release.mjs
+//
+// Release als ein Dispatch — the local half of issue #978.
+//
+// WHY THIS EXISTS (the incident class):
+//   Version, tag, npm publish, README badge, CHANGELOG entry, site copy and
+//   the two plugin manifests were SEVEN independent manual acts. Every past
+//   release forgot at least one: v3.18.0 shipped without its tag for 65
+//   commits (retro-tagged 2026-07-31), the marketplace pin froze ~588 commits
+//   behind HEAD (#851). The defense is a single surfaces table that both the
+//   rewrite and the check share — a version literal that exists outside the
+//   table is found by the drift sweep, and a table pattern that stops
+//   matching its file is a hard error, never a silent pass.
+//
+// PHASES:
+//   --set-version X.Y.Z   Mechanically rewrite every version surface, then
+//                         sync package-lock.json via `npm install
+//                         --package-lock-only`. Editorial surfaces (CHANGELOG
+//                         entry, README highlights prose) are NOT written —
+//                         they are enforced by --check instead.
+//   --check               Preflight: surface parity, CHANGELOG entry present
+//                         + Unreleased folded, drift sweep, tag collision
+//                         (local, origin, github), github/main mirror parity
+//                         (under `mirror: curated`: github/main's Source-Commit
+//                         trailer == HEAD instead of the sha, plus a green
+//                         snapshot-probe receipt for HEAD's export tree),
+//                         npm registry collision, npm token liveness and
+//                         publish capability (Bypass-2FA), configured publish
+//                         route vs. the January-2027 token sunset (#1906;
+//                         SO_RELEASE_NOW overrides the clock of that row only), CI green
+//                         on HEAD, leakage gate over retained archive filenames and contents.
+//   --publish             Runs --check first, then STAGES the checked archive
+//                         with `npm stage publish` via temp userconfig
+//                         (NPM_TOKEN from .env.local; ADR-0018 route C, owner
+//                         decision queue #7906). The staged version is not
+//                         public until the owner approves it with 2FA on
+//                         npmjs.com; the script writes the publish proof,
+//                         prints the approval step and stops. The tail is then
+//                         `--resume-tail --target X.Y.Z`, which refuses until the
+//                         registry serves the approved version.
+//   --publish --direct    The pre-ADR-0018 route: `npm publish` with a
+//                         Bypass-2FA token, receipt and tail in one run. npm
+//                         ends it in January 2027 (`publish-route` row). A
+//                         target-confirmed npm receipt is the irreversible
+//                         boundary: before it, failure aborts normally; after it,
+//                         never rerun --publish. The tail tags AFTER receipt
+//                         (never before — eliminates "tagged but unpublished"),
+//                         pushes main + tag to origin AND github (under
+//                         `mirror: curated`: the verified export snapshot to
+//                         github main and the tag on THAT snapshot — never HEAD
+//                         or main, #1645), handles the
+//                         GitHub release (`--verify-tag`), reconciles registry
+//                         propagation, and polls the live site. A tag/push
+//                         failure skips the tag-dependent GitHub-release and
+//                         site phases and returns reconciliation guidance.
+//                         After the receipt it writes the publish proof
+//                         .orchestrator/runtime/release-<target>.json (#1537).
+//   --publish --trusted   ADR-0018 route B (#1906): no local npm publish. Writes the
+//                         proof, tags and pushes (the GitHub tag push triggers
+//                         .github/workflows/publish.yml), then waits for the
+//                         registry receipt (provenance + per-file content)
+//                         and the workflow's public npm install check.
+//   --reconcile           Read-only resume after an accepted upload: from the
+//                         proof, verify the exact version is served as latest
+//                         with the checked integrity, then that a consumer
+//                         download hashes to it. Never publishes, tags or pushes.
+//   --resume-tail         Finish an interrupted publish tail with one command
+//                         (#1791): --reconcile first (nothing is tagged unless
+//                         the registry serves the proof's integrity), then from
+//                         the proof's commit create/push the tag where it is
+//                         missing (an existing tag must point at that commit),
+//                         then GitHub release and live site. Idempotent; never
+//                         publishes to npm.
+//                         Every push/fetch/ls-remote of a tail runs in its own
+//                         process group with a deadline (TAIL_CHILD_TIMEOUT_MS).
+//
+// USAGE:
+//   node scripts/release.mjs --check [--json] [--skip-ci]
+//   node scripts/release.mjs --set-version 3.19.0
+//   node scripts/release.mjs --publish [--json]
+//   node scripts/release.mjs --reconcile [--target X.Y.Z] [--json]
+//   node scripts/release.mjs --resume-tail --target X.Y.Z [--json]
+//
+// EXIT CODES:
+//   0  success (trusted publish or trusted tail complete with install job passed)
+//   1  preflight/check failure (stale surface, missing CHANGELOG entry,
+//      tag/registry collision, mirror behind, dead token, CI not green,
+//      leakage-gate hit) OR post-publish reconciliation required OR
+//      --reconcile not yet installable (pending / failed / proof missing;
+//      a confirmed trusted receipt exits 0 even with installable no or
+//      not measured, as in --help)
+//      OR a published trusted release with a non-successful install check
+//   2  system/usage error before the npm receipt (git/npm spawn failure,
+//      missing NPM_TOKEN, unknown flag, --skip-ci combined with --publish)
+//   3  published, install job not measured — look at the Actions URL; never rerun --publish
+//
+// FAIL-CLOSED IS THE HOUSE RULE (the defect class this file kept re-growing):
+//   A preflight check reports on evidence it GATHERED. When the gathering
+//   itself fails — a non-zero exit nobody read, output in an unexpected shape,
+//   an empty listing — the honest verdict is "could not tell", and "could not
+//   tell" MUST be reported as `ok:false`. Three checks previously did the
+//   opposite: an errored `git grep` produced an empty hit list that read as a
+//   clean sweep, an unparseable `npm view` produced an empty version list that
+//   read as "no collision", and an `npm pack` whose listing did not parse
+//   produced zero scanned lines that read as "0 leaks". Each is a green check
+//   that verified nothing, on the one code path where being wrong is
+//   irreversible. Hence: every check that consumes a subprocess result routes
+//   through an exported `evaluate*` function below, which is pure over
+//   `{status, stdout, stderr}` and unit-tested against exactly the degraded
+//   shapes that used to pass.
+//
+//   --skip-ci is the deliberate, operator-visible exception to that rule — and
+//   is therefore REFUSED under --publish (see `validateFlags`).
+//
+// SECURITY INVARIANTS (from skills/npm-publish/SKILL.md):
+//   - NPM_TOKEN only from gitignored .env.local; never logged, never persisted.
+//   - Temp userconfig chmod 600, removed in a finally block.
+//   - Leakage gate runs before EVERY publish, not only the first.
+
+import {
+  readFileSync,
+  writeFileSync,
+  existsSync,
+  mkdtempSync,
+  chmodSync,
+  rmSync,
+  realpathSync,
+  mkdirSync,
+  lstatSync,
+} from 'node:fs';
+import { join, relative as relativePath, sep, basename, isAbsolute } from 'node:path';
+import { tmpdir } from 'node:os';
+import { createHash } from 'node:crypto';
+import { packedFilename } from './lib/plugin-package-stage.mjs';
+import { resolveNativeCommand, spawn, spawnSync } from './lib/native-command.mjs';
+import { parseArgs } from 'node:util';
+import { fileURLToPath } from 'node:url';
+
+import { resolveRepoSpec } from './lib/vcs-repo-spec.mjs';
+import { enumerateRepoFiles } from './lib/validate/enumerate-repo-files.mjs';
+import { writeJsonAtomicSync } from './lib/io.mjs';
+import { redactedEnv } from './lib/redacted-env.mjs';
+import {
+  buildGithubExport,
+  createGitRunner,
+  parseSourceCommitTrailer,
+  plainPushGuard,
+  pushUrlProblem,
+  readMirrorSetting,
+  verifyExportCommit,
+} from './lib/github-export.mjs';
+import { CITATION_STEP, computeSnapshotTree, readSnapshotProbeReceipt } from './lib/snapshot-probe.mjs';
+import { describeNamesList, evaluateNamesListRow } from './lib/confidential-names-list.mjs';
+import { loadOwnerConfig } from './lib/owner-yaml.mjs';
+import {
+  archiveContentManifest,
+  compareContentManifests,
+  evaluateTrustedPublishReceipt,
+  expectedTrustedIdentity,
+  fetchTrustedPublishEvidence,
+  tarballMatchesIntegrity,
+} from './lib/release-trusted.mjs';
+import { parse as parseYaml } from 'yaml';
+
+const PACKAGE_NAME = 'session-orchestrator';
+const SPAWN_OPTS = { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 };
+
+// ---------------------------------------------------------------------------
+// Surfaces table — the SSOT both the scan and the rewrite share.
+//
+// Every entry: { file, patterns: [RegExp], checkOnly?: boolean }. Each pattern
+// has exactly one capture group holding the version. Matching ZERO occurrences
+// is a hard failure ("pattern-dead") — that is the guard against a surface
+// silently falling out of the check after a file refactor. All captured
+// versions must equal the target.
+//
+// `checkOnly: true` means: scanned by --check, NOT rewritten by applyVersion,
+// because a different generator owns the write. See site/index.html below for
+// the only current case and for why the ownership split is structural here
+// rather than a comment asking the next editor to be careful.
+//
+// CHANGELOG.md is deliberately NOT here: it carries version HISTORY, so a
+// replace-all would corrupt it. It has its own editorial check below.
+// package-lock.json is also special-cased (thousands of dep "version" keys).
+// ---------------------------------------------------------------------------
+export const SURFACES = [
+  {
+    file: 'package.json',
+    patterns: [/"version":\s*"(\d+\.\d+\.\d+)"/],
+  },
+  {
+    file: '.claude-plugin/plugin.json',
+    patterns: [/"version":\s*"(\d+\.\d+\.\d+)"/],
+  },
+  {
+    // Cursor's native manifest replaces the root Agent Plugins manifest so
+    // Codex can load its own component paths and cache version independently.
+    // It remains a required version surface for every release.
+    file: '.cursor-plugin/plugin.json',
+    patterns: [/"version":\s*"(\d+\.\d+\.\d+)"/],
+  },
+  {
+    file: '.claude-plugin/marketplace.json',
+    patterns: [/"version":\s*"(\d+\.\d+\.\d+)"/g],
+  },
+  {
+    // Codex manifest: version is '<base>+codex.<YYYYMMDDHHmmss>' (see
+    // scripts/lib/codex/plugin-contract.mjs). The base must equal the target;
+    // applyVersion additionally rotates the cachebuster timestamp. This
+    // surface was the first drift-sweep catch: a plain `rg` census missed it
+    // because ripgrep skips hidden directories by default — only `git grep`
+    // (and the validate-plugin base-version check) saw it.
+    file: '.codex-plugin/plugin.json',
+    patterns: [/"version":\s*"(\d+\.\d+\.\d+)\+codex\./],
+  },
+  {
+    file: 'hooks/hooks.json',
+    patterns: [/Session Orchestrator v(\d+\.\d+\.\d+)/],
+  },
+  {
+    file: 'hooks/hooks-codex.json',
+    patterns: [/Session Orchestrator v(\d+\.\d+\.\d+)/],
+  },
+  {
+    file: 'README.md',
+    // Only the version badge carries the version since the README rewrite
+    // (#1595, !261) dropped "Recent highlights" on purpose; its two patterns
+    // matched nothing from 6b6a1773 on and failed every preflight as pattern-dead.
+    patterns: [/version-(\d+\.\d+\.\d+)-blue\.svg/],
+  },
+  {
+    // ONE WRITER, ONE CHECKER — and they are not the same program.
+    //
+    // The page carries its version in three `<span data-metric="version">`
+    // cells, and `scripts/site-numbers.mjs --write` owns every `data-metric`
+    // cell on the site: it recomputes each one from its declared source (for
+    // `version`, that source is package.json). This table only READS them back,
+    // hence `checkOnly` — applyVersion deliberately does not touch this file.
+    //
+    // Why that is not a gap: --set-version runs applyVersion FIRST (package.json
+    // gets the target) and `site-numbers --write` SECOND, so the generator
+    // derives the same literal from the surface applyVersion just wrote. Adding
+    // a second writer here would not "make it safer" — it would make two
+    // programs authoritative for one cell, and the next divergence between them
+    // would be invisible until a release shipped. If the generator ever stops
+    // running, this check goes red rather than quietly self-healing, which is
+    // the outcome worth having.
+    //
+    // HISTORY (do not restore either old pattern): the previous entry was
+    // `/"softwareVersion":\s*"(...)"/` plus `/v(\d+\.\d+\.\d+)\b/g`. Commit
+    // 8802aa4 removed `softwareVersion` from the JSON-LD (deliberately — see the
+    // comment at the top of site/index.html) and replaced the bare `vX.Y.Z`
+    // literals with the metric cells, leaving BOTH patterns matching nothing.
+    // The pattern-dead guard caught that, which is the entire reason it exists.
+    // The `\b`-anchored one was also actively dangerous as a WRITE pattern: it
+    // was a replace-all over every `vX.Y.Z` on the page, so a sentence
+    // mentioning a historical release would have been silently rewritten to the
+    // new version by --set-version. The replacement is anchored to the cell.
+    file: 'site/index.html',
+    patterns: [/data-metric="version"[^>]*>(\d+\.\d+\.\d+)</g],
+    checkOnly: true,
+  },
+  {
+    // The German landing page (2026-09-07 redesign) mirrors the EN metric cells
+    // one-to-one; same single writer (scripts/site-numbers.mjs --write), so it is
+    // checkOnly for the same reason as site/index.html above.
+    file: 'site/de/index.html',
+    patterns: [/data-metric="version"[^>]*>(\d+\.\d+\.\d+)</g],
+    checkOnly: true,
+  },
+  {
+    file: 'site/llms.txt',
+    patterns: [/Version:\s*(\d+\.\d+\.\d+)/],
+  },
+  {
+    file: 'site/llms-full.txt',
+    patterns: [/Version\s+(\d+\.\d+\.\d+)/g],
+  },
+];
+
+/**
+ * Scan every surface against the target version.
+ * Pure over the filesystem — no git/network. Returns one row per surface:
+ * { file, ok, problems: string[] }.
+ */
+export function scanSurfaces(repoRoot, target) {
+  const rows = [];
+  for (const surface of SURFACES) {
+    const abs = join(repoRoot, surface.file);
+    const problems = [];
+    if (!existsSync(abs)) {
+      rows.push({ file: surface.file, ok: false, problems: ['file missing'] });
+      continue;
+    }
+    const text = readFileSync(abs, 'utf8');
+    for (const pattern of surface.patterns) {
+      const re = new RegExp(pattern.source, pattern.flags.includes('g') ? pattern.flags : pattern.flags + 'g');
+      const found = [...text.matchAll(re)].map((m) => m[1]);
+      if (found.length === 0) {
+        problems.push(`pattern-dead: /${pattern.source}/ matches nothing`);
+        continue;
+      }
+      const stale = found.filter((v) => v !== target);
+      if (stale.length > 0) {
+        problems.push(`/${pattern.source}/ found ${stale.join(', ')} (want ${target})`);
+      }
+    }
+    rows.push({ file: surface.file, ok: problems.length === 0, problems });
+  }
+
+  // package-lock.json — parse, don't pattern-match (dep versions everywhere).
+  const lockPath = join(repoRoot, 'package-lock.json');
+  if (!existsSync(lockPath)) {
+    rows.push({ file: 'package-lock.json', ok: false, problems: ['file missing'] });
+  } else {
+    const problems = [];
+    try {
+      const lock = JSON.parse(readFileSync(lockPath, 'utf8'));
+      if (lock.version !== target) problems.push(`root version is ${lock.version} (want ${target})`);
+      const rootPkg = lock.packages?.[''];
+      if (rootPkg && rootPkg.version !== target) {
+        problems.push(`packages[""].version is ${rootPkg.version} (want ${target})`);
+      }
+    } catch (err) {
+      problems.push(`unparseable: ${err.message}`);
+    }
+    rows.push({ file: 'package-lock.json', ok: problems.length === 0, problems });
+  }
+
+  return rows;
+}
+
+/**
+ * Mechanically rewrite every surface to the target version by replacing the
+ * captured version in each pattern match. Idempotent. Does NOT touch
+ * CHANGELOG.md or package-lock.json (the caller syncs the lock via npm), nor
+ * any `checkOnly` surface (another generator owns that file's write — see the
+ * site/index.html entry in SURFACES).
+ * Returns the list of files actually changed.
+ */
+export function applyVersion(repoRoot, target) {
+  const changed = [];
+  for (const surface of SURFACES) {
+    if (surface.checkOnly) continue;
+    const abs = join(repoRoot, surface.file);
+    if (!existsSync(abs)) continue;
+    const before = readFileSync(abs, 'utf8');
+    let after = before;
+    for (const pattern of surface.patterns) {
+      const re = new RegExp(pattern.source, pattern.flags.includes('g') ? pattern.flags : pattern.flags + 'g');
+      after = after.replace(re, (full, captured) => full.replace(captured, target));
+    }
+    if (surface.file === '.codex-plugin/plugin.json') {
+      const stamp = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14);
+      after = after.replace(/(\+codex\.)\d{14}/, `$1${stamp}`);
+    }
+    if (after !== before) {
+      writeFileSync(abs, after);
+      changed.push(surface.file);
+    }
+  }
+  return changed;
+}
+
+/**
+ * Editorial gate: the CHANGELOG must carry a dated entry for the target as
+ * its topmost release, and [Unreleased] must be folded (empty) — an
+ * Unreleased section with content means the release notes are incomplete.
+ */
+export function checkChangelogEntry(text, target) {
+  const problems = [];
+  const entryRe = new RegExp(`^## \\[${target.replace(/\./g, '\\.')}\\] - \\d{4}-\\d{2}-\\d{2}`, 'm');
+  if (!entryRe.test(text)) {
+    problems.push(`no "## [${target}] - YYYY-MM-DD" entry`);
+  }
+  const headings = [...text.matchAll(/^## \[([^\]]+)\]/gm)].map((m) => m[1]);
+  const firstRelease = headings.find((h) => h.toLowerCase() !== 'unreleased');
+  if (firstRelease && firstRelease !== target) {
+    problems.push(`topmost release entry is [${firstRelease}], not [${target}]`);
+  }
+  const unreleasedMatch = text.match(/^## \[Unreleased\]([\s\S]*?)(?=^## \[|$(?![\s\S]))/m);
+  if (unreleasedMatch && unreleasedMatch[1].trim() !== '') {
+    problems.push('[Unreleased] still has content — fold it into the release entry');
+  }
+  return { ok: problems.length === 0, problems };
+}
+
+// The leak checks operate only on paths extracted from real packed-entry lines,
+// never on arbitrary `npm notice` prose. `tests` and `.claude` are exact path
+// segments: nested copies leak too, while `contest` and `.claude-plugin` do not.
+function hasPathSegment(path, segment) {
+  return path.split('/').includes(segment);
+}
+
+export const LEAKAGE_PATTERNS = [
+  { name: 'tests/', matches: (path) => hasPathSegment(path, 'tests') },
+  // `.orchestrator/policy/` is CARVED OUT and everything else under
+  // `.orchestrator/` still leaks: the destructive-guard FLOOR policy ships to npm
+  // consumers since 4.0.0 (Codex P1 — measured: `npm pack` carried 0 policy
+  // entries, so `loadEffectivePolicy` returned `rules:null` and the guard allowed
+  // everything on a consumer install). The carve-out is a `policy/` PATH segment,
+  // not a prefix: `.orchestrator/metrics/`, `.orchestrator/tmp/`,
+  // `.orchestrator/runtime/`, `*.lock` and the `.orchestrator/policy-backup/`
+  // prefix trick are all still caught.
+  {
+    name: '.orchestrator/',
+    matches: (path) => /\.orchestrator\//.test(path) && !/^\.orchestrator\/policy\//.test(path),
+  },
+  { name: '.claude/', matches: (path) => hasPathSegment(path, '.claude') },
+  { name: '.github/', matches: (path) => /\.github\//.test(path) },
+  { name: 'node_modules', matches: (path) => /node_modules/.test(path) },
+  { name: '.env', matches: (path) => /\.env/i.test(path) },
+  { name: 'owner.yaml', matches: (path) => /owner\.yaml/i.test(path) },
+  // Claimed as checked by docs/distribution/npm-publish-checklist.md long before
+  // any code checked it (measured 2026-08-19: 3 leakage lists, 3 different sets).
+  // `files` in package.json overrides .gitignore, so a stray .DS_Store inside a
+  // shipped directory reaches the tarball.
+  { name: '.DS_Store', matches: (path) => /\.DS_Store/.test(path) },
+];
+
+// Bootstrap's public Standard path copies each selected template in full, so
+// these two sanity tests are intentional scaffold assets, not package-internal
+// test material. This is exact by path and applies only to the `tests/` class:
+// do not turn it into a templates/** or segment-level bypass.
+const INTENTIONAL_TEST_ASSET_PATHS = new Set([
+  'templates/node-minimal/tests/sanity.test.ts',
+  'templates/python-uv/tests/test_sanity.py',
+]);
+
+// `skills/release/SKILL.md` quotes the `npm view` OUTPUT that proves the 3.18.0 gap,
+// dated at the line. Bumping it would destroy the evidence it exists to carry —
+// the registry state on that date is the whole point of the paragraph.
+//
+// `site/guide/index.html` carries ONE dated historical sentence — "re-checked
+// against v<prev> on <date>" — deliberately left as a literal: a release that
+// bumped the version while the date stood still would fabricate a verification
+// nobody ran. The page is not unguarded by this exemption. It loses only the
+// coarse prev-tag sweep and keeps the STRICTER guard in
+// tests/scripts/site-numbers.test.mjs, which forbids ANY vX.Y.Z and the current
+// package version outside a `data-metric` cell on EVERY shipped page, and
+// exempts exactly the lines marked `site-numbers:historical`.
+// 4.0.1 (measured 2026-09-07): the 4.0.0 sweep would have flagged five files whose only literal
+// is PROSE HISTORY of the major ("moved out of agents/ in 4.0.0", "removed in 4.0.0",
+// "releases 4.0.0 would have blocked on itself") — CLAUDE.md, its generated twin AGENTS.md,
+// CONTRIBUTING.md, NOTICE and .husky/pre-push. None of them is a version SURFACE (no
+// `"version":`, badge or `vX.Y.Z` form), so they join the history allowlist rather than being
+// reworded to dodge the sweep.
+// Four more prose-history files surfaced once the detail line stopped truncating at five hits
+// (same 2026-09-07 sweep): site/llms-full.txt ("The v4.0.0 release REMOVES public surfaces" — its
+// version SURFACE is checked separately by the SURFACES row, so the sweep on it is redundant),
+// skills/architecture/references/domain-model.md ("Merged here in v4.0.0"), skills/autopilot/SKILL.md
+// ("4.0.0 — see docs/migration-v4.md"). A fifth, templates/_shared/journey-manifest.md ("Retired …
+// in 4.0.0"), was DELETED on 2026-09-12 (replaced by ux-manifest.template.md, Epic #1322) and its
+// allowlist entry went with it — re-add only if a file of that name returns.
+// September 10 campaign snapshot: inputs and receipt reproduce the dated 4.3-planned
+// render made while 4.2.0 was current. Exact files only; neighboring marketing
+// remains checked. Do not bump receipt props without a newly reviewed render.
+// `scripts/lib/locks/index.mjs` is the one-cycle deprecation shim (5.2.0 CHANGELOG, Changed): its
+// runtime warning names the version it was deprecated IN, so it legitimately carries the previous
+// release literal until its 6.0.0 removal — version history by construction, not drift.
+// `skills/eval/rubric-v3.md` (5.9.0 sweep, measured 2026-10-06): its change log quotes the dated
+// owner decision "rubric-v3 in 5.8.0" (2026-10-05, #1487) — the release that introduced the rubric.
+// Prose history, not a version surface; bumping it would falsify the quote.
+// `design/prototypes/1756/` (5.20.0 sweep, measured 2026-11-14): the frozen hero prototypes of
+// both design rounds for the home page (#1756). Their captions and notes quote the demo run they
+// were built from ("plugin 5.19.0, 13 Nov 2026"); bumping them would falsify the run. Only this
+// one round directory is exempt — a new prototype directory under `design/prototypes/` stays swept.
+// `SECURITY.md` (5.21.2 follow-up, 2026-11-22, #2239): its "Fixed in <version>" advisory sections
+// must name the version that carries the fix ("Update to 5.21.2 or later"); bumping them would
+// falsify the advisory. Only the root file is exempt.
+// `site/_census.json` is deliberately NOT allowlisted: it carries a `"version"` field that
+// `--set-version` re-stamps (scripts/site-numbers.mjs --write, see the post-bump hint in main()),
+// so leaving it under the drift sweep makes the sweep double as its staleness gate — a census
+// not re-stamped after a bump fails `--check` instead of shipping the previous version.
+export const HISTORY_ALLOWLIST = /^(CHANGELOG\.md|README\.md|scripts\/lib\/locks\/index\.mjs|CLAUDE\.md|AGENTS\.md|CONTRIBUTING\.md|NOTICE|SECURITY\.md$|\.husky\/pre-push|docs\/|tests\/|skills\/npm-publish\/|skills\/architecture\/references\/domain-model\.md|skills\/autopilot\/SKILL\.md|skills\/eval\/rubric-v3\.md|scripts\/release\.mjs|\.orchestrator\/|site\/leaderboard\.json|site\/guide\/index\.html|site\/llms-full\.txt|skills\/release\/SKILL\.md|design\/prototypes\/1756\/|marketing\/remotion\/(?:README\.md|campaign\.json|render-receipt\.json|src\/ReleaseFilm\.tsx)$)/;
+
+/** Pure check over packed-entry lines. Returns violations: {name, line}[]. */
+export function checkLeakage(lines) {
+  const violations = [];
+  for (const line of lines) {
+    const entry = parsePackedEntry(line);
+    if (!entry) continue;
+    for (const { name, matches } of LEAKAGE_PATTERNS) {
+      if (name === 'tests/' && INTENTIONAL_TEST_ASSET_PATHS.has(entry.path)) continue;
+      if (matches(entry.path)) violations.push({ name, line: line.trim() });
+    }
+  }
+  return violations;
+}
+
+/**
+ * One packed tarball entry in `npm pack --dry-run` output:
+ * `npm notice 1.3kB .claude-plugin/marketplace.json`.
+ *
+ * This grammar intentionally excludes npm's package metadata and summary
+ * notices. Leakage decisions must be made over a file path, not a sentence
+ * that happens to mention one.
+ */
+export const PACKED_ENTRY_RE = /^npm notice\s+(\d+(?:\.\d+)?\s*(?:B|kB|MB|GB))\s+(\S.*)$/;
+
+/**
+ * Parse an npm packed-entry notice into its path. Returns null for every other
+ * npm notice line, including package metadata and summaries.
+ *
+ * @param {string} line
+ * @returns {{path: string}|null}
+ */
+export function parsePackedEntry(line) {
+  const match = line.match(PACKED_ENTRY_RE);
+  return match ? { path: match[2].trim() } : null;
+}
+
+/**
+ * Floor on parsed packed entries, below which the leak scan is presumed BLIND
+ * rather than clean.
+ *
+ * Measured 2026-08-21 with `npm pack --dry-run`: npm's own summary reports
+ * `total files: 805` and {@link PACKED_ENTRY_RE} independently counts 805 —
+ * two differently-shaped measurements agreeing. Package size 2.9 MB, unpacked
+ * 9.0 MB. The count dropped from 830 when `package.json` `files` gained
+ * `!scripts/tests/**` and `!skills/vault-sync/tests/**`; those 28 entries were
+ * shipped in 3.21.0 (scanned: no secrets, no owner data — ballast, not an
+ * incident). Independently confirmable after the fact:
+ * `npm view session-orchestrator@3.21.0 dist.fileCount` returns 832 — npm's own
+ * count of what the registry accepted for THAT version, from outside this repo,
+ * and therefore still the pre-exclusion number.
+ *
+ * (An earlier revision of this comment claimed the checklist "still records the
+ * older ~750 files" baseline. It did not: commit a2e495c rewrote that line to
+ * the measured 830/2.9/8.9 at the same SHA this comment was written. The claim
+ * was a second copy of a fact, contradicting the first, inside the file that
+ * argues against second copies. Caught by the post-publish review panel.)
+ *
+ * 400 is a FLOOR, not a pin — deliberately ~50% of today's count. It cannot
+ * break on growth (the pack only grows), and it is far enough below 805 that a
+ * deliberate docs/skills prune would not trip it. What it does catch is the
+ * whole failure class in one number: an npm output-format change, an
+ * `npm notice` prefix rename, a `files`/`.npmignore` edit that drops entire
+ * trees — every state in which the scan sees a handful of lines, finds no
+ * leak pattern in them, and reports "0 leaks" with total confidence.
+ */
+export const MIN_PACKED_ENTRIES = 400;
+
+// ---------------------------------------------------------------------------
+// Preflight evaluators — pure over a spawn result `{status, stdout, stderr}`.
+//
+// These exist so the DECISION of every preflight check is unit-testable while
+// the subprocess call itself stays in the impure section below. Each returns
+// `{ok, detail}`. The shared contract, and the reason this family exists at
+// all, is the FAIL-CLOSED house rule in the file header: an evaluator may
+// return `ok:true` only when it has positively SEEN the evidence, never merely
+// because it failed to see a counterexample.
+// ---------------------------------------------------------------------------
+
+/**
+ * A regex matching `literal` as a VERSION TOKEN, not as a substring.
+ *
+ * THE BUG (measured 2026-09-07, mid-release): the sweep matched the previous tag `4.0.0`
+ * inside `>=24.0.0` — `package.json`'s own engines field and a `scripts/lib/` string that
+ * quotes it — so a release could not be cut without either rewording an engines constraint or
+ * widening the allowlist over two files that carry no version surface at all. The boundary is
+ * therefore part of WHAT IS SWEPT FOR, not an allowlist row: `24.0.0`, `14.0.0` and `4.0.0.1`
+ * are different literals, at every path, forever.
+ *
+ * @param {string} literal — the previous release version
+ * @returns {RegExp} global regex; `4.0.0` matches only when not preceded by `[0-9.]` and not
+ *   continued by a further numeric component (`(?!\.?[0-9])`).
+ */
+function versionTokenRegex(literal) {
+  return new RegExp(`(?<![0-9.])${literal.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?!\\.?[0-9])`, 'g');
+}
+
+/**
+ * Is EVERY token occurrence of `literal` on this line a dependency range (`^X.Y.Z` / `~X.Y.Z`)?
+ *
+ * One bare occurrence anywhere on the line is enough to call the whole line drift — a comment
+ * that also happens to mention a ranged dep must not be excused by that mention. Occurrences are
+ * counted with {@link versionTokenRegex}, so `>=24.0.0` is not an occurrence of `4.0.0` here
+ * either — otherwise a line pinning `^4.0.0` beside an engines constraint would read as drift.
+ *
+ * @param {string} content — the matching line's text
+ * @param {string} literal — the previous release version, matched as a token
+ * @returns {boolean}
+ */
+export function isDependencyRangeOnly(content, literal) {
+  const re = versionTokenRegex(literal);
+  let seen = 0;
+  for (let m = re.exec(content); m; m = re.exec(content)) {
+    seen += 1;
+    const before = m.index > 0 ? content[m.index - 1] : '';
+    if (before !== '^' && before !== '~') return false;
+  }
+  return seen > 0;
+}
+
+/** Lockfiles whose dependency entries are third-party history, never our surface. */
+const LOCKFILE_BASENAMES = new Set(['package-lock.json', 'npm-shrinkwrap.json']);
+
+/** Code files in which a `//`, `*`, `/*` or `#` line is comment prose, never a version surface. */
+const CODE_COMMENT_EXTENSIONS = new Set(['.mjs', '.js', '.cjs', '.ts', '.sh']);
+
+/** Workflow/CI files in which a SHA-pinned `uses:` carries a third-party version as a trailing comment. */
+const YAML_EXTENSIONS = new Set(['.yml', '.yaml']);
+
+/**
+ * Is this YAML row a SHA-pinned THIRD-PARTY action whose version lives only in the
+ * trailing comment?
+ *
+ * Measured on the 5.1.0 cut (2026-09-13): `.github/workflows/test.yml` carries
+ * `uses: actions/setup-node@a0853c2…  # v5.0.0` twice. That `5.0.0` is setup-node's
+ * version, not ours — the sweep matched it only because our previous release happened
+ * to land on the same number, so the false positive is triggered by COINCIDENCE and
+ * would reappear for any action whose pin equals our next version.
+ *
+ * Expressed as a PREDICATE, like the three classes above, for the reason
+ * `.claude/rules/measurement-discipline.md` records: a per-path allowlist row fixes
+ * this file and leaves the class open for the next workflow.
+ *
+ * Two conditions, both required, so the predicate cannot mask a stale surface of ours:
+ *   1. the line pins a reference with `uses:` BEFORE the comment marker, and
+ *   2. EVERY occurrence of the literal sits AFTER that marker.
+ * A version in the pin itself (`uses: foo@v5.0.0`) fails condition 2 and is still swept.
+ *
+ * NAMED CEILING (BV-004): no SURFACES pattern targets a `.yml`/`.yaml` file today, so a
+ * YAML hit is never our own surface anyway. Revisit trigger: the first version surface
+ * added to a YAML file — then this predicate must also exclude that file's pattern.
+ *
+ * @param {string} content — the matching line's text
+ * @param {string} literal — the previous release literal being swept for
+ * @returns {boolean} true = third-party pin comment, skip the row
+ */
+export function isPinnedActionComment(content, literal) {
+  const hash = content.indexOf('#');
+  if (hash === -1) return false;
+  if (!/\buses:\s*\S/.test(content.slice(0, hash))) return false;
+  const re = versionTokenRegex(literal);
+  let seen = 0;
+  for (let m = re.exec(content); m; m = re.exec(content)) {
+    seen += 1;
+    if (m.index < hash) return false;
+  }
+  return seen > 0;
+}
+
+/**
+ * Is this `path:line:content` row version HISTORY rather than a stale surface?
+ *
+ * Three classes, all measured on the 4.0.1 cut (2026-09-07) as FALSE POSITIVES of the raw
+ * substring sweep, and all expressed as PREDICATES for the same reason the range carve-out
+ * above is one: a per-path allowlist row fixes the instance and leaves the class open.
+ *
+ * 1. **Dependency range** — `^X.Y.Z` / `~X.Y.Z` (see {@link isDependencyRangeOnly}).
+ * 2. **Lockfile dependency entry** — `package-lock.json` carried 72 hits for `4.0.0`, every one
+ *    a third-party package version or an engines range. Our OWN entry there is still swept: the
+ *    root package's `"version"` line, which npm writes in the `packages[""]` record at the top
+ *    of the file. NAMED CEILING (BV-004): "at the top" is read as `line <= 20`, which covers
+ *    every lockfileVersion-3 file npm writes today (the root record starts at line 5). Revisit
+ *    trigger: a lockfile whose root `"version"` sits below line 20 — then key on the enclosing
+ *    JSON path instead of the line number.
+ * 3. **Comment prose in a code file** — `// (pre-4.0.0 checkouts, …)` and a `* since 4.0.0`
+ *    docblock line. No SURFACES pattern is ever a comment (every one is `"version": "X.Y.Z"`,
+ *    `vX.Y.Z` or a badge), so excusing comment lines cannot mask a stale surface.
+ *
+ * @param {string} file — repo-relative path
+ * @param {number} line — 1-based line number
+ * @param {string} content — the matching line's text
+ * @param {string} prevTag — the previous release literal being swept for
+ * @returns {boolean} true = history, skip the row
+ */
+function isHistoryRow(file, line, content, prevTag) {
+  if (!versionTokenRegex(prevTag).test(content)) return true;
+  // A shipped page line marked `site-numbers:historical` carries a dated run caption on purpose
+  // (site/index.html, site/de/index.html since #1756). tests/scripts/site-numbers.test.mjs already
+  // exempts exactly these lines and guards every other line of the page more strictly, so the
+  // prev-tag sweep follows the same marker instead of exempting the whole file. Only on the pages
+  // that test reads (site/**/*.html): elsewhere no stricter guard stands behind the marker.
+  if (file.startsWith('site/') && file.endsWith('.html') && content.includes('site-numbers:historical')) return true;
+  if (isDependencyRangeOnly(content, prevTag)) return true;
+  const base = file.split('/').pop();
+  if (LOCKFILE_BASENAMES.has(base)) {
+    const isRootVersionLine = line <= 20 && new RegExp(`"version":\\s*"${prevTag.replace(/\./g, '\\.')}"`).test(content);
+    return !isRootVersionLine;
+  }
+  const dot = base.lastIndexOf('.');
+  const ext = dot === -1 ? '' : base.slice(dot);
+  if (YAML_EXTENSIONS.has(ext) && isPinnedActionComment(content, prevTag)) return true;
+  if (CODE_COMMENT_EXTENSIONS.has(ext)) {
+    const trimmed = content.trim();
+    if (trimmed.startsWith('//') || trimmed.startsWith('/*') || trimmed.startsWith('*')) return true;
+    if (ext === '.sh' && trimmed.startsWith('#')) return true;
+  }
+  return false;
+}
+
+/**
+ * Drift sweep verdict over a grep-shaped result (`-l` file list or `-n` line hits).
+ *
+ * Exit-code contract, kept identical to `git grep`'s because that is what this
+ * evaluator was written against and what {@link collectDriftHits} now emits:
+ * 0 = matches found, 1 = no match (the success case here), anything else = it
+ * did not run. Measured on git 2.x: a bad regex and a bad pathspec both exit
+ * 128; git also documents 2 for usage errors. The old inline code read
+ * `.stdout` without ever looking at `.status`, so BOTH the no-match case and
+ * the it-crashed case produced an empty hit list and the same reassuring
+ * detail line, "no file still carries X". A sweep that never ran is not a
+ * clean sweep.
+ *
+ * ONE CLASS OF MATCH IS NOT OURS TO BUMP: a dependency RANGE that happens to equal our own
+ * previous version. `skills/vault-sync` pinned `zod` at `^3.24.0` then (the projects-baseline pin), so
+ * the 4.0.0 sweep collected two files whose literal belongs to zod and must NOT move when we
+ * release. The carve-out is deliberately a PREDICATE and not two allowlist rows: a per-path row
+ * fixes this instance and leaves the class open for the next dependency that lands on our version
+ * number — the unenumerable-table failure `.claude/rules/measurement-discipline.md` records. A
+ * caret- or tilde-prefixed literal is a range, and no version surface of this package is ever
+ * written as one (see SURFACES above: every pattern is an exact `"version": "X.Y.Z"`, `vX.Y.Z`
+ * or badge form), so the predicate cannot mask a stale surface.
+ *
+ * THREE FURTHER CLASSES are history for the same reason, all measured 2026-09-07 mid-release
+ * and all decided by {@link isHistoryRow}, never by an allowlist row: a literal that is only a
+ * SUBSTRING of a longer version (`4.0.0` inside `>=24.0.0`), a `package-lock.json` /
+ * `npm-shrinkwrap.json` row that is not the root package's own `"version"` line (72 of the 72
+ * lockfile hits on that cut were third-party), and COMMENT PROSE in a code file
+ * (`// (pre-4.0.0 checkouts, …)`). See that function for each one's ceiling.
+ *
+ * Accepts BOTH `git grep` output shapes. A bare `path` (from `-l`) carries no content and is
+ * therefore always a hit — the fail-closed reading, unchanged, and the shape {@link collectDriftHits}
+ * emits for a file it could not READ. `path:line:content` (from `-n`)
+ * is judged per line, and the file counts as drift as soon as ONE matching line is not a range.
+ *
+ * @param {{status: number, stdout?: string, stderr?: string}} grep
+ * @param {string} prevTag — the previous release literal being swept for
+ * @param {RegExp} allowlist — files that legitimately carry version HISTORY
+ * @returns {{ok: boolean, detail: string}}
+ */
+export function evaluateDriftSweep(grep, prevTag, allowlist) {
+  if (grep.status !== 0 && grep.status !== 1) {
+    return {
+      ok: false,
+      detail: `drift sweep did not run (exit ${grep.status}): ${(grep.stderr || '').trim().slice(0, 200)} — sweep for ${prevTag} is inconclusive`,
+    };
+  }
+  const hits = [];
+  for (const row of (grep.stdout || '').split('\n').filter(Boolean)) {
+    const withContent = row.match(/^(.+?):(\d+):(.*)$/);
+    const file = withContent ? withContent[1] : row;
+    if (allowlist.test(file)) continue;
+    if (withContent && isHistoryRow(file, Number(withContent[2]), withContent[3], prevTag)) continue;
+    if (!hits.includes(file)) hits.push(file);
+  }
+  return {
+    ok: hits.length === 0,
+    detail: hits.length
+      ? `still carry ${prevTag} (${hits.length} file(s)): ${hits.slice(0, 5).join(', ')}${hits.length > 5 ? ', …' : ''}`
+      : `no file outside the allowlist still carries ${prevTag} (tracked + untracked-not-ignored)`,
+  };
+}
+
+/**
+ * Bytes of a file inspected when deciding whether it is binary.
+ *
+ * A NUL byte in the first 8 KB is the same heuristic `git grep`/`grep` use to
+ * declare a file binary. NAMED CEILING (BV-004): a text file whose only NUL
+ * sits past 8 KB is scanned as text (harmless — it produces no version match),
+ * and a binary whose first 8 KB happen to be NUL-free is scanned as text and
+ * may emit mojibake rows. Revisit trigger: the first drift-sweep row naming a
+ * file nobody recognises as text.
+ */
+const BINARY_SNIFF_BYTES = 8192;
+
+/**
+ * Produce the drift-sweep hit list over the files that EXIST in the working
+ * tree — tracked or not — in the exact `{status, stdout, stderr}` shape
+ * {@link evaluateDriftSweep} already consumes.
+ *
+ * ## Why not `git grep` any more (#1248)
+ *
+ * `git grep` searches the INDEX: it is blind to an untracked file, so the
+ * moment a stale version literal is most likely to exist (a doc or manifest
+ * written for this release and not yet staged) is exactly the moment the sweep
+ * cannot see it and reports clean. The population is now
+ * `scripts/lib/validate/enumerate-repo-files.mjs`
+ * (`git ls-files --cached --others --exclude-standard`) — tracked PLUS
+ * untracked, minus everything `.gitignore` excludes, so `node_modules/` and
+ * the peer worktrees under `.claude/worktrees/` stay out without a prune list
+ * having to guess at them.
+ *
+ * What `git grep` bought — searching hidden directories a plain `rg` skips,
+ * which is how the forgotten `.codex-plugin` manifest was found — is kept:
+ * `git ls-files` lists dotted paths like any other.
+ *
+ * ## Fail-closed, in two places
+ *
+ * Enumeration itself throwing is reported as exit 128, which
+ * {@link evaluateDriftSweep} reads as "inconclusive" = FAIL — the same reading
+ * a crashed `git grep` got. A single file that enumerates but cannot be READ
+ * is emitted as a CONTENT-LESS row, which that evaluator already treats as a
+ * hit: a file we could not sweep is never silently a clean file.
+ *
+ * @param {object} options
+ * @param {string} options.repoRoot absolute repository root
+ * @param {string} options.prevTag the previous release literal to sweep for
+ * @param {(o: {repoRoot: string}) => string[]} [options.enumerate] injection seam for tests
+ * @param {(absolute: string) => Buffer} [options.read] injection seam for tests
+ * @returns {{status: number, stdout: string, stderr: string}}
+ */
+export function collectDriftHits({ repoRoot, prevTag, enumerate = enumerateRepoFiles, read = readFileSync }) {
+  let files;
+  try {
+    files = enumerate({ repoRoot });
+  } catch (err) {
+    return { status: 128, stdout: '', stderr: `enumerateRepoFiles failed: ${err && err.message}` };
+  }
+  const rows = [];
+  for (const absolute of files) {
+    const relative = relativePath(repoRoot, absolute).split(sep).join('/');
+    let buf;
+    try {
+      buf = read(absolute);
+    } catch {
+      // Content-less row = hit (see the evaluator's contract above).
+      rows.push(relative);
+      continue;
+    }
+    if (buf.subarray(0, BINARY_SNIFF_BYTES).includes(0)) continue;
+    const text = buf.toString('utf8');
+    if (!text.includes(prevTag)) continue;
+    const lines = text.split('\n');
+    for (let i = 0; i < lines.length; i += 1) {
+      if (lines[i].includes(prevTag)) rows.push(`${relative}:${i + 1}:${lines[i]}`);
+    }
+  }
+  return { status: rows.length ? 0 : 1, stdout: rows.length ? `${rows.join('\n')}\n` : '', stderr: '' };
+}
+
+/**
+ * Registry-collision verdict over `npm view <pkg> versions --json`.
+ *
+ * The most dangerous of the three fail-opens this file carried: on `status 0`
+ * with unparseable stdout, the old code swallowed the parse error, left the
+ * version list EMPTY, and concluded from that emptiness that the target was
+ * free — reporting `latest: ?` while claiming the collision check had passed.
+ * Reproduced verbatim: a `<html>` body (proxy/captive-portal response) with
+ * exit 0 yields `ok = true`. Any npm output-format change lands in the same
+ * hole. An empty ARRAY is treated identically: a published package always has
+ * at least one version, so an empty list is a shape we do not understand, not
+ * an all-clear.
+ *
+ * @param {{status: number, stdout?: string, stderr?: string}} view
+ * @param {string} target
+ * @returns {{ok: boolean, detail: string}}
+ */
+export function evaluateRegistryCollision(view, target) {
+  if (view.status !== 0) {
+    const e404 = /E404/.test(view.stderr || '');
+    return e404
+      ? { ok: true, detail: 'package not yet on registry (first publish)' }
+      : { ok: false, detail: `npm view failed (exit ${view.status}): ${(view.stderr || '').slice(0, 200)}` };
+  }
+  const raw = view.stdout || '';
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return {
+      ok: false,
+      detail: `npm view returned unparseable JSON (${raw.length} bytes, starts "${raw.trim().slice(0, 40)}") — cannot rule out a collision on ${target}`,
+    };
+  }
+  const published = Array.isArray(parsed) ? parsed : [parsed];
+  if (published.length === 0) {
+    return { ok: false, detail: `npm view returned an empty version list — cannot rule out a collision on ${target}` };
+  }
+  return published.includes(target)
+    ? { ok: false, detail: `${target} already published` }
+    : { ok: true, detail: `latest: ${published[published.length - 1]}` };
+}
+
+/**
+ * Leakage-gate verdict over an `npm pack --dry-run` result.
+ *
+ * The SURFACES table has `pattern-dead` for exactly this class — a matcher that
+ * stops matching its input must be a hard error, never a silent pass — and the
+ * leak scan had no equivalent: an `npm pack` that exits 0 with output the scan
+ * cannot parse yields zero scanned lines, zero violations, and the verdict
+ * "0 packed entries, 0 leaks". Reproduced verbatim with empty stdout+stderr.
+ * {@link MIN_PACKED_ENTRIES} is that missing `pattern-dead`.
+ *
+ * The floor is asserted on the SAME lines `checkLeakage` scans, not on npm's
+ * `total files:` summary line. That is the point: the summary could survive a
+ * format change that broke the per-entry lines, and it is the per-entry lines
+ * whose absence blinds the scan.
+ *
+ * @param {{status: number, stdout?: string, stderr?: string}} pack
+ * @param {{minEntries?: number}} [opts]
+ * @returns {{ok: boolean, detail: string}}
+ */
+export function evaluateLeakageGate(pack, { minEntries = MIN_PACKED_ENTRIES } = {}) {
+  if (pack.status !== 0) {
+    return { ok: false, detail: `npm pack failed (exit ${pack.status}): ${(pack.stderr || '').trim().slice(-200)}` };
+  }
+  const lines = `${pack.stdout || ''}\n${pack.stderr || ''}`.split('\n');
+  const entries = lines.filter(parsePackedEntry).length;
+  if (entries < minEntries) {
+    return {
+      ok: false,
+      detail: `only ${entries} packed entries parsed (floor ${minEntries}) — the pack listing did not parse, so the leak scan read ${entries} line(s) and its "no leaks" verdict means nothing`,
+    };
+  }
+  const violations = checkLeakage(lines);
+  return violations.length
+    ? { ok: false, detail: violations.map((v) => `${v.name}: ${v.line}`).slice(0, 5).join(' | ') }
+    : { ok: true, detail: `${entries} packed entries, 0 leaks` };
+}
+
+/** Strict npm 11/12 inventory, preserving the existing filename policy/floor. */
+export function evaluatePackedInventory(pack, { minEntries = MIN_PACKED_ENTRIES } = {}) {
+  if (pack.status !== 0) return { ok: false, detail: 'npm pack failed' };
+  try {
+    const json = JSON.parse(pack.stdout);
+    const records = Array.isArray(json) ? json : json && typeof json === 'object' ? Object.values(json) : [];
+    if (records.length !== 1) throw new Error('inventory-shape');
+    const record = records[0];
+    const filename = packedFilename([record]);
+    if (!filename || basename(filename) !== filename || !/^[A-Za-z0-9][A-Za-z0-9._-]*\.tgz$/.test(filename)) throw new Error('archive-name');
+    if (!Array.isArray(record.files) || record.files.length > 20000 || record.files.length < minEntries) throw new Error('inventory-floor');
+    const paths = record.files.map((entry) => entry?.path);
+    if (paths.some((name) => typeof name !== 'string' || !name || name.length > 4096 || isAbsolute(name) || name.split('/').some((part) => !part || part === '.' || part === '..') || (name.includes('\\') || [...name].some((c) => c.charCodeAt(0) < 32 || c.charCodeAt(0) === 127))) || new Set(paths).size !== paths.length) throw new Error('inventory-path');
+    const violations = checkLeakage(paths.map((name) => `npm notice 1B ${name}`));
+    if (violations.length) return { ok: false, detail: 'forbidden packed filename class: ' + [...new Set(violations.map((v) => v.name))].join(', ') };
+    return { ok: true, detail: `${paths.length} packed entries, 0 filename leaks`, record, filename, paths };
+  } catch { return { ok: false, detail: 'invalid packed inventory or insufficient entry count' }; }
+}
+
+function archiveDigest(tarballPath) {
+  if (!lstatSync(tarballPath).isFile()) throw new Error('checked archive is not a regular file');
+  return createHash('sha256').update(readFileSync(tarballPath)).digest('hex');
+}
+
+/**
+ * npm's Subresource-Integrity form of an archive (`sha512-<base64>`), the exact
+ * shape npm serves as `dist.integrity` — so the checked bytes can later be
+ * compared with what the registry and a consumer download actually carry.
+ *
+ * @param {string} tarballPath
+ * @returns {string}
+ */
+export function archiveIntegrity(tarballPath) {
+  if (!lstatSync(tarballPath).isFile()) throw new Error('archive is not a regular file');
+  return `sha512-${createHash('sha512').update(readFileSync(tarballPath)).digest('base64')}`;
+}
+
+/**
+ * Scan extracted archive bytes, retain that archive for the callback, and always
+ * clean up. Command/scan failures never call the publication callback. The
+ * 20,000-entry inventory ceiling matches the scanner; revisit for larger packs.
+ * `requireConfidentialNames` (#2238, `mirror: curated`): the scan fails closed
+ * without a usable CP11 name list instead of passing CP11 as unconfigured.
+ */
+export async function withCheckedPackage(repoRoot, callback, {
+  runImpl = run, env = process.env, minEntries = MIN_PACKED_ENTRIES, cleanupImpl = rmSync, requireConfidentialNames = false,
+} = {}) {
+  const work = mkdtempSync(join(tmpdir(), 'so-release-pack-'));
+  try {
+    let artifact;
+    let detail;
+    try {
+      const opts = { cwd: repoRoot, env: { ...env, npm_config_loglevel: 'notice' }, timeout: 60000 };
+      const pack = runImpl('npm', ['pack', '--json', '--ignore-scripts', '--pack-destination', work], opts);
+      const inventory = evaluatePackedInventory(pack, { minEntries });
+      if (!inventory.ok) return inventory;
+      const tarballPath = join(work, inventory.filename);
+      const digest = archiveDigest(tarballPath);
+      // Refuse links/special members BEFORE extraction and check the file census.
+      const members = runImpl('tar', ['-tzf', tarballPath], opts);
+      const types = runImpl('tar', ['-tvzf', tarballPath], opts);
+      if (members.status !== 0 || types.status !== 0 || types.stdout.trim().split('\n').some((line) => !/^[-d]/.test(line))) throw new Error('archive-list');
+      const names = members.stdout.trim().split('\n');
+      const files = names.filter((name) => !name.endsWith('/'));
+      const expected = new Set(inventory.paths.map((name) => `package/${name}`));
+      if (names.some((name) => !name.startsWith('package/') || name.split('/').some((part) => part === '..' || part === '.')) || files.length !== expected.size || new Set(files).size !== files.length || files.some((name) => !expected.has(name))) throw new Error('archive-census');
+      const unpacked = join(work, 'unpacked');
+      mkdirSync(unpacked);
+      const extracted = runImpl('tar', ['-xzf', tarballPath, '-C', unpacked], opts);
+      if (extracted.status !== 0) throw new Error('archive-extraction');
+      const inventoryPath = join(work, 'inventory.json');
+      writeFileSync(inventoryPath, JSON.stringify([inventory.record]), { mode: 0o600 });
+      const scanner = fileURLToPath(new URL('./lib/validate/check-owner-leakage.mjs', import.meta.url));
+      const scanArgs = [scanner, join(unpacked, 'package'), '--require-owner-patterns', ...(requireConfidentialNames ? ['--require-confidential-names'] : []), '--packed-files', inventoryPath];
+      const scan = runImpl(process.execPath, scanArgs, opts);
+      const summaries = [...(scan.stdout || '').matchAll(/^Results: (\d+) passed, (\d+) failed \((\d+) scanned files\)$/gm)];
+      if (scan.status !== 0 || summaries.length !== 1 || Number(summaries[0][1]) < 1 || Number(summaries[0][2]) !== 0 || Number(summaries[0][3]) !== inventory.paths.length) return { ok: false, detail: 'required owner policy / packed content scan failed or incomplete' };
+      if (archiveDigest(tarballPath) !== digest) throw new Error('archive-changed');
+      chmodSync(tarballPath, 0o400);
+      artifact = { tarballPath, digest, integrity: archiveIntegrity(tarballPath) };
+      detail = `${inventory.paths.length} packed files, filenames and contents verified`;
+    } catch { return { ok: false, detail: 'packed archive preparation or content verification failed' }; }
+    return { ok: true, detail, value: await callback(artifact) };
+  } finally {
+    // Cleanup must never replace an irreversible receipt or the original error.
+    try { cleanupImpl(work, { recursive: true, force: true }); }
+    catch { console.error('release: temporary package cleanup failed; release outcome unchanged'); }
+  }
+}
+
+/**
+ * Remote-branch parity verdict over `git ls-remote <remote> refs/heads/<branch>`.
+ *
+ * Preflight compared HEAD against `origin/main` only. The Vercel deploy hangs
+ * off the GITHUB mirror, so a mirror that lags is invisible until
+ * `verifyLiveSite` fails — which happens AFTER npm publish and AFTER both tag
+ * pushes, i.e. after the two irreversible steps. Same fail-closed shape as
+ * `tag-free-github`: a failed `ls-remote` is a failed check, and so is output
+ * that carries no sha (an empty answer for `refs/heads/main` means the branch
+ * is not there at all, which is not parity either).
+ *
+ * @param {string} remote
+ * @param {{status: number, stdout?: string, stderr?: string}} ls
+ * @param {string} head — the local HEAD sha
+ * @param {string} [branch]
+ * @returns {{ok: boolean, detail: string}}
+ */
+export function evaluateRemoteHeadParity(remote, ls, head, branch = 'main') {
+  if (ls.status !== 0) {
+    return { ok: false, detail: `ls-remote ${remote} failed (exit ${ls.status}): ${(ls.stderr || '').trim().slice(0, 200)}` };
+  }
+  const sha = (ls.stdout || '').trim().split(/\s+/)[0] || '';
+  if (!/^[0-9a-f]{40}$/i.test(sha)) {
+    return { ok: false, detail: `ls-remote ${remote} returned no sha for refs/heads/${branch} — cannot compare` };
+  }
+  return sha === head
+    ? { ok: true, detail: sha.slice(0, 8) }
+    : { ok: false, detail: `${remote}/${branch} at ${sha.slice(0, 8)}, HEAD at ${head.slice(0, 8)} — the mirror is behind` };
+}
+
+/**
+ * `head-pushed-github` under `mirror: curated` (#1645). The public main is a
+ * snapshot commit, never HEAD, so sha parity can never hold; what must hold is
+ * that github/main IS the snapshot of the commit being released — its
+ * `Source-Commit` trailer equals HEAD. Fail-closed on every gathering failure:
+ * an unreadable ls-remote, no sha, or a commit object that is not local.
+ *
+ * @param {{status: number, stdout?: string, stderr?: string}} ls — `git ls-remote github refs/heads/main`
+ * @param {string} head — the local HEAD sha
+ * @param {string|null} commitBody — `git cat-file commit <github main>` output, null when unreadable
+ * @returns {{ok: boolean, detail: string, sha: string|null}}
+ */
+export function evaluateCuratedMirrorParity(ls, head, commitBody) {
+  if (ls.status !== 0) {
+    return { ok: false, sha: null, detail: `ls-remote github failed (exit ${ls.status}): ${(ls.stderr || '').trim().slice(0, 200)}` };
+  }
+  const sha = (ls.stdout || '').trim().split(/\s+/)[0] || '';
+  if (!/^[0-9a-f]{40}$/i.test(sha)) {
+    return { ok: false, sha: null, detail: 'ls-remote github returned no sha for refs/heads/main — cannot compare' };
+  }
+  if (commitBody === null) {
+    return { ok: false, sha, detail: `github/main ${sha.slice(0, 8)} is not available locally (git fetch github failed) — snapshot source unknown` };
+  }
+  const source = parseSourceCommitTrailer(commitBody);
+  if (!source) {
+    return { ok: false, sha, detail: `github/main ${sha.slice(0, 8)} carries no Source-Commit trailer — publish the curated snapshot first (/close, mirror: curated)` };
+  }
+  return source === head
+    ? { ok: true, sha, detail: `curated: github/main ${sha.slice(0, 8)} is the snapshot of HEAD ${head.slice(0, 8)}` }
+    : { ok: false, sha, detail: `curated: github/main ${sha.slice(0, 8)} is the snapshot of ${source.slice(0, 8)}, HEAD at ${head.slice(0, 8)} — the mirror is behind (/close publishes it)` };
+}
+
+/**
+ * The two GitHub-mirror preflight rows plus the sha GitHub's CI must be asked
+ * about. Reads `mirror` exactly as session-end § 4.4 does (`readMirrorSetting`):
+ *  - `curated`: `head-pushed-github` is the trailer parity above, and the CI sha
+ *    is the snapshot (GitHub never sees HEAD itself).
+ *  - anything else: the plain sha parity, unchanged — but the plain push is only
+ *    allowed when `plainPushGuard` agrees (no export policy in HEAD or on
+ *    origin's main), so a checkout whose Session Config predates
+ *    `mirror: curated` fails `github-mirror-mode` instead of later pushing the
+ *    private history.
+ *  - `none`: GitHub is not a release target at all — `skip` is true and the
+ *    github rows are reported as skipped (release.mjs used to push anyway).
+ *
+ *  - every mode but `none`: `pushUrl` is the `github-push-url` row (#1693). The
+ *    publish tail refuses a push URL that differs from the fetch URL
+ *    (`pushUrlProblem`), but only AFTER the irreversible npm publish; the
+ *    preflight must see the same refusal first. A checkout with no `github`
+ *    remote has no push target, so the row is `skipped`. The detail is
+ *    `pushUrlProblem`'s own message, which names the remote but never a URL
+ *    (a URL may carry credentials).
+ *
+ * @param {string} repoRoot
+ * @param {string} head
+ * @returns {{ skip: boolean, curated?: boolean, mode: {ok: boolean, detail: string}, parity: {ok: boolean, detail: string}, pushUrl: {ok: boolean, detail: string}, ciSha: string }}
+ */
+export function evaluateGithubMirrorPreflight(repoRoot, head) {
+  const setting = readMirrorSetting(repoRoot);
+  if (setting.ok && setting.mirror === 'none') {
+    const skipped = { ok: true, detail: "skipped — 'mirror: none'" };
+    return { skip: true, mode: skipped, parity: skipped, pushUrl: skipped, ciSha: head };
+  }
+  const pushUrl = evaluateGithubPushUrl(repoRoot);
+  const ls = run('git', ['ls-remote', 'github', 'refs/heads/main'], { cwd: repoRoot });
+  if (setting.ok && setting.mirror === 'curated') {
+    const sha = ls.status === 0 ? (ls.stdout || '').trim().split(/\s+/)[0] : '';
+    let body = null;
+    if (/^[0-9a-f]{40}$/i.test(sha)) {
+      // `run` hands `env` to spawnSync verbatim (it replaces, never merges).
+      const readBody = () => run('git', ['cat-file', 'commit', sha], { cwd: repoRoot, env: { ...process.env, ...GIT_NO_REPLACE_ENV } });
+      let cat = readBody();
+      if (cat.status !== 0) {
+        run('git', ['fetch', '--quiet', '--no-tags', 'github', 'refs/heads/main'], { cwd: repoRoot });
+        cat = readBody();
+      }
+      body = cat.status === 0 ? cat.stdout : null;
+    }
+    const parity = evaluateCuratedMirrorParity(ls, head, body);
+    return {
+      skip: false,
+      curated: true,
+      mode: { ok: true, detail: 'curated — GitHub receives the export snapshot, never HEAD' },
+      parity: { ok: parity.ok, detail: parity.detail },
+      pushUrl,
+      ciSha: parity.ok && parity.sha ? parity.sha : head,
+    };
+  }
+  const parity = evaluateRemoteHeadParity('github', ls, head);
+  if (!setting.ok) return { skip: false, mode: { ok: false, detail: setting.reason }, parity, pushUrl, ciSha: head };
+  const verdict = plainPushGuard({ git: createGitRunner(repoRoot), explicitGithub: setting.mirror === 'github' });
+  return {
+    skip: false,
+    mode: verdict.ok
+      ? { ok: true, detail: `plain (mirror: ${setting.mirror ?? 'unset'})` }
+      : { ok: false, detail: `plain push refused — ${verdict.reason}` },
+    parity,
+    pushUrl,
+    ciSha: head,
+  };
+}
+
+/** Steps that run the test suite; a receipt without one proves only validate-plugin. */
+const SNAPSHOT_SUITE_STEPS = ['test', 'remote-gate'];
+const SNAPSHOT_PROBE_REMEDY = 'run: node scripts/snapshot-probe.mjs --local (--host <alias> only without an include policy)';
+
+/**
+ * Verdict of the `snapshot-probe` preflight row (#1712). Release 5.13.0 found
+ * three blockers only after the first curated GitHub push, because nobody had
+ * ever run the suite on the exported tree. Green only for a receipt of THIS
+ * snapshot tree with `ok: true`, every step `pass`, at least one suite step
+ * (`test` or `remote-gate`), and citations checked against the current excluded paths.
+ * Runs nothing itself. Every red detail ends with the remediation.
+ *
+ * @param {{ tree: {ok: boolean, snapshotTree?: string, excludedPathsHash?: string, reason?: string}, receiptResult?: {ok: boolean, receipt: any, reason?: string}|null }} input
+ * @returns {{ ok: boolean, detail: string }}
+ */
+export function evaluateSnapshotProbeRow({ tree, receiptResult }) {
+  const red = (why) => ({ ok: false, detail: `${why} — ${SNAPSHOT_PROBE_REMEDY}` });
+  if (!tree?.ok) return red(`snapshot tree not computable (${tree?.reason ?? 'unknown'})`);
+  const short = String(tree.snapshotTree).slice(0, 8);
+  if (!receiptResult?.ok) {
+    const reason = receiptResult?.reason ?? 'absent';
+    return red(reason === 'absent' ? `no probe receipt for snapshot tree ${short}` : `probe receipt for tree ${short} ${reason}`);
+  }
+  const receipt = receiptResult.receipt;
+  const steps = Array.isArray(receipt?.steps) ? receipt.steps : [];
+  const failed = steps.filter((s) => s?.status !== 'pass').map((s) => `${s?.name ?? '?'}=${s?.status ?? '?'}`);
+  if (failed.length > 0) return red(`probe of tree ${short} red: ${failed.join(', ')}`);
+  if (receipt.ok !== true) return red(`probe receipt for tree ${short} is not ok`);
+  const names = steps.map((s) => s.name);
+  if (!names.some((n) => SNAPSHOT_SUITE_STEPS.includes(n))) {
+    return red(`probe of tree ${short} ran no suite step (${names.join(', ') || 'no steps'})`);
+  }
+  if (!names.includes(CITATION_STEP)) return red(`probe of tree ${short} did not check excluded citations`);
+  if (!tree.excludedPathsHash || tree.excludedPathsHash !== receipt.excludedPathsHash) {
+    return red(`probe of tree ${short} does not cover the current excluded paths`);
+  }
+  return { ok: true, detail: `tree ${short} probed green (${names.join(', ')}; route ${receipt.route ?? 'unknown'})` };
+}
+
+/**
+ * Wiring of the `snapshot-probe` row: only under `mirror: curated` (read off the
+ * {@link evaluateGithubMirrorPreflight} verdict). Under any other mode GitHub
+ * never receives an exported tree, so the row is skipped.
+ * @param {string} repoRoot @param {string} head @param {{ curated?: boolean }} mirror
+ * @returns {{ ok: boolean, detail: string }}
+ */
+export function evaluateSnapshotProbePreflight(repoRoot, head, mirror) {
+  if (!mirror?.curated) return { ok: true, detail: 'skipped — not mirror: curated' };
+  const tree = computeSnapshotTree({ repoRoot, source: head });
+  const receiptResult = tree.ok ? readSnapshotProbeReceipt({ repoRoot, snapshotTree: tree.snapshotTree }) : null;
+  return evaluateSnapshotProbeRow({ tree, receiptResult });
+}
+
+/**
+ * The `github-push-url` preflight row (#1693): red when a push to `github`
+ * would reach a different URL than the one every github read goes through.
+ * @param {string} repoRoot
+ * @returns {{ok: boolean, detail: string}}
+ */
+function evaluateGithubPushUrl(repoRoot) {
+  const remotes = run('git', ['remote'], { cwd: repoRoot });
+  if (remotes.status !== 0) return { ok: false, detail: `git remote failed (exit ${remotes.status}) — push URL unknown` };
+  if (!(remotes.stdout || '').split('\n').map((r) => r.trim()).includes('github')) {
+    return { ok: true, detail: "skipped — no 'github' remote" };
+  }
+  const problem = pushUrlProblem(createGitRunner(repoRoot), 'github');
+  return problem ? { ok: false, detail: problem } : { ok: true, detail: 'push URL equals fetch URL' };
+}
+
+/**
+ * npm-auth verdict over `npm whoami --userconfig <tmp>`.
+ *
+ * A dead or revoked token used to surface only inside `publish()`, i.e. after
+ * every other preflight check had passed and the operator had committed to the
+ * release. The probe is read-only and costs one request. Fail-closed on the
+ * empty-identity case too: `whoami` exiting 0 while printing nothing is not
+ * proof of an identity.
+ *
+ * @param {{status: number, stdout?: string, stderr?: string}|null} whoami
+ * @returns {{ok: boolean, detail: string}}
+ */
+export function evaluateNpmAuth(whoami) {
+  if (!whoami) return { ok: false, detail: 'npm whoami was not run' };
+  if (whoami.status !== 0) {
+    return { ok: false, detail: `npm whoami exited ${whoami.status}: ${(whoami.stderr || '').trim().slice(0, 200)}` };
+  }
+  const who = (whoami.stdout || '').trim();
+  return who
+    ? { ok: true, detail: `authenticated as ${who}` }
+    : { ok: false, detail: 'npm whoami exited 0 with an empty identity — the token could not be confirmed' };
+}
+
+/**
+ * Does `abbreviated` (an `npm token list --json` `token` field) denote
+ * `fullToken`? npm 11 prints the first 8 characters, a literal `...`, and the
+ * last 4 (measured 2026-10-21, npm 11.19.1). Any other shape is no match —
+ * guessing a looser form would let a different token answer for this one.
+ *
+ * @param {string} fullToken
+ * @param {unknown} abbreviated
+ * @returns {boolean}
+ */
+export function matchAbbreviatedNpmToken(fullToken, abbreviated) {
+  if (typeof fullToken !== 'string' || typeof abbreviated !== 'string') return false;
+  const m = abbreviated.match(/^(.{8})\.\.\.(.{4})$/);
+  if (!m) return false;
+  return fullToken.length > 12 && fullToken.startsWith(m[1]) && fullToken.endsWith(m[2]);
+}
+
+/**
+ * Judge whether the token in use can publish NON-INTERACTIVELY (#1712).
+ *
+ * `npm-token-live` (`npm whoami`) proves only that the token authenticates.
+ * Release 5.13.0 passed it and then failed `npm publish` with EOTP: the
+ * granular token lacked "Bypass 2FA". Without bypass, publish fails with EOTP
+ * (account with 2FA) or E403 (account without) — either way the release
+ * cannot finish, so `bypass_2fa !== true` is red, never a warning.
+ *
+ * The caller matches the token and strips `token`/`key`/`id` before calling;
+ * this function never sees a token value, and its details name only the
+ * token's NAME. Fail-closed: anything it cannot confirm is red.
+ *
+ * `mode` is the publish route (ADR-0018): under `stage` (`npm stage publish`,
+ * the default of `--publish` since queue #7906) the bypass flag is not needed,
+ * because the 2FA happens at the owner's approval; write permission, scope,
+ * expiry and revocation are judged the same. The parameter defaults to
+ * `direct` so the historical judgement stays the one a caller gets without
+ * naming a route.
+ *
+ * @param {{matches?: number, entry?: {name?: string, bypass_2fa?: unknown,
+ *   permissions?: Array<{name?: string, action?: string}>,
+ *   scopes?: Array<{name?: string|null, type?: string}>, revoked?: unknown,
+ *   expiry?: string|null} | null, now?: Date, packageName?: string, error?: string, mode?: 'direct'|'stage'}} input
+ * @returns {{ok: boolean, detail: string}}
+ */
+export function evaluateNpmPublishCapability({ matches, entry, now = new Date(), packageName = PACKAGE_NAME, error, mode = 'direct' } = {}) {
+  if (error) return { ok: false, detail: `npm token list failed: ${String(error).slice(0, 200)}` };
+  if (matches !== 1 || !entry) {
+    return { ok: false, detail: `cannot identify the token in use in npm token list (matches: ${matches})` };
+  }
+  const name = String(entry.name ?? '(unnamed)').slice(0, 80);
+  if (entry.revoked !== null && entry.revoked !== undefined) {
+    return { ok: false, detail: `token '${name}' is revoked` };
+  }
+  let expiry = null;
+  if (entry.expiry !== null && entry.expiry !== undefined) {
+    expiry = new Date(entry.expiry);
+    if (Number.isNaN(expiry.getTime())) return { ok: false, detail: `token '${name}' has an unreadable expiry` };
+    if (expiry.getTime() <= now.getTime()) {
+      return { ok: false, detail: `token '${name}' expired ${expiry.toISOString().slice(0, 10)}` };
+    }
+  }
+  const perms = Array.isArray(entry.permissions) ? entry.permissions : [];
+  if (!perms.some((p) => p?.name === 'package' && p?.action === 'write')) {
+    return { ok: false, detail: `token '${name}' has no package write permission` };
+  }
+  // A package scope with `name: null` covers all packages (measured shape).
+  const scopes = Array.isArray(entry.scopes) ? entry.scopes : [];
+  if (!scopes.some((sc) => sc?.type === 'package' && (sc.name === null || sc.name === packageName))) {
+    return { ok: false, detail: `token '${name}' is not scoped to ${packageName}` };
+  }
+  const expires = expiry ? `expires ${expiry.toISOString().slice(0, 10)}` : 'no expiry';
+  if (mode === 'stage') {
+    const bypass = entry.bypass_2fa === true ? 'bypass-2FA present but not needed' : 'no bypass-2FA needed';
+    return { ok: true, detail: `token '${name}': stage-capable (${bypass}; the owner approves on npmjs.com), write, ${expires}` };
+  }
+  if (entry.bypass_2fa !== true) {
+    return {
+      ok: false,
+      detail: `token '${name}' lacks Bypass-2FA — npm publish will fail with EOTP/E403; create a granular token per skills/npm-publish § Token requirements`,
+    };
+  }
+  return { ok: true, detail: `token '${name}': bypass-2FA, write, ${expires}` };
+}
+
+/**
+ * The day npm stops accepting a direct publish with a granular token that
+ * bypasses 2FA (#1906; banner on npmjs.com, read 2026-11-01: "January 2027").
+ * npm named only the month, so the row turns red on its first day.
+ */
+export const TOKEN_ROUTE_SUNSET = '2027-01-01T00:00:00Z';
+
+/**
+ * The clock the `publish-route` preflight row judges against (the token-expiry
+ * row keeps the wall clock). `SO_RELEASE_NOW`
+ * (ISO date) overrides the wall clock so a dry run can rehearse a later day;
+ * an unreadable override returns `null` and the caller reports it red instead
+ * of silently falling back to today.
+ *
+ * @param {Record<string, string|undefined>} [env]
+ * @param {() => Date} [wallClock]
+ * @returns {Date|null}
+ */
+export function resolveReleaseNow(env = process.env, wallClock = () => new Date()) {
+  const raw = (env.SO_RELEASE_NOW || '').trim();
+  if (!raw) return wallClock();
+  const at = new Date(raw);
+  return Number.isNaN(at.getTime()) ? null : at;
+}
+
+/** A publish-route input exists but cannot be read (#1906). Carries the basename and code only. */
+export class PublishRouteReadError extends Error {
+  /**
+   * @param {string} file basename of the unreadable file
+   * @param {string} [code] fs error code, e.g. EACCES or EISDIR
+   */
+  constructor(file, code) {
+    super(`cannot read ${file} (${code || 'unknown'})`);
+    this.name = 'PublishRouteReadError';
+    this.file = file;
+    this.code = code || 'unknown';
+  }
+}
+
+/**
+ * The `publish-route` preflight row (#1906): {@link detectPublishRoutes} judged by
+ * {@link evaluatePublishRouteRow}. An unreadable input turns the row red instead
+ * of crashing `--check`, like the token rows 5b/5c.
+ *
+ * @param {string} repoRoot
+ * @param {Date|null} now
+ * Under `mode: 'trusted'` it also reads the mirror mode (`deps.readMirror`) and the
+ * latest published version's registry document (`deps.npmLatestView`, default
+ * {@link readLatestVersionDoc}); both are injectable so tests need no network.
+ *
+ * @param {Parameters<typeof detectPublishRoutes>[1] & {readMirror?: Function, npmLatestView?: Function}} [deps]
+ * @param {'direct'|'stage'|'trusted'} [mode]
+ * @returns {{ok: boolean, detail: string}}
+ */
+export function publishRouteRow(repoRoot, now, deps, mode = 'direct') {
+  try {
+    const routes = detectPublishRoutes(repoRoot, deps);
+    const workflow = detectTrustedWorkflow(repoRoot, deps);
+    /** @type {{mirror?: string|null, mirrorDetail?: string, evidence?: string}} */
+    let trusted = {};
+    if (mode === 'trusted') {
+      const setting = (deps?.readMirror ?? readMirrorSetting)(repoRoot);
+      const lookup = deps?.npmLatestView ?? (() => readLatestVersionDoc(repoRoot));
+      let view;
+      try {
+        view = lookup();
+      } catch (err) {
+        view = { status: null, stdout: '', stderr: err?.message ?? String(err) };
+      }
+      trusted = {
+        mirror: setting.ok ? setting.mirror : undefined,
+        mirrorDetail: setting.ok ? undefined : setting.reason,
+        evidence: describeTrustedPublisherEvidence(view),
+      };
+    }
+    const { ok, detail } = evaluatePublishRouteRow({ ...routes, now, mode, workflow, ...trusted });
+    return { ok, detail };
+  } catch (err) {
+    if (err instanceof PublishRouteReadError) return { ok: false, detail: `publish-route: ${err.message}` };
+    throw err;
+  }
+}
+
+/**
+ * Which publish routes this checkout has configured (#1906). Presence only:
+ * `.env.local` is tested for an `NPM_TOKEN=` line and the value is never
+ * returned. Trusted publishing counts only when `.github/workflows/publish.yml`
+ * exists AND either `package.json` declares `publishConfig.provenance` or the
+ * workflow grants `id-token: write` (the OIDC permission npm needs).
+ *
+ * A present but unreadable `.env.local` or workflow (EACCES, a directory, …)
+ * throws {@link PublishRouteReadError}, which names only the basename and the
+ * error code — never an absolute path or file content.
+ *
+ * @param {string} repoRoot
+ * @param {{read?: (p: string) => string, exists?: (p: string) => boolean}} [deps]
+ * @returns {{tokenPresent: boolean, trustedPublishing: boolean}}
+ * @throws {PublishRouteReadError}
+ */
+export function detectPublishRoutes(repoRoot, { read: rawRead = (p) => readFileSync(p, 'utf8'), exists = existsSync } = {}) {
+  const read = (p) => {
+    try {
+      return rawRead(p);
+    } catch (err) {
+      throw new PublishRouteReadError(basename(p), err?.code);
+    }
+  };
+  const envPath = join(repoRoot, '.env.local');
+  const tokenPresent = exists(envPath) && /^NPM_TOKEN=\S/m.test(read(envPath));
+  const workflowPath = join(repoRoot, '.github', 'workflows', 'publish.yml');
+  let trustedPublishing = false;
+  if (exists(workflowPath)) {
+    let provenance = false;
+    try {
+      provenance = JSON.parse(read(join(repoRoot, 'package.json')))?.publishConfig?.provenance === true;
+    } catch {
+      // An unreadable package.json leaves only the workflow permission as evidence.
+    }
+    trustedPublishing = provenance || /^\s*id-token:\s*write\b/m.test(read(workflowPath));
+  }
+  return { tokenPresent, trustedPublishing };
+}
+
+/** A `uses:` reference pinned to a full commit SHA: `owner/repo[/path]@<40 hex>`. */
+const PINNED_ACTION_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_./-]+@[0-9a-f]{40}$/;
+
+/**
+ * Env for local git reads on the trusted route: `refs/replace/*` must not make a
+ * read see a different object than the push sends (mirrors `createGitRunner`).
+ */
+const GIT_NO_REPLACE_ENV = Object.freeze({ GIT_NO_REPLACE_OBJECTS: '1' });
+
+/** Release tag shapes a `push.tags` pattern must match to count as the release trigger. */
+const RELEASE_TAG_SAMPLES = ['v1.2.3', 'v10.20.30'];
+
+/**
+ * Whether a GitHub `push.tags` filter pattern matches release tags `vX.Y.Z`.
+ * Ceiling (BV-004): understands `*`, `**` and `?` only; a pattern with `[`, `+`
+ * or `!` is not interpreted and never counts (fail-closed). Revisit trigger:
+ * publish.yml needs one of those filter forms.
+ *
+ * @param {unknown} pattern
+ * @returns {boolean}
+ */
+function tagPatternMatchesRelease(pattern) {
+  if (typeof pattern !== 'string' || pattern === '' || /[[]+!]/.test(pattern)) return false;
+  const glob = pattern
+    .split('**')
+    .map((part) => part.split('*').map((lit) => lit.split('?').map((c) => c.replace(/[.^$()|{}\\]/g, '\\$&')).join('.')).join('[^/]*'))
+    .join('.*');
+  const re = new RegExp(`^${glob}$`);
+  return RELEASE_TAG_SAMPLES.every((tag) => re.test(tag));
+}
+
+/**
+ * Is `.github/workflows/publish.yml` armed for ADR-0018 route B? PURE; never throws.
+ *
+ * Armed only when ALL hold: `on` is a mapping whose ONLY event is `push`, and
+ * `on.push` carries ONLY `tags` (no `branches`, `branches-ignore`, `paths`,
+ * `paths-ignore`, `tags-ignore`) with a pattern matching `vX.Y.Z` — the short
+ * forms `on: push` / `on: [push]` fire on every branch push and are refused, as
+ * is any second event (`workflow_dispatch`, `pull_request`, `schedule`, …); some job runs in `environment: npm-publish` (string or
+ * `{name}`) AND grants `id-token: write` on THAT job; no OTHER job grants
+ * `id-token: write` or `write-all`; the top-level permissions do not grant
+ * `id-token: write` (or `write-all`) to every job; and every `uses:` of a job in
+ * environment npm-publish (step or job level) is pinned to a 40-hex commit SHA
+ * (`owner/repo@<sha>`; tags, branches, short SHAs and local `./` actions refused).
+ *
+ * @param {string|null|undefined} text workflow file content, null when absent
+ * @returns {{armed: boolean, detail: string}}
+ */
+export function evaluateTrustedWorkflow(text) {
+  if (typeof text !== 'string') return { armed: false, detail: 'publish.yml absent' };
+  let doc;
+  try {
+    doc = parseYaml(text);
+  } catch (err) {
+    return { armed: false, detail: `publish.yml unparseable (${String(err?.message ?? err).split('\n')[0].slice(0, 120)})` };
+  }
+  if (!doc || typeof doc !== 'object' || Array.isArray(doc)) return { armed: false, detail: 'publish.yml is not a YAML mapping' };
+  const on = doc.on;
+  if (typeof on === 'string' || Array.isArray(on)) {
+    return { armed: false, detail: `publish.yml trigger is the short form on: ${JSON.stringify(on)} (fires on every push, not only on the release tag)` };
+  }
+  if (!on || typeof on !== 'object') return { armed: false, detail: 'publish.yml trigger is not a mapping with push.tags' };
+  if (Object.hasOwn(on, 'workflow_dispatch')) return { armed: false, detail: 'publish.yml allows workflow_dispatch (a manual run could publish any ref)' };
+  const otherEvents = Object.keys(on).filter((k) => k !== 'push');
+  if (otherEvents.length) return { armed: false, detail: `publish.yml also runs on ${otherEvents.join(', ')} (only push.tags may trigger it)` };
+  const push = on.push;
+  if (!push || typeof push !== 'object' || Array.isArray(push)) return { armed: false, detail: 'publish.yml has no push.tags pattern matching vX.Y.Z (on.push is not a mapping)' };
+  const rawTags = push.tags;
+  const tags = Array.isArray(rawTags) ? rawTags : typeof rawTags === 'string' ? [rawTags] : [];
+  const pattern = tags.find(tagPatternMatchesRelease);
+  if (!pattern) return { armed: false, detail: 'publish.yml has no push.tags pattern matching vX.Y.Z' };
+  const otherFilters = Object.keys(push).filter((k) => k !== 'tags');
+  if (otherFilters.length) return { armed: false, detail: `publish.yml push carries ${otherFilters.join(', ')} beside tags (only a pure tag trigger is armed)` };
+  const top = doc.permissions;
+  if (top === 'write-all' || (top && typeof top === 'object' && top['id-token'] === 'write')) {
+    return { armed: false, detail: 'publish.yml grants id-token: write at the top level (every job could mint the OIDC token)' };
+  }
+  const jobs = doc.jobs && typeof doc.jobs === 'object' ? Object.entries(doc.jobs) : [];
+  const inEnv = jobs.filter(([, job]) => {
+    const env = job?.environment;
+    return env === 'npm-publish' || (env && typeof env === 'object' && env.name === 'npm-publish');
+  });
+  if (inEnv.length === 0) return { armed: false, detail: 'publish.yml has no job in environment npm-publish' };
+  const armedJob = inEnv.find(([, job]) => job?.permissions && typeof job.permissions === 'object' && job.permissions['id-token'] === 'write');
+  if (!armedJob) return { armed: false, detail: `publish.yml job ${inEnv[0][0]} (environment npm-publish) lacks id-token: write` };
+  // Every action the environment-bound job runs sees the OIDC token, so each
+  // `uses:` must be pinned to a full commit SHA; a tag, a branch, a short SHA or
+  // a local `./` action can change under the same reference.
+  for (const [name, job] of inEnv) {
+    const steps = Array.isArray(job?.steps) ? job.steps : [];
+    const refs = [...(job?.uses !== undefined ? [job.uses] : []), ...steps.filter((s) => s && typeof s === 'object' && s.uses !== undefined).map((s) => s.uses)];
+    const unpinned = refs.find((u) => typeof u !== 'string' || u.startsWith('.') || !PINNED_ACTION_RE.test(u));
+    if (unpinned !== undefined) return { armed: false, detail: `publish.yml job ${name} (environment npm-publish) uses ${JSON.stringify(unpinned)}, not pinned to a 40-hex commit SHA` };
+  }
+  // Only the environment-bound job may mint the OIDC token: another job with
+  // id-token: write (or write-all) could publish outside the configured environment.
+  const minting = jobs.find(([name, job]) => name !== armedJob[0] && (job?.permissions === 'write-all' || (job?.permissions && typeof job.permissions === 'object' && job.permissions['id-token'] === 'write')));
+  if (minting) return { armed: false, detail: `publish.yml job ${minting[0]} outside environment npm-publish can mint the OIDC token (${minting[1].permissions === 'write-all' ? 'write-all' : 'id-token: write'})` };
+  return { armed: true, detail: `publish.yml on push.tags ${pattern}, job ${armedJob[0]} in environment npm-publish with id-token: write` };
+}
+
+/**
+ * Read `.github/workflows/publish.yml` and judge it with {@link evaluateTrustedWorkflow}.
+ *
+ * @param {string} repoRoot
+ * @param {{read?: (p: string) => string, exists?: (p: string) => boolean}} [deps]
+ * @returns {{armed: boolean, detail: string}}
+ * @throws {PublishRouteReadError} when the file exists but cannot be read
+ */
+export function detectTrustedWorkflow(repoRoot, { read = (p) => readFileSync(p, 'utf8'), exists = existsSync } = {}) {
+  const workflowPath = join(repoRoot, '.github', 'workflows', 'publish.yml');
+  if (!exists(workflowPath)) return evaluateTrustedWorkflow(null);
+  let text;
+  try {
+    text = read(workflowPath);
+  } catch (err) {
+    throw new PublishRouteReadError(basename(workflowPath), err?.code);
+  }
+  return evaluateTrustedWorkflow(text);
+}
+
+/** Registry document of the latest version; carries `_npmUser` as an OBJECT. */
+export const LATEST_VERSION_DOC_URL = `https://registry.npmjs.org/${PACKAGE_NAME}/latest`;
+
+/**
+ * Read {@link LATEST_VERSION_DOC_URL} in a child `node` process (`fetch`,
+ * `redirect: 'error'`, 20 s) — synchronous like the other preflight lookups.
+ * Not `npm view … _npmUser`: npm prints that field as a display STRING
+ * (`"name <email>"`), so `trustedPublisher` is lost and the evidence could never
+ * read "verified" (measured 2026-11-02 on session-orchestrator@5.17.0).
+ *
+ * @param {string} repoRoot
+ * @param {{runImpl?: Function}} [deps]
+ * @returns {{status: number|null, stdout?: string, stderr?: string}}
+ */
+export function readLatestVersionDoc(repoRoot, { runImpl = run } = {}) {
+  const script = 'fetch(process.argv[1],{redirect:"error",signal:AbortSignal.timeout(20000)})'
+    + '.then(async(r)=>{if(!r.ok){process.stderr.write("HTTP "+r.status);process.exit(1);}process.stdout.write(await r.text());})'
+    + '.catch((e)=>{process.stderr.write(String(e?.message??e));process.exit(1);});';
+  return runImpl(process.execPath, ['-e', script, LATEST_VERSION_DOC_URL], { cwd: repoRoot, timeout: 30000 });
+}
+
+/**
+ * Trusted-publisher EVIDENCE from the latest version's registry document
+ * ({@link readLatestVersionDoc}). INFORMATION, never a gate: npm does not expose
+ * the trusted-publisher configuration without a 2FA login, so the first
+ * `--trusted` release is what proves it.
+ *
+ * @param {{status: number|null, stdout?: string}|null|undefined} view
+ * @returns {string} `verified by v…`, `not yet verified (…)` or `not measurable (…)`
+ */
+export function describeTrustedPublisherEvidence(view) {
+  if (!view || view.status !== 0) return `not measurable (registry lookup exited ${view?.status ?? 'unknown'})`;
+  let json;
+  try {
+    json = JSON.parse(view.stdout || '');
+  } catch {
+    return 'not measurable (registry document is not JSON)';
+  }
+  const version = json?.version;
+  if (typeof version !== 'string' || !/^\d+\.\d+\.\d+$/.test(version)) return 'not measurable (no version in the registry document)';
+  const user = json?._npmUser;
+  if (!user) return `not measurable (v${version} carries no _npmUser)`;
+  if (typeof user !== 'object') return `not measurable (v${version} _npmUser is a display string, not the registry object)`;
+  if (user.trustedPublisher?.id === 'github') return `verified by v${version}`;
+  if (user.trustedPublisher === undefined || user.trustedPublisher === null) {
+    return `not yet verified (v${version} was published with a token; the first --trusted release proves it)`;
+  }
+  return `not yet verified (v${version} names trusted publisher ${JSON.stringify(String(user.trustedPublisher?.id))}, not github)`;
+}
+
+/**
+ * Verdict of the `publish-route` preflight row (#1906). The route is the one
+ * `--publish` actually uses, so a present token wins over a trusted-publishing
+ * workflow: `release.mjs` has no hand-off to the mirror workflow yet. The
+ * preflight knows only ok/red, so the token route stays green before the
+ * sunset and names it in the detail; from {@link TOKEN_ROUTE_SUNSET} on it is
+ * red with the remedy.
+ *
+ * Under `mode: 'stage'` (ADR-0018 route C, the default of `--publish`) the
+ * token route has no sunset: npm keeps `npm stage publish` for granular tokens
+ * after January 2027, and the 2FA moves to the owner's approval. The row then
+ * stays green and names route B (trusted publishing, due 2026-12-15) as the
+ * planned successor.
+ *
+ * Under `mode: 'trusted'` (ADR-0018 route B, `--publish --trusted`) no token is
+ * involved: the row is green only when the workflow is armed
+ * ({@link evaluateTrustedWorkflow}) AND the mirror mode is known and not `none`.
+ * The trusted-publisher `evidence` is named in the detail but never decides.
+ * Under `stage`/`direct` a given `workflow` only appends `; route B workflow armed`
+ * or `not armed` to the unchanged verdict.
+ *
+ * @param {{tokenPresent: boolean, trustedPublishing: boolean, now: Date|null, mode?: 'direct'|'stage'|'trusted',
+ *   workflow?: {armed: boolean, detail: string}, mirror?: string|null, mirrorDetail?: string, evidence?: string}} input
+ * @returns {{ok: boolean, route: 'token'|'trusted-publishing'|'none', detail: string}}
+ */
+export function evaluatePublishRouteRow({ workflow, mirror, mirrorDetail, evidence, ...input }) {
+  if (input.mode === 'trusted') {
+    const ev = `trusted-publisher evidence: ${evidence ?? 'not measurable (not looked up)'}`;
+    const route = 'trusted-publishing';
+    if (!workflow?.armed) return { ok: false, route, detail: `trusted-publishing — workflow not armed: ${workflow?.detail ?? 'not evaluated'}; ${ev}` };
+    if (mirror === 'none') {
+      return { ok: false, route, detail: `trusted-publishing — 'mirror: none': the workflow runs on the GitHub mirror, which this repo never pushes; ${ev}` };
+    }
+    if (mirror !== null && mirror !== 'github' && mirror !== 'curated') {
+      return { ok: false, route, detail: `trusted-publishing — GitHub mirror mode unknown (${mirrorDetail ?? 'not read'}); ${ev}` };
+    }
+    return { ok: true, route, detail: `trusted-publishing (route B) — ${workflow.detail}; mirror: ${mirror ?? 'github (key absent)'}; ${ev}` };
+  }
+  const row = evaluateTokenRouteRow(input);
+  if (!workflow) return row;
+  return { ...row, detail: `${row.detail}; route B workflow ${workflow.armed ? 'armed' : 'not armed'}` };
+}
+
+/** The stage/direct verdict of {@link evaluatePublishRouteRow}, unchanged by route B. */
+function evaluateTokenRouteRow({ tokenPresent, trustedPublishing, now, mode = 'direct' }) {
+  const route = tokenPresent ? 'token' : trustedPublishing ? 'trusted-publishing' : 'none';
+  if (!(now instanceof Date) || Number.isNaN(now.getTime())) {
+    return { ok: false, route, detail: `route ${route}; SO_RELEASE_NOW is not a readable date` };
+  }
+  if (route === 'none') {
+    return {
+      ok: false,
+      route,
+      detail: 'none — no NPM_TOKEN in .env.local and no trusted-publishing workflow (.github/workflows/publish.yml with id-token: write)',
+    };
+  }
+  if (route === 'trusted-publishing') {
+    return {
+      ok: true,
+      route,
+      detail: 'trusted-publishing — .github/workflows/publish.yml; route B runs with --publish --trusted (no NPM_TOKEN in .env.local, so the default --publish cannot stage)',
+    };
+  }
+  const also = trustedPublishing ? '; a trusted-publishing workflow is also present' : '';
+  if (mode === 'stage') {
+    return {
+      ok: true,
+      route,
+      detail: `token (stage) — npm stage publish keeps working after January 2027; the owner approves each release on npmjs.com (ADR-0018 route C); trusted publishing (route B) is due by 2026-12-15 (#1906)${also}`,
+    };
+  }
+  if (now.getTime() >= new Date(TOKEN_ROUTE_SUNSET).getTime()) {
+    return {
+      ok: false,
+      route,
+      detail: `token — npm no longer accepts a direct publish with a granular token since January 2027; switch to trusted publishing (#1906)${also}`,
+    };
+  }
+  return {
+    ok: true,
+    route,
+    detail: `token — npm ends this route in January 2027; switch to trusted publishing before then (#1906)${also}`,
+  };
+}
+
+/**
+ * Turn a `checkCiStatus` result into the `ci-green-on-head` preflight row.
+ *
+ * Three input states since #1031, and the middle one is why this is a named
+ * function rather than a ternary: `degraded` means the check could NOT be READ.
+ * Interpolating `ci.status` there printed `status: undefined` — a red row whose
+ * detail names no cause, which reads as "CI is broken" when the truth is "we
+ * never found out". Only an actual `status: 'green'` reading passes; a release
+ * must never proceed on an unknown CI state.
+ *
+ * The row also carries the CAUSE the probe already knows, because the three
+ * ways this row goes red are indistinguishable without it (#1384 P5): a short
+ * `sha`, a commit the mirror has never seen, and a HEAD with no pipeline all
+ * printed `CI status unknown (query-failed)` / `status: unknown`. The probe's
+ * `detail` (degraded branch, `degradedResult`) and `details.reason` /
+ * `failingJobName` (read branch, `sanitizeApiText`) are clamped and
+ * control-byte-escaped AT THEIR GENERATION in `ci-status-banner.mjs` —
+ * appended here, never re-formatted. That escaping is load-bearing, not
+ * hygiene: the read branch interpolates a RAW API `status` value into
+ * `reason`, and until #1384 f-4 a status carrying `\r` + an ANSI sequence
+ * could repaint THIS row green while its verdict stayed `ok:false`. Do not
+ * append a further probe field here without checking it goes through one of
+ * those two. With neither present the text is byte-identical to
+ * before, so a plain green or a named failing job reads exactly as it did.
+ *
+ * @param {null | {status?: string, failingJobName?: string, failingJobNames?: string[],
+ *   degraded?: string, detail?: string, details?: {reason?: string}}} ci
+ * @returns {{ok: boolean, detail: string}}
+ */
+export function evaluateCiRow(ci) {
+  if (ci === null || ci === undefined) return { ok: false, detail: 'CI status unavailable' };
+  if (ci.degraded) {
+    const why = ci.detail ? `: ${ci.detail}` : '';
+    return { ok: false, detail: `CI status unknown (${ci.degraded}${why})` };
+  }
+  // A failing job NAMES the failure, so it wins over the generic reason;
+  // `reason` is what fills the gap when there is no job to name (`unknown`).
+  // Several red jobs are ALL named (#1712): 5.13.0 showed only the first, and
+  // a red informational Windows run sat beside the real cause. The names come
+  // from `failingJobNames`, sanitised at generation like `failingJobName`.
+  const names = Array.isArray(ci.failingJobNames) ? ci.failingJobNames : [];
+  const reason = (names.length > 1 ? names.join(', ') : ci.failingJobName) || ci.details?.reason || '';
+  const why = reason ? ` (${reason})` : '';
+  return { ok: ci.status === 'green', detail: `status: ${ci.status}${why}` };
+}
+
+/**
+ * Turn the GitHub-mirror CI reading into the `ci-green-on-head-github` row.
+ *
+ * WHY A SECOND CI ROW AT ALL: `ci-green-on-head` reads whatever platform
+ * `detectVcsFamily` picks for `origin` — GitLab here — and the GitLab pipeline
+ * runs Linux only. The **macOS** matrix leg exists solely on the GitHub mirror
+ * (`.github/workflows/test.yml`), i.e. on the operator's own platform. A
+ * release could therefore go out fully green with the macOS leg red, and the
+ * release path would never have asked.
+ *
+ * SELF-DISABLING, and that is the one place this row is allowed to pass without
+ * evidence: a checkout with no `github` remote has no mirror to be red, so the
+ * row is `skipped` rather than red. Everything else keeps the three-state
+ * contract of `evaluateCiRow` unchanged — `unknown` and `degraded` FAIL, because
+ * "we could not read the mirror" is not "the mirror is green" (the fail-closed
+ * house rule at the top of this file).
+ *
+ * This function only judges the `ci` reading it is handed — it is
+ * `evaluateCiPreflightRows` (the caller, see its own docblock) that fetches
+ * `ci` for the commit actually being released, rather than whichever HEAD the
+ * GitHub mirror itself reports.
+ *
+ * @param {string|undefined} repoSpec — `resolveRepoSpec({vcs:'github'})`, undefined when no github remote resolves
+ * @param {null | {status?: string, failingJobName?: string, degraded?: string}} ci
+ * @returns {{ok: boolean, detail: string}}
+ */
+export function evaluateGithubCiRow(repoSpec, ci) {
+  if (!repoSpec) return { ok: true, detail: 'skipped — no github remote' };
+  const row = evaluateCiRow(ci);
+  return { ok: row.ok, detail: `${repoSpec} — ${row.detail}` };
+}
+
+/**
+ * Flag-combination gate, applied before any work.
+ *
+ * `--skip-ci` turns the CI check into `ok:true` with the detail
+ * "SKIPPED via --skip-ci". That is a legitimate affordance for `--check` (an
+ * operator inspecting surface parity while a pipeline is still running) and an
+ * illegitimate one for `--publish`: it would let a green summary that verified
+ * nothing about CI authorise npm publish + two tag pushes, none of which can be
+ * taken back. The refusal is a usage error (exit 2), not a check failure —
+ * nothing was checked.
+ *
+ * @param {{publish?: boolean, 'skip-ci'?: boolean}} values
+ * @returns {{ok: boolean, code?: number, message?: string}}
+ */
+export function validateFlags(values) {
+  if (values.publish && values['skip-ci']) {
+    return {
+      ok: false,
+      code: 2,
+      message:
+        '--skip-ci is refused under --publish: it makes ci-green-on-head pass without checking anything, and publish is irreversible.\n' +
+        'Run `--check --skip-ci` to inspect the other surfaces, then `--publish` once CI is actually green on HEAD.',
+    };
+  }
+  // --reconcile is the read-only resume path after an accepted upload (#1537).
+  // Combining it with a mode that writes would blur exactly the separation it
+  // exists for, so every combination is a usage error rather than a precedence rule.
+  if (values.reconcile && (values.publish || values.check || values['set-version'] || values['skip-ci'])) {
+    return {
+      ok: false,
+      code: 2,
+      message: '--reconcile cannot be combined with --publish, --check, --set-version or --skip-ci: it only verifies an already accepted upload.',
+    };
+  }
+  // --resume-tail finishes the tail of an already accepted upload (#1791). It
+  // writes tags and pushes, so it must never sit beside a mode that publishes or
+  // rewrites the tree, and it needs an explicit version: the package.json of a
+  // moved checkout may already name the next release.
+  if (values['resume-tail'] && (values.publish || values.check || values['set-version'] || values['skip-ci'] || values.reconcile)) {
+    return {
+      ok: false,
+      code: 2,
+      message: '--resume-tail cannot be combined with --publish, --check, --set-version, --skip-ci or --reconcile: it only finishes the tail of an already accepted upload.',
+    };
+  }
+  if (values['resume-tail'] && values.target === undefined) {
+    return { ok: false, code: 2, message: '--resume-tail requires --target X.Y.Z (the version npm already accepted).' };
+  }
+  if (values.target !== undefined && !values.reconcile && !values['resume-tail']) {
+    return { ok: false, code: 2, message: '--target is only valid with --reconcile or --resume-tail.' };
+  }
+  if (values.target !== undefined && !/^\d+\.\d+\.\d+$/.test(values.target)) {
+    return { ok: false, code: 2, message: `invalid --target: ${values.target} (expected X.Y.Z)` };
+  }
+  // --direct selects the pre-ADR-0018 publish route (npm publish with a
+  // Bypass-2FA token, tail in the same run). It only means something next to
+  // --publish; anywhere else it would silently do nothing.
+  // --trusted selects ADR-0018 route B (the GitHub workflow publishes). It is a
+  // publish route like --direct, so the same two refusals apply — except that
+  // `--check --trusted` is allowed: it runs the route-B preflight and prints the
+  // publish-route row with the trusted-publisher evidence; publishing stays
+  // behind --publish.
+  if (values.trusted && (values.reconcile || values['resume-tail'] || values['set-version'])) {
+    return { ok: false, code: 2, message: '--trusted cannot be combined with --reconcile, --resume-tail or --set-version: they read the route from the proof or publish nothing.' };
+  }
+  if (values.trusted && !values.publish && !values.check) {
+    return { ok: false, code: 2, message: '--trusted is only valid with --publish or --check: it hands the publish to the GitHub workflow (ADR-0018 route B), --check shows its preflight.' };
+  }
+  if (values.trusted && values.direct) {
+    return { ok: false, code: 2, message: '--trusted cannot be combined with --direct: they select different publish routes (ADR-0018 route B vs. the token route).' };
+  }
+  if (values.direct && !values.publish) {
+    return { ok: false, code: 2, message: '--direct is only valid with --publish: it selects the direct npm publish route instead of the staged one (ADR-0018).' };
+  }
+  return { ok: true };
+}
+
+// ---------------------------------------------------------------------------
+// Impure orchestration below — git/npm/network. The DECISIONS live in the
+// evaluators above and are unit-tested; what remains here is the plumbing that
+// feeds them.
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Publish-tail shield (#1753). Once npm has issued the target-confirmed
+// receipt, dying half-way leaves a release that npm serves but that has no
+// origin tag and no GitHub release (5.13.0: `timeout 580` sent SIGTERM after
+// the receipt). From that point on, SIGTERM/SIGINT/SIGHUP are only recorded,
+// and every child `run()` starts gets its own process group, because GNU
+// `timeout` signals the whole group: a handler alone keeps node alive while
+// the `git push` child still dies (measured 2026-10-24, Node 24.22.1).
+// Ctrl-C is deferred as well; a half release is worse than waiting, and there
+// is no "press twice" escape because `timeout` delivers each signal twice at
+// once. Force-abort stays possible with SIGKILL.
+// ---------------------------------------------------------------------------
+
+const TAIL_SIGNALS = ['SIGTERM', 'SIGINT', 'SIGHUP'];
+const releaseTailShield = { armed: false, deferred: [] };
+
+function recordTailSignal(signal) {
+  releaseTailShield.deferred.push({ signal, at: new Date().toISOString() });
+}
+
+/**
+ * Defer SIGTERM/SIGINT/SIGHUP for the rest of this process and announce it once
+ * on stderr. Idempotent: a second call is a no-op and returns false. Never
+ * exits and never re-raises; the recorded signals are reported by
+ * {@link printPublishOutcome}.
+ *
+ * @param {{target: string, log?: (s: string) => void}} opts
+ * @returns {boolean} true when this call armed the shield
+ */
+export function armReleaseTailShield({ target, log = (s) => process.stderr.write(s) }) {
+  if (releaseTailShield.armed) return false;
+  releaseTailShield.armed = true;
+  for (const signal of TAIL_SIGNALS) process.on(signal, recordTailSignal);
+  // After SIGHUP the tty may be gone and writes fail with EIO; without a
+  // listener that 'error' would crash the tail. Unmeasured: no SIGHUP-on-a-dead-
+  // tty run has been observed yet.
+  const ignore = () => {};
+  process.stdout.on('error', ignore);
+  process.stderr.on('error', ignore);
+  log(`publish tail running for ${PACKAGE_NAME}@${target} (npm accepted it): SIGTERM/SIGINT/SIGHUP are deferred until tag, push, GitHub release and live check end; force-abort only with kill -KILL ${process.pid}; if it dies anyway, finish it with: node scripts/release.mjs --resume-tail --target ${target}; registry state: node scripts/release.mjs --reconcile --target ${target}\n`);
+  return true;
+}
+
+/**
+ * The signals the armed shield has deferred so far, oldest first.
+ *
+ * @returns {Array<{signal: string, at: string}>}
+ */
+export function deferredTailSignals() {
+  return releaseTailShield.deferred.map((entry) => ({ ...entry }));
+}
+
+/**
+ * Let libuv deliver signals that arrived while a synchronous child ran: the JS
+ * handler only fires on a later event-loop turn, so without this turn a
+ * deferred SIGTERM would be recorded after the outcome was already printed.
+ */
+async function settleDeferredTailSignals() {
+  if (releaseTailShield.armed) await new Promise((r) => setImmediate(r));
+}
+
+function run(cmd, args, opts = {}) {
+  // While the tail shield is armed, the child leads its own process group so a
+  // group-wide signal (GNU `timeout`) cannot kill a push half-way. setsid also
+  // drops the controlling tty: a git credential prompt fails instead of hanging
+  // (remotes are HTTPS with a keychain helper). Ceiling: spawns inside
+  // `lib/github-export.mjs` / `lib/vcs-repo-spec.mjs` are not covered; a signal
+  // in those seconds surfaces as a `tag-and-push` reconciliation result, never
+  // silence. Revisit if that is ever observed.
+  const detached = releaseTailShield.armed && process.platform !== 'win32';
+  // Windows: npm is npm.cmd, which Node refuses to spawn without a shell
+  // (CVE-2024-27980); run npm-cli.js with this Node instead (#1743). A missing
+  // npm throws here, loud. Unix argv is unchanged (identity resolution).
+  let native;
+  try {
+    native = resolveNativeCommand(cmd, args, { env: opts.env ?? process.env });
+  } catch (err) {
+    throw new Error(`${cmd} ${args.join(' ')}: ${err.message}`, { cause: err });
+  }
+  const res = spawnSync(native.cmd, native.args, { ...SPAWN_OPTS, ...(detached ? { detached: true } : {}), ...opts });
+  if (res.error) throw new Error(`${cmd} ${args.join(' ')}: ${res.error.message}`, { cause: res.error });
+  return res;
+}
+
+function mustRun(cmd, args, opts = {}) {
+  const res = run(cmd, args, opts);
+  if (res.status !== 0) {
+    throw new Error(`${cmd} ${args.join(' ')} exited ${res.status}: ${(res.stderr || res.stdout || '').slice(0, 500)}`);
+  }
+  return res;
+}
+
+/**
+ * Deadline for one network-bound tail child (push, fetch, ls-remote), #1791.
+ * A push runs this repo's pre-push gate (~2.5 min per remote, measured), so
+ * 900 s leaves headroom for a loaded host. Ceiling (BV-004): a gate that
+ * legitimately needs longer ends as a `timed out` reconciliation item and is
+ * finished by `--resume-tail`; raise the constant if that is ever observed.
+ */
+export const TAIL_CHILD_TIMEOUT_MS = 900_000;
+
+/**
+ * Run one network-bound tail child in its own process group with a deadline
+ * (#1791, Security-Review W4: a hung `git push` of the armed tail could only be
+ * ended with `kill -KILL` on node, and its child kept running as an orphan).
+ * The child PID — which is also its process-group id on POSIX — is printed on
+ * stderr when it starts; on the deadline the WHOLE group gets SIGTERM, then
+ * SIGKILL after `graceMs`, so the pre-push gate under the push dies too.
+ *
+ * Deliberately NOT `spawnInGroup` (lib/process-group.mjs): its exit handler
+ * kills every live group on SIGTERM/SIGINT/SIGHUP even when another listener is
+ * present, which would undo the tail shield (#1753) — GNU `timeout` would again
+ * kill the push half-way. The ladder here never outlives its promise: every
+ * timer is cleared on settling, and no signal is sent after settling.
+ *
+ * Once the deadline fired, the ladder runs until the GROUP is gone, not just
+ * its leader (SO#1791 F2): a leader that exits on SIGTERM closes its pipes
+ * while a member that ignores SIGTERM keeps running. After the leader's
+ * `close` the group is probed (`kill(-pgid, 0)`) every 50 ms; SIGKILL still
+ * goes out at `graceMs` while the probe answers, and the promise settles when
+ * the probe reports the group gone or at the hard deadline (`graceMs` + 5 s),
+ * then with `survivors: ['process group <pgid>']`. POSIX does not reuse a
+ * process-group id while any member exists, so signalling a group the probe
+ * just saw alive is safe; after the first ESRCH nothing is sent again.
+ * Before the deadline nothing is probed or signalled.
+ * Ceilings (BV-004): on Windows only the direct child is signalled (no group,
+ * no probe, `survivors` stays empty); a grandchild that leaves the group
+ * (setsid) is neither reached nor counted; between a probe that saw the group
+ * alive and the next signal the group can empty and its id be reused — a
+ * window of one event-loop turn, not closed here. A zombie member whose parent
+ * never reaps it counts as alive. Revisit if a survivor line ever names a
+ * group that `ps -ax -o pgid` shows empty.
+ *
+ * @param {string} cmd
+ * @param {string[]} args
+ * @param {{cwd?: string, timeoutMs?: number, graceMs?: number, log?: (s: string) => void, spawnImpl?: typeof spawn,
+ *   killImpl?: (pid: number, sig: string|number) => unknown}} [opts] `killImpl` defaults to `process.kill` (tests inject a fake).
+ * @returns {Promise<{status: number|null, output: string, timedOut: boolean, pgid: number|null, killSignals: string[], survivors?: string[]}>}
+ *   `survivors` is set only after a deadline: empty when the group was gone before settling.
+ */
+export function runTailChild(cmd, args, opts = {}) {
+  const timeoutMs = opts.timeoutMs ?? TAIL_CHILD_TIMEOUT_MS;
+  const graceMs = opts.graceMs ?? 10_000;
+  const log = opts.log ?? ((s) => process.stderr.write(s));
+  const group = process.platform !== 'win32';
+  const label = `${cmd} ${args.join(' ')}`;
+  const killImpl = opts.killImpl ?? ((pid, sig) => process.kill(pid, sig));
+  return new Promise((resolve) => {
+    const killSignals = [];
+    const timers = [];
+    let output = '';
+    let timedOut = false;
+    let settled = false;
+    let groupGone = false;
+    let child;
+    // True while the process group has a member. ESRCH latches `groupGone` for
+    // good; EPERM means a member exists that we may not signal.
+    const groupAlive = () => {
+      if (!group || !child?.pid || groupGone) return false;
+      try { killImpl(-child.pid, 0); return true; } catch (err) {
+        if (err?.code === 'EPERM') return true;
+        groupGone = true;
+        return false;
+      }
+    };
+    const settle = (status) => {
+      if (settled) return;
+      settled = true;
+      for (const t of timers) clearTimeout(t);
+      const result = { status: timedOut ? null : status, output, timedOut, pgid: group ? child?.pid ?? null : null, killSignals };
+      if (timedOut) result.survivors = groupAlive() ? [`process group ${child.pid}`] : [];
+      resolve(result);
+    };
+    try {
+      child = (opts.spawnImpl ?? spawn)(cmd, args, {
+        cwd: opts.cwd,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        ...(group ? { detached: true } : { windowsHide: true }),
+      });
+    } catch (err) {
+      output = err?.message ?? String(err);
+      settle(null);
+      return;
+    }
+    if (child.pid) log(`  tail child pid ${child.pid}${group ? ` (process group ${child.pid})` : ''}: ${label} — deadline ${Math.round(timeoutMs / 1000)} s\n`);
+    // Bounded capture: only the tail of the output is ever reported.
+    const collect = (d) => { output = (output + d).slice(-64 * 1024); };
+    child.stdout?.on('data', collect);
+    child.stderr?.on('data', collect);
+    const signal = (sig) => {
+      if (settled || !child.pid || groupGone) return;
+      killSignals.push(sig);
+      try { if (group) killImpl(-child.pid, sig); else child.kill(sig); } catch (err) {
+        if (group && err?.code === 'ESRCH') groupGone = true;
+      }
+    };
+    // After the deadline: settle only once no member of the group is left.
+    const awaitGroupGone = () => {
+      if (settled) return;
+      if (!groupAlive()) { settle(null); return; }
+      timers.push(setTimeout(awaitGroupGone, 50));
+    };
+    timers.push(setTimeout(() => {
+      timedOut = true;
+      log(`  tail child pid ${child.pid} passed its ${Math.round(timeoutMs / 1000)} s deadline: ${label}; sending SIGTERM to its process group\n`);
+      signal('SIGTERM');
+      timers.push(setTimeout(() => signal('SIGKILL'), graceMs));
+      timers.push(setTimeout(() => settle(null), graceMs + 5_000));
+    }, timeoutMs));
+    child.on('error', (err) => { output += `\n${err?.message ?? err}`; settle(null); });
+    child.on('close', (code) => {
+      if (timedOut && group) awaitGroupGone();
+      else settle(code);
+    });
+  });
+}
+
+/** {@link runTailChild}, throwing on a deadline or a non-zero exit. */
+async function mustRunTail(cmd, args, opts = {}) {
+  const res = await runTailChild(cmd, args, opts);
+  const label = `${cmd} ${args.join(' ')}`;
+  if (res.timedOut) {
+    const seconds = Math.round((opts.timeoutMs ?? TAIL_CHILD_TIMEOUT_MS) / 1000);
+    const survivors = res.survivors?.length ? `; still alive after SIGKILL: ${res.survivors.join(', ')}` : '';
+    throw new Error(`${label} timed out after ${seconds} s; process group ${res.pgid ?? 'unknown'} was sent ${res.killSignals.join(', ') || 'no signal'}${survivors}`);
+  }
+  if (res.status !== 0) throw new Error(`${label} exited ${res.status}: ${res.output.trim().slice(-500)}`);
+  return res;
+}
+
+function readPackageVersion(repoRoot) {
+  return JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf8')).version;
+}
+
+/**
+ * Both CI preflight rows (`ci-green-on-head` + `ci-green-on-head-github`) for
+ * ONE commit — the commit actually about to be released — never whichever
+ * HEAD the queried platform happens to report.
+ *
+ * Before this function existed, neither `checkCiStatus` call below passed
+ * `sha`, so the GitHub branch fell back to `commits/HEAD` — the MIRROR's own
+ * default-branch head, which is the release commit only once `head-pushed-github`
+ * has ALREADY proven `github/main == local HEAD`. A release cut before that
+ * push landed asked GitHub about a commit that was never pushed and could read
+ * green for work GitHub has not seen at all (measured 2026-09-16 for
+ * `3ebf0e9d`). The GitLab branch was already correct by default (`deps.sha ??
+ * getHeadSha(repoRoot)`), so only the two call sites below needed the fix —
+ * see `checkCiStatus`'s own docblock in `ci-status-banner.mjs` for the `sha`
+ * contract (#1332).
+ *
+ * Factored out of `preflight()` as its own async, DI-testable unit:
+ * `checkCiStatus` reaches the network by default, and `preflight()`'s
+ * surrounding checks (git, npm) are not test-doubled, so this is the seam
+ * through which the `sha` wiring can be unit-tested without spinning up a
+ * full fixture release.
+ *
+ * @param {string} repoRoot
+ * @param {string} head - full hex commit id of the commit being released (the
+ *   local HEAD `preflight()` already computed for the remote-parity rows).
+ * @param {{
+ *   skipCi?: boolean,
+ *   githubSha?: string,
+ *   skipGithub?: boolean,
+ *   checkCiStatus?: Function,
+ *   resolveRepoSpec?: (opts: { repoRoot: string, vcs: 'github' }) => string|undefined,
+ * }} [deps]
+ * @returns {Promise<{ gitlab: {ok: boolean, detail: string}, github: {ok: boolean, detail: string} }>}
+ */
+export async function evaluateCiPreflightRows(repoRoot, head, {
+  skipCi = false,
+  // Under `mirror: curated` GitHub never sees `head`; its CI ran on the snapshot
+  // whose Source-Commit is `head` (#1645). Plain mirrors keep `head`.
+  githubSha = head,
+  // `mirror: none`: GitHub is no release target, so its CI is not consulted.
+  skipGithub = false,
+  checkCiStatus: checkCiStatusDep,
+  resolveRepoSpec: resolveRepoSpecDep = resolveRepoSpec,
+} = {}) {
+  if (skipCi) {
+    const skipped = { ok: true, detail: 'SKIPPED via --skip-ci' };
+    return { gitlab: skipped, github: skipped };
+  }
+  const checkCiStatusImpl = checkCiStatusDep ?? (await import('./lib/ci-status-banner.mjs')).checkCiStatus;
+
+  const ci = await checkCiStatusImpl({ repoRoot, timeoutMs: 15000, sha: head });
+  const gitlab = evaluateCiRow(ci);
+
+  if (skipGithub) return { gitlab, github: { ok: true, detail: "skipped — 'mirror: none'" } };
+  const githubSpec = resolveRepoSpecDep({ repoRoot, vcs: 'github' });
+  let githubCi = null;
+  if (githubSpec) {
+    githubCi = await checkCiStatusImpl({ repoRoot, vcs: 'github', timeoutMs: 15000, sha: githubSha });
+  }
+  const github = evaluateGithubCiRow(githubSpec, githubCi);
+
+  return { gitlab, github };
+}
+
+/** Detail of both npm token rows under `--trusted`: the route involves no token. */
+export const TRUSTED_TOKEN_ROW_DETAIL = 'not used under --trusted (no npm token involved)';
+
+async function preflight(repoRoot, target, { skipCi = false, mode = 'stage' } = {}) {
+  const checks = [];
+  const add = (name, ok, detail = '') => checks.push({ name, ok, detail });
+
+  // 1. Git state: on main, clean tree, HEAD present on BOTH publish remotes.
+  //
+  // Both remotes, symmetrically, and both read LIVE via ls-remote rather than
+  // from a local tracking ref. origin (GitLab) is where the code lives; github
+  // is where the Vercel git integration watches, so a lagging mirror means the
+  // site cannot deploy — and that was previously discovered only by
+  // verifyLiveSite, i.e. after npm publish and both tag pushes had already
+  // happened. The old origin check read `origin/main` after a `git fetch` whose
+  // exit status nobody inspected: a failed fetch left a stale tracking ref that
+  // could still equal HEAD, so the comparison was against remembered state
+  // rather than remote state. ls-remote has no such intermediate.
+  const branch = run('git', ['branch', '--show-current'], { cwd: repoRoot }).stdout.trim();
+  add('branch-is-main', branch === 'main', branch);
+  // `git status` exit status is read, not assumed: an empty stdout from a
+  // FAILED status call is indistinguishable from a genuinely clean tree, and
+  // the empty-reads-as-all-clear shape is exactly the fail-open this file was
+  // hardened against elsewhere. Same reasoning for the two `git tag -l` reads
+  // below. A third subprocess shares the shape — the `git ls-remote --tags`
+  // collision probe further down reads an empty stdout as "no collision" — but
+  // that one guards it with an explicit `ls.status === 0`, so it is not
+  // fail-open. Emptiness-means-all-clear is the shape to look for; reading the
+  // status is what makes it safe. (Census: 14 `run(` call sites in this file.
+  // It does NOT cover the raw `spawnSync` calls — a payload-keyed census misses
+  // the consumer that uses a different channel, which is how the unchecked
+  // propagation wait stayed invisible to it.)
+  const status = run('git', ['status', '--porcelain'], { cwd: repoRoot });
+  const dirty = (status.stdout || '').trim();
+  add(
+    'working-tree-clean',
+    status.status === 0 && dirty === '',
+    status.status !== 0
+      ? `git status failed (exit ${status.status}) — cleanliness unknown`
+      : dirty
+        ? `${dirty.split('\n').length} dirty path(s)`
+        : '',
+  );
+  const head = run('git', ['rev-parse', 'HEAD'], { cwd: repoRoot }).stdout.trim();
+  const originLs = run('git', ['ls-remote', 'origin', 'refs/heads/main'], { cwd: repoRoot });
+  const originParity = evaluateRemoteHeadParity('origin', originLs, head);
+  add('head-pushed-origin', originParity.ok, originParity.detail);
+  // github: sha parity for a plain mirror, Source-Commit parity under
+  // `mirror: curated` (#1645) — see evaluateGithubMirrorPreflight.
+  const mirror = evaluateGithubMirrorPreflight(repoRoot, head);
+  add('github-mirror-mode', mirror.mode.ok, mirror.mode.detail);
+  add('head-pushed-github', mirror.parity.ok, mirror.parity.detail);
+  add('github-push-url', mirror.pushUrl.ok, mirror.pushUrl.detail);
+  // Curated only: the exported tree must have been probed (#1712).
+  const probe = evaluateSnapshotProbePreflight(repoRoot, head, mirror);
+  add('snapshot-probe', probe.ok, probe.detail);
+  // Curated only: CP11 needs a usable host-local name list (#2238); stale = WARN detail.
+  const namesRow = evaluateNamesListRow({
+    curated: Boolean(mirror.curated),
+    list: mirror.curated ? describeNamesList({ ownerConfig: loadOwnerConfig().config }) : null,
+  });
+  add('confidential-names', namesRow.ok, namesRow.detail);
+
+  // 2. Surface parity.
+  const surfaceRows = scanSurfaces(repoRoot, target);
+  for (const row of surfaceRows) {
+    add(`surface:${row.file}`, row.ok, row.problems.join('; '));
+  }
+
+  // 3. CHANGELOG editorial gate.
+  const changelog = checkChangelogEntry(readFileSync(join(repoRoot, 'CHANGELOG.md'), 'utf8'), target);
+  add('changelog-entry', changelog.ok, changelog.problems.join('; '));
+
+  // 3b. Drift sweep: no file outside the surfaces table + allowlist may still
+  // carry the previous release's version literal.
+  //
+  // POPULATION (#1248, closed here): this used to be one `git grep`, which
+  // searches the INDEX and is therefore blind to UNTRACKED files — the sweep
+  // measured "no TRACKED file still carries X" while its row read as a
+  // whole-tree census. It now enumerates via
+  // `scripts/lib/validate/enumerate-repo-files.mjs` (tracked PLUS
+  // untracked-not-ignored) and greps in-process; see {@link collectDriftHits}
+  // for the fail-closed contract and why hidden directories (the forgotten
+  // .codex-plugin manifest) are still covered. Allowlisted: files that
+  // legitimately carry version HISTORY.
+  const tagList = run('git', ['tag', '-l', 'v*', '--sort=-v:refname'], { cwd: repoRoot });
+  const prevTag = (tagList.stdout || '')
+    .split('\n').map((t) => t.trim().replace(/^v/, ''))
+    .filter((t) => /^\d+\.\d+\.\d+$/.test(t) && t !== target)[0];
+  if (tagList.status !== 0) {
+    // "No previous tag" and "could not list tags" are different facts, and only
+    // one of them means the sweep is unnecessary.
+    add('drift-sweep', false, `git tag -l failed (exit ${tagList.status}) — cannot determine the previous release to sweep for`);
+  } else if (prevTag) {
+    // Line-shaped rows (not a bare file list): the verdict needs the matching LINE, because a
+    // caret-ranged dependency that equals our previous version is not drift and a file list
+    // cannot show that.
+    const hits = collectDriftHits({ repoRoot, prevTag });
+    const sweep = evaluateDriftSweep(hits, prevTag, HISTORY_ALLOWLIST);
+    add('drift-sweep', sweep.ok, sweep.detail);
+  } else {
+    add('drift-sweep', true, 'no previous tag to sweep against');
+  }
+
+  // 4. Tag collision — local, origin, github mirror.
+  const tag = `v${target}`;
+  const localTagRes = run('git', ['tag', '-l', tag], { cwd: repoRoot });
+  const localTag = (localTagRes.stdout || '').trim();
+  add(
+    'tag-free-local',
+    localTagRes.status === 0 && localTag === '',
+    localTagRes.status !== 0
+      ? `git tag -l failed (exit ${localTagRes.status}) — local tag collision unknown`
+      : localTag && `${tag} already exists locally`,
+  );
+  for (const remote of mirror.skip ? ['origin'] : ['origin', 'github']) {
+    const ls = run('git', ['ls-remote', '--tags', remote, `refs/tags/${tag}`], { cwd: repoRoot });
+    const collision = ls.status === 0 && ls.stdout.trim() !== '';
+    add(`tag-free-${remote}`, ls.status === 0 && !collision, collision ? `${tag} already on ${remote}` : ls.status !== 0 ? `ls-remote ${remote} failed` : '');
+  }
+
+  // 5. npm registry collision (E404 = name free = fine for a first publish).
+  const view = run('npm', ['view', PACKAGE_NAME, 'versions', '--json'], { cwd: repoRoot });
+  const registry = evaluateRegistryCollision(view, target);
+  add('registry-version-free', registry.ok, registry.detail);
+
+  // 5a. A staged publish of this version must not be staged again (ADR-0018
+  // route C). Reads the proof's `staged` block only; see evaluateStagedProofRow.
+  const stagedRow = evaluateStagedProofRow(readReleaseProof(repoRoot, target), target);
+  add('staged-proof-absent', stagedRow.ok, stagedRow.detail);
+
+  // 5b. npm token liveness. Read-only, one request, and it answers the one
+  // question the rest of the preflight cannot: is the credential we are about
+  // to publish with actually alive? Without it, a revoked or expired token
+  // surfaces inside publish() — after every other check has gone green and the
+  // operator has committed to the release. Same token discipline as publish():
+  // .env.local only, temp userconfig at 0600, removed in a finally.
+  let auth;
+  if (mode === 'trusted') {
+    // Route B: the GitHub workflow publishes via OIDC; no npm token is read or sent.
+    add('npm-token-live', true, TRUSTED_TOKEN_ROW_DETAIL);
+    add('npm-token-publish', true, TRUSTED_TOKEN_ROW_DETAIL);
+  } else try {
+    auth = withTempUserconfig(loadNpmToken(repoRoot), (rc) =>
+      run('npm', ['whoami', '--userconfig', rc], { cwd: repoRoot }),
+    );
+    const verdict = evaluateNpmAuth(auth);
+    add('npm-token-live', verdict.ok, verdict.detail);
+  } catch (err) {
+    // A missing/ungitignored .env.local is a legitimate red preflight, not a
+    // crash: "cannot publish from here" is exactly what the operator needs.
+    add('npm-token-live', false, err.message);
+  }
+
+  // 5c (skipped under --trusted, see 5b). npm token PUBLISH capability (#1712). `whoami` was green for 5.13.0,
+  // yet publish failed with EOTP: the token lacked Bypass-2FA. `npm token list`
+  // (works with a granular token; `npm profile get` does not) carries that
+  // flag. The token is matched INSIDE this block and only the stripped entry
+  // leaves it — no token value, prefix or key reaches a detail string.
+  if (mode !== 'trusted') try {
+    const token = loadNpmToken(repoRoot);
+    const listed = withTempUserconfig(token, (rc) => {
+      const res = run('npm', ['token', 'list', '--json', '--userconfig', rc], { cwd: repoRoot });
+      if (res.status !== 0) return { error: `exit ${res.status}: ${(res.stderr || '').trim().slice(0, 200)}` };
+      let list;
+      try {
+        list = JSON.parse(res.stdout || '');
+      } catch {
+        return { error: 'output is not JSON' };
+      }
+      if (!Array.isArray(list)) return { error: 'output is not a JSON array' };
+      const hits = list.filter((e) => matchAbbreviatedNpmToken(token, e?.token));
+      if (hits.length !== 1) return { matches: hits.length, entry: null };
+      // Destructured only to strip them: they never leave this closure.
+      const { token: _abbr, key: _key, id: _id, ...entry } = hits[0];
+      return { matches: 1, entry };
+    });
+    const verdict = evaluateNpmPublishCapability({ ...listed, mode });
+    add('npm-token-publish', verdict.ok, verdict.detail);
+  } catch (err) {
+    add('npm-token-publish', false, err.message);
+  }
+
+  // 5d. Which publish route is configured, judged against the token-route
+  // sunset (#1906) for the direct route; the staged route (ADR-0018 C, the
+  // default) has no sunset. Presence only — this reads no token value into a
+  // detail.
+  const route = publishRouteRow(repoRoot, resolveReleaseNow(), undefined, mode);
+  add('publish-route', route.ok, route.detail);
+
+  // 6/6b. CI green on HEAD, both platforms — judged for the commit actually
+  // being released, never whichever HEAD the queried platform reports (see
+  // evaluateCiPreflightRows's docblock for the `sha`-wiring history, #1332).
+  //
+  // GitLab: the repo's iron session-start rule applies to releases doubly —
+  // local green is not evidence — see .claude/rules. GitHub: this second row
+  // exists because `detectVcsFamily` picks `origin` (GitLab) for the row
+  // above, whose pipeline is Linux-only; the macOS matrix leg lives
+  // exclusively in `.github/workflows/test.yml`. `vcs: 'github'` forces the
+  // probe onto the mirror without touching the detection order.
+  // SELF-DISABLING: a checkout with no `github` remote has no mirror to be
+  // red, so `evaluateGithubCiRow` reports `skipped` rather than red — see its
+  // own docblock. --skip-ci is refused under --publish upstream in
+  // validateFlags(); it can only reach this branch from --check.
+  if (mirror.skip) add('tag-free-github', true, "skipped — 'mirror: none'");
+  const ciRows = await evaluateCiPreflightRows(repoRoot, head, { skipCi, githubSha: mirror.ciSha, skipGithub: mirror.skip });
+  add('ci-green-on-head', ciRows.gitlab.ok, ciRows.gitlab.detail);
+  add('ci-green-on-head-github', ciRows.github.ok, ciRows.github.detail);
+
+  // `head` is handed to the publish tail, which refuses to tag anything else.
+  return { checks, head, curated: Boolean(mirror.curated) };
+}
+
+function changelogExcerpt(repoRoot, target) {
+  const text = readFileSync(join(repoRoot, 'CHANGELOG.md'), 'utf8');
+  const re = new RegExp(`^## \\[${target.replace(/\./g, '\\.')}\\][^\\n]*\\n([\\s\\S]*?)(?=^## \\[|$(?![\\s\\S]))`, 'm');
+  const m = text.match(re);
+  return m ? m[1].trim().split('\n').slice(0, 40).join('\n') : '';
+}
+
+/**
+ * Read NPM_TOKEN from the gitignored .env.local, refusing if the ignore is not
+ * actually in force. Throws with an operator-actionable message; the token
+ * itself is never part of any message.
+ */
+function loadNpmToken(repoRoot) {
+  const ignored = run('git', ['check-ignore', '.env.local'], { cwd: repoRoot });
+  if (ignored.status !== 0) throw new Error('.env.local is NOT gitignored — refusing to read a token from it');
+  if (!existsSync(join(repoRoot, '.env.local'))) throw new Error('.env.local not found — no NPM_TOKEN to publish with');
+  const tokenMatch = readFileSync(join(repoRoot, '.env.local'), 'utf8').match(/^NPM_TOKEN=(.+)$/m);
+  if (!tokenMatch) throw new Error('NPM_TOKEN not found in .env.local');
+  return tokenMatch[1].trim();
+}
+
+/**
+ * Run `fn(userconfigPath)` against a throwaway npm userconfig carrying the
+ * token. Extracted so the preflight liveness probe and the publish itself share
+ * ONE implementation of the security invariants from
+ * skills/npm-publish/SKILL.md — 0600, and removed in a finally even when the
+ * callback throws. Two hand-copied versions of this dance would be two places
+ * for a token file to be left behind.
+ */
+function withTempUserconfig(token, fn) {
+  const tmpDir = mkdtempSync(join(tmpdir(), 'release-npmrc-'));
+  const tmpRc = join(tmpDir, 'npmrc');
+  try {
+    writeFileSync(tmpRc, `//registry.npmjs.org/:_authToken=${token}\n`, { mode: 0o600 });
+    chmodSync(tmpRc, 0o600);
+    return fn(tmpRc);
+  } finally {
+    // NEVER let cleanup decide the release outcome. This finally runs AFTER
+    // `npm publish` has already published and BEFORE the caller evaluates the
+    // receipt, so a throwing rmSync (EPERM/EBUSY -- `force` only swallows
+    // ENOENT) surfaced as a pre-receipt system failure: published, untagged,
+    // unpushed, and reported as "safe to re-run". That is the #1088 F1 shape at
+    // its last remaining site. A surviving 0600 token file is a hygiene problem,
+    // so it is announced rather than swallowed.
+    try {
+      rmSync(tmpDir, { recursive: true, force: true });
+    } catch (err) {
+      process.stderr.write(
+        `WARN: could not remove temporary npm userconfig ${tmpDir} (${err?.message ?? err}). ` +
+          `It contains a write token — delete it and rotate the token.\n`,
+      );
+    }
+  }
+}
+
+/**
+ * Evaluate npm publish output for the receipt that makes the release immutable.
+ * A successful process alone is insufficient: the receipt must name this package
+ * and this exact target version.
+ *
+ * @param {{status: number|null, stdout?: string, stderr?: string}} result
+ * @param {string} target
+ * @returns {{confirmed: boolean, target: string, detail: string}}
+ */
+export function evaluatePublishReceipt(result, target) {
+  const output = `${result.stdout || ''}\n${result.stderr || ''}`;
+  const receipt = new RegExp(`(?:^|\\n)\\+ ${PACKAGE_NAME.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}@${target.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:\\r?$|\\s)`);
+  const confirmed = result.status === 0 && receipt.test(output);
+  return {
+    confirmed,
+    target,
+    detail: confirmed
+      ? `${PACKAGE_NAME}@${target} receipt confirmed`
+      : /\bEOTP\b/.test(output)
+        // #1712: npm asks for a one-time password BEFORE uploading, so nothing
+        // reached the registry and a re-run is safe.
+        ? `npm publish failed with EOTP (exit ${result.status}): the token lacks Bypass-2FA — nothing was published; re-running --publish with a Bypass-2FA granular token is safe (skills/npm-publish § Token requirements)`
+        : `npm publish did not emit a target-confirmed receipt for ${PACKAGE_NAME}@${target} (exit ${result.status})`,
+  };
+}
+
+/**
+ * Poll the registry after npm has issued a target-confirmed receipt. Every
+ * failure remains visible, but none invalidates the already irreversible npm
+ * publish; callers must reconcile rather than retry `--publish`.
+ *
+ * `npm view <pkg> version` resolves the `latest` dist-tag (and `npm view` fetches
+ * with `preferOnline`, so no local cache masks the answer): the poll returns
+ * `verified` on the first attempt whose `dist-tags.latest` equals `target`.
+ * Default budget: 12 attempts, 15 s apart = 165 s between the first and last
+ * poll. npm's registry needs ~2 min to serve a fresh `latest` (#1440 C2); the
+ * previous 5 x 3 s = 12 s budget reported `timeout` on every real publish.
+ *
+ * @param {string} repoRoot
+ * @param {string} target
+ * @param {{attempts?: number, delaySeconds?: number, runImpl?: Function, waitImpl?: Function}} [deps]
+ * @returns {{ok: boolean, kind: 'verified'|'timeout'|'query-failed'|'wait-failed', attempts: number, detail: string}}
+ */
+export function waitForRegistryPropagation(repoRoot, target, deps = {}) {
+  const attempts = deps.attempts ?? 12;
+  const delaySeconds = deps.delaySeconds ?? 15;
+  const runImpl = deps.runImpl ?? run;
+  const waitImpl = deps.waitImpl ?? (() => runImpl('sleep', [String(delaySeconds)], { cwd: repoRoot }));
+
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    let view;
+    try {
+      view = runImpl('npm', ['view', PACKAGE_NAME, 'version'], { cwd: repoRoot });
+    } catch (err) {
+      return {
+        ok: false,
+        kind: 'query-failed',
+        attempts: attempt,
+        detail: `registry query failed on attempt ${attempt}/${attempts}: ${err.message}`,
+      };
+    }
+    if (view.status === 0 && (view.stdout || '').trim() === target) {
+      return {
+        ok: true,
+        kind: 'verified',
+        attempts: attempt,
+        detail: `registry reports ${target} on attempt ${attempt}/${attempts}`,
+      };
+    }
+    if (view.status !== 0) {
+      return {
+        ok: false,
+        kind: 'query-failed',
+        attempts: attempt,
+        detail: `registry query failed on attempt ${attempt}/${attempts} (exit ${view.status}): ${(view.stderr || view.stdout || '').trim().slice(0, 300)}`,
+      };
+    }
+    if (attempt < attempts) {
+      let wait;
+      try {
+        wait = waitImpl({ attempt, delaySeconds });
+      } catch (err) {
+        return {
+          ok: false,
+          kind: 'wait-failed',
+          attempts: attempt,
+          detail: `registry propagation wait failed after attempt ${attempt}/${attempts}: ${err.message}`,
+        };
+      }
+      if (!wait || wait.status !== 0 || wait.error) {
+        return {
+          ok: false,
+          kind: 'wait-failed',
+          attempts: attempt,
+          detail: `registry propagation wait failed after attempt ${attempt}/${attempts} (exit ${wait?.status ?? 'unknown'}): ${(wait?.error?.message || wait?.stderr || wait?.stdout || '').trim().slice(0, 300)}`,
+        };
+      }
+    }
+  }
+  return {
+    ok: false,
+    kind: 'timeout',
+    attempts,
+    detail: `registry did not report ${target} after ${attempts} attempts`,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Accepted -> available -> installable (#1537).
+//
+// npm's PUT answers HTTP 202 and the CLI prints the target receipt BEFORE the
+// version is publicly served: publish-time scanning runs asynchronously and can
+// hold a version for far longer than any in-process poll should wait (5.10.0
+// stayed 404 for more than 25 minutes after its receipt). So the receipt is
+// persisted as a proof file, and `--reconcile` resumes the verification later
+// from that proof alone. That path is structurally separate from publishing: it
+// never reaches publish(), tagAndPush(), a push, or an `npm pack` of the repo.
+// ---------------------------------------------------------------------------
+
+const RELEASE_PROOF_DIR = join('.orchestrator', 'runtime');
+const INTEGRITY_RE = /^sha512-[A-Za-z0-9+/]{86}==$/;
+
+/** Path of the persisted publish proof for `target` (gitignored runtime dir). */
+export function releaseProofPath(repoRoot, target) {
+  return join(repoRoot, RELEASE_PROOF_DIR, `release-${target}.json`);
+}
+
+/**
+ * The evidence `--reconcile` needs to verify an accepted upload later without
+ * the original archive: which bytes were checked (sha256 + npm-style sha512
+ * integrity), when npm issued the receipt, and which commit/tag they belong to.
+ *
+ * @param {{target: string, artifact: {digest: string, integrity: string}, commit: string|null, receiptAt: string}} input
+ */
+export function buildReleaseProof({ target, artifact, commit, receiptAt }) {
+  return {
+    schema: 1,
+    package: PACKAGE_NAME,
+    target,
+    tag: `v${target}`,
+    commit: commit || null,
+    receiptAt,
+    sha256: artifact.digest,
+    integrity: artifact.integrity,
+  };
+}
+
+/**
+ * The proof of a route-B hand-off (`--publish --trusted`): every field of
+ * {@link buildReleaseProof} (`sha256`/`integrity` of the LOCAL checked archive,
+ * so {@link readReleaseProof} still validates it) plus `route`, the per-file
+ * content digest the registry tarball must reproduce, and `handedOff`.
+ * `receiptAt` stays null until the trusted receipt is confirmed; `handedOff.commit`
+ * (the commit the workflow builds) is filled in right after the push.
+ *
+ * @param {{target: string, artifact: {digest: string, integrity: string}, commit: string|null,
+ *   content: {digest: string, count: number}, at: string}} input
+ */
+export function buildTrustedReleaseProof({ target, artifact, commit, content, at }) {
+  return {
+    ...buildReleaseProof({ target, artifact, commit, receiptAt: null }),
+    route: 'trusted-publishing',
+    contentDigest: content.digest,
+    contentCount: content.count,
+    handedOff: { at, commit: null },
+  };
+}
+
+/** Typed refusal of the route-B flow before anything irreversible happened. */
+export class TrustedRouteError extends Error {
+  /** @param {string} message */
+  constructor(message) {
+    super(message);
+    this.name = 'TrustedRouteError';
+  }
+}
+
+/**
+ * Judge one round of registry evidence for a route-B release. PURE.
+ *
+ * Wraps {@link evaluateTrustedPublishReceipt} with the two rules this flow adds:
+ * the commit is ALWAYS checked (no expected commit → `refused`; a receipt whose
+ * `source-commit` check did not pass is never `confirmed`), and the registry
+ * tarball's per-file content digest must equal the checked archive's.
+ * `pending`/`unreadable` mean "keep waiting"; `mismatch`, `content-mismatch` and
+ * `refused` are final.
+ *
+ * @param {{target: string, evidence: {versionDoc?: any, attestations?: any, tarball?: Buffer|null, errors?: string[]}|null,
+ *   commit: string|null|undefined, contentDigest: string, localManifest?: {files: Array<{path: string, sha256: string}>}|null}} input
+ * @returns {{state: 'pending'|'unreadable'|'mismatch'|'content-mismatch'|'refused'|'confirmed', detail: string,
+ *   checks: Array<{name: string, ok: boolean|null, detail: string}>, diff?: {onlyLocal: string[], onlyRegistry: string[], changed: string[]}}}
+ */
+export function judgeTrustedReceipt({ target, evidence, commit, contentDigest, localManifest = null }) {
+  if (typeof commit !== 'string' || !/^[0-9a-f]{40}$/.test(commit)) {
+    return { state: 'refused', checks: [], detail: 'no expected commit recorded — a receipt without the commit check is never confirmed' };
+  }
+  const receipt = evaluateTrustedPublishReceipt({
+    target,
+    versionDoc: evidence?.versionDoc ?? null,
+    attestations: evidence?.attestations ?? null,
+    expected: { ...expectedTrustedIdentity(target), commit },
+  });
+  const errors = Array.isArray(evidence?.errors) && evidence.errors.length ? ` (${evidence.errors.slice(0, 3).join('; ')})` : '';
+  const checks = receipt.checks;
+  if (receipt.state === 'pending') return { state: 'pending', checks, detail: `${receipt.detail}${errors}` };
+  if (receipt.state === 'unreadable') return { state: 'unreadable', checks, detail: `${receipt.detail}${errors}` };
+  if (receipt.state === 'mismatch') {
+    const failed = checks.find((c) => c.ok === false);
+    return { state: 'mismatch', checks, detail: `registry evidence contradicts a publish by our workflow from ${commit.slice(0, 12)} — check ${failed?.name ?? 'unknown'}: ${receipt.detail}` };
+  }
+  if (checks.find((c) => c.name === 'source-commit')?.ok !== true) {
+    return { state: 'mismatch', checks, detail: 'source-commit was not verified — a receipt without the commit check is never confirmed' };
+  }
+  if (!evidence?.tarball) return { state: 'unreadable', checks, detail: `registry tarball not readable yet${errors}` };
+  if (!tarballMatchesIntegrity(evidence.tarball, evidence?.versionDoc?.dist?.integrity)) {
+    return { state: 'content-mismatch', checks, detail: 'registry tarball bytes do not match dist.integrity (sha512) — not parsed' };
+  }
+  let registry;
+  try {
+    registry = archiveContentManifest(evidence.tarball);
+  } catch (err) {
+    return { state: 'content-mismatch', checks, detail: `registry tarball is not a readable archive: ${err?.message ?? err}` };
+  }
+  if (registry.digest !== contentDigest) {
+    const full = localManifest ? compareContentManifests(localManifest, registry) : null;
+    const diff = full ? { onlyLocal: full.onlyLocal.slice(0, 10), onlyRegistry: full.onlyRegistry.slice(0, 10), changed: full.changed.slice(0, 10) } : undefined;
+    const lists = diff ? `; only local: [${diff.onlyLocal.join(', ')}]; only registry: [${diff.onlyRegistry.join(', ')}]; changed: [${diff.changed.join(', ')}]` : '';
+    return { state: 'content-mismatch', checks, ...(diff ? { diff } : {}), detail: `registry tarball content ${registry.digest.slice(0, 12)} differs from the checked archive ${String(contentDigest).slice(0, 12)}${lists}` };
+  }
+  return { state: 'confirmed', checks, detail: `${receipt.detail}; content equals the checked archive (${registry.count} files)` };
+}
+
+/**
+ * Why `handedOff.commit` of a route-B proof is NOT anchored to the release
+ * commit, or null when it is (SO#1791 F3 applied to route B). Under
+ * `mirror: curated` the handed commit must be a local commit object whose
+ * `Source-Commit:` trailer equals `proof.commit` (the check `curatedGithubTag`
+ * does for the non-trusted tail); under any other pushing mirror it must BE
+ * `proof.commit`. `mirror: none` is never anchored (the workflow lives on the
+ * mirror). Without this, a hand-edited proof could bind the receipt and the
+ * GitHub tag to any 40-hex commit.
+ *
+ * @param {{commit?: unknown, handedOff?: {commit?: unknown}}} proof
+ * @param {string} mirror the resolved `mirror` setting
+ * @param {(args: string[], opts?: {env?: Record<string, string>}) => {status: number, stdout?: string}} git
+ *   local git runner; the commit read passes `env: {GIT_NO_REPLACE_OBJECTS: '1'}`,
+ *   which the runner must merge into the child env
+ * @returns {string|null}
+ */
+export function trustedAnchorProblem(proof, mirror, git) {
+  const handed = proof?.handedOff?.commit;
+  const commit = proof?.commit;
+  if (typeof handed !== 'string' || !FULL_SHA_RE.test(handed)) return 'the proof records no handedOff.commit';
+  if (typeof commit !== 'string' || !FULL_SHA_RE.test(commit)) return 'the proof records no release commit';
+  if (mirror === 'none') return "'mirror: none' — the workflow lives on the GitHub mirror, which this repo never pushes";
+  if (mirror !== 'curated') {
+    return handed === commit ? null : `handedOff.commit ${handed.slice(0, 12)} is not the release commit ${commit.slice(0, 12)} under a plain mirror`;
+  }
+  const body = git(['cat-file', 'commit', handed], { env: GIT_NO_REPLACE_ENV });
+  const source = body?.status === 0 ? parseSourceCommitTrailer(String(body.stdout ?? '')) : null;
+  return source === commit
+    ? null
+    : `handedOff.commit ${handed.slice(0, 12)} carries Source-Commit: ${source ?? (body?.status === 0 ? 'none' : 'unreadable (not a local commit)')}, not the release commit ${commit.slice(0, 12)}`;
+}
+
+/**
+ * `version` of `<sha>:package.json`, read without replace objects; `null` when
+ * the blob is unreadable, not JSON, or carries no string version. Never throws.
+ *
+ * @param {(args: string[], opts?: {env?: Record<string, string>}) => {status: number, stdout?: string}} git
+ * @param {string} sha
+ * @returns {string|null}
+ */
+function trustedCommitVersion(git, sha) {
+  try {
+    const res = git(['show', `${sha}:package.json`], { env: GIT_NO_REPLACE_ENV });
+    if (res?.status !== 0) return null;
+    const version = JSON.parse(String(res.stdout ?? ''))?.version;
+    return typeof version === 'string' ? version : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The proof after a CONFIRMED trusted receipt: `receiptAt` + `receipt` added,
+ * every other field kept. Shared by `--publish --trusted` and `--resume-tail`
+ * so both persist the same shape.
+ *
+ * @param {object} proof a route-B proof ({@link buildTrustedReleaseProof})
+ * @param {object} checks the `checks` of the confirmed {@link judgeTrustedReceipt} verdict
+ * @param {string} at ISO timestamp of the confirmation
+ * @returns {object}
+ */
+export function withTrustedReceipt(proof, checks, at) {
+  return { ...proof, receiptAt: at, receipt: { route: 'trusted-publishing', checks } };
+}
+
+/** Add the public install job measurement to the existing release proof. */
+export function withInstallCheck(proof, { state, conclusion, url, reason }, at) {
+  return { ...proof, installCheck: { state, ...(conclusion && { conclusion }), url, ...(reason && { reason }), at } };
+}
+
+/**
+ * Persist the proof atomically. Never throws: it runs after the irreversible
+ * receipt, where a write failure must be reported, not turned into a pre-receipt
+ * style abort.
+ *
+ * @returns {{ok: boolean, path: string, detail: string}}
+ */
+export function writeReleaseProof(repoRoot, proof, { writeImpl = writeJsonAtomicSync } = {}) {
+  const path = releaseProofPath(repoRoot, proof.target);
+  try {
+    const res = writeImpl(path, proof, { tmpPrefix: '.release-proof' });
+    if (res?.ok) return { ok: true, path, detail: `publish proof written to ${relativePath(repoRoot, path)}` };
+    return { ok: false, path, detail: `publish proof NOT written (${res?.error ?? 'unknown error'})` };
+  } catch (err) {
+    return { ok: false, path, detail: `publish proof NOT written (${err?.message ?? err})` };
+  }
+}
+
+/**
+ * Read and validate the proof for `target`. A missing or malformed proof is a
+ * refusal — success is never derived from `latest` alone.
+ *
+ * `missing` is true only when the proof file does not exist (ENOENT); every
+ * other failure (unparseable, invalid) carries `missing: false`.
+ *
+ * @returns {{ok: true, proof: object, path: string} | {ok: false, missing: boolean, path: string, detail: string}}
+ */
+export function readReleaseProof(repoRoot, target, { readImpl = readFileSync } = {}) {
+  const path = releaseProofPath(repoRoot, target);
+  let proof;
+  try {
+    proof = JSON.parse(readImpl(path, 'utf8'));
+  } catch (err) {
+    const missing = err?.code === 'ENOENT';
+    return { ok: false, missing, path, detail: missing ? `proof missing: ${relativePath(repoRoot, path)} does not exist` : `proof unreadable: ${err?.message ?? err}` };
+  }
+  if (!proof || typeof proof !== 'object' || proof.package !== PACKAGE_NAME || proof.target !== target || !INTEGRITY_RE.test(proof.integrity ?? '') || !/^[0-9a-f]{64}$/.test(proof.sha256 ?? '')) {
+    return { ok: false, missing: false, path, detail: `proof invalid: ${relativePath(repoRoot, path)} does not describe ${PACKAGE_NAME}@${target} with sha256 + sha512 integrity` };
+  }
+  return { ok: true, proof, path };
+}
+
+/**
+ * Judge one `npm view <pkg>@<target> --json` answer against the proof.
+ * A 404 is `pending` — never read as "held" or "blocked": the package token
+ * cannot see npm's internal scan state, so a 404 alone carries no diagnosis.
+ *
+ * `superseded` = exact version + integrity served, but `latest` already points
+ * at a semver-greater release.
+ *
+ * @returns {{state: 'available'|'superseded'|'pending'|'failed', reason: string, detail: string}}
+ */
+export function evaluateRegistryManifest(view, target, proof) {
+  const raw = (view?.stdout || '').trim();
+  let json;
+  try { json = raw ? JSON.parse(raw) : null; } catch { json = undefined; }
+  if (view?.status !== 0) {
+    if (json?.error?.code === 'E404' || /\bE404\b/.test(`${view?.stderr || ''}`)) {
+      return { state: 'pending', reason: 'not-visible', detail: `registry answers 404 for ${PACKAGE_NAME}@${target} — not yet publicly served; a 404 alone is not evidence of a hold or block` };
+    }
+    return { state: 'pending', reason: 'query-failed', detail: `npm view exited ${view?.status}: ${(json?.error?.summary || view?.stderr || raw).trim().slice(0, 300)}` };
+  }
+  if (json === null) return { state: 'pending', reason: 'not-visible', detail: `registry returned no manifest for ${PACKAGE_NAME}@${target}` };
+  if (!json || typeof json !== 'object' || Array.isArray(json)) return { state: 'pending', reason: 'unparseable', detail: 'npm view output is not a single manifest object' };
+  if (json.version !== target) return { state: 'pending', reason: 'not-visible', detail: `registry manifest reports version ${json.version ?? 'none'}, not ${target}` };
+  const integrity = json.dist?.integrity;
+  if (!integrity) return { state: 'pending', reason: 'integrity-missing', detail: 'registry manifest carries no dist.integrity yet' };
+  if (integrity !== proof.integrity) {
+    return { state: 'failed', reason: 'integrity-mismatch', detail: `registry dist.integrity ${integrity} differs from the checked archive ${proof.integrity}` };
+  }
+  const latest = json['dist-tags']?.latest;
+  if (latest !== target) {
+    // A later release can only have been published after this one was
+    // accepted, so `latest` will never come back to the target. Keeping that
+    // `pending` forever would be a standing false alarm; the exact version and
+    // its bytes are still verified (here, and by the download that follows).
+    if (isNewerRelease(latest, target)) {
+      return { state: 'superseded', reason: 'superseded', detail: `registry serves ${target} with the checked integrity; dist-tags.latest is already the later ${latest}` };
+    }
+    return { state: 'pending', reason: 'latest-not-target', detail: `dist-tags.latest is ${latest ?? 'unset'}, not ${target}` };
+  }
+  return { state: 'available', reason: 'available', detail: `registry serves ${target} as latest with the checked integrity` };
+}
+
+/** True when `candidate` is a plain X.Y.Z strictly greater than `target`; prereleases never count. */
+function isNewerRelease(candidate, target) {
+  const parse = (v) => (/^\d+\.\d+\.\d+$/.test(v ?? '') ? v.split('.').map(Number) : null);
+  const a = parse(candidate);
+  const b = parse(target);
+  if (!a || !b) return false;
+  for (let i = 0; i < 3; i++) if (a[i] !== b[i]) return a[i] > b[i];
+  return false;
+}
+
+/**
+ * Download the published tarball the way a consumer resolves it (`npm pack
+ * <pkg>@<target> --ignore-scripts` into an empty temp dir), hash it, and compare
+ * with the proof. Nothing from the download is extracted or executed.
+ *
+ * @returns {{state: 'installable'|'pending'|'failed', reason: string, detail: string}}
+ */
+export function checkInstallable(target, proof, deps = {}) {
+  const runImpl = deps.runImpl ?? run;
+  const integrityImpl = deps.integrityImpl ?? archiveIntegrity;
+  const dir = (deps.mkTempImpl ?? (() => mkdtempSync(join(tmpdir(), 'so-release-reconcile-'))))();
+  try {
+    let pack;
+    try {
+      pack = runImpl('npm', ['pack', `${PACKAGE_NAME}@${target}`, '--json', '--ignore-scripts', '--prefer-online', '--pack-destination', dir], { cwd: dir, timeout: 120000 });
+    } catch (err) {
+      return { state: 'pending', reason: 'download-failed', detail: `npm pack ${PACKAGE_NAME}@${target} failed: ${err?.message ?? err}` };
+    }
+    if (pack?.status !== 0) {
+      return { state: 'pending', reason: 'download-failed', detail: `npm pack ${PACKAGE_NAME}@${target} exited ${pack?.status}: ${(pack?.stderr || '').trim().slice(0, 300)}` };
+    }
+    let filename;
+    try {
+      const records = JSON.parse(pack.stdout);
+      filename = Array.isArray(records) && records.length === 1 ? records[0]?.filename : null;
+    } catch { filename = null; }
+    if (typeof filename !== 'string' || basename(filename) !== filename || !filename.endsWith('.tgz')) {
+      return { state: 'pending', reason: 'download-unparseable', detail: 'npm pack output did not name exactly one downloaded tarball' };
+    }
+    let integrity;
+    try { integrity = integrityImpl(join(dir, filename)); } catch (err) {
+      return { state: 'pending', reason: 'download-unreadable', detail: `downloaded tarball unreadable: ${err?.message ?? err}` };
+    }
+    if (integrity !== proof.integrity) {
+      return { state: 'failed', reason: 'integrity-mismatch', detail: `downloaded tarball ${integrity} differs from the checked archive ${proof.integrity}` };
+    }
+    return { state: 'installable', reason: 'installable', detail: `downloaded ${filename} matches the checked archive integrity` };
+  } finally {
+    try { (deps.cleanupImpl ?? rmSync)(dir, { recursive: true, force: true }); } catch { /* temp download dir only */ }
+  }
+}
+
+/**
+ * Resume verification of an accepted upload: accepted (proof exists) ->
+ * available (exact version served as latest with the checked integrity) ->
+ * installable (a consumer download hashes to the checked integrity).
+ *
+ * Budget defaults to 20 attempts 60 s apart (19 min between first and last
+ * query): npm's changelog (2026-07-28, read 2026-10-08) names ~5 min typical
+ * and "up to 15 minutes or more" for publish-time scanning, without guarantee.
+ * The budget is therefore a bound, not the fix — it is resumable: a `pending`
+ * result is not a failure, the next `--reconcile` starts over from the same
+ * proof. Only an integrity mismatch is `failed`.
+ *
+ * @param {string} repoRoot
+ * @param {string} target
+ * @param {{attempts?: number, delaySeconds?: number, runImpl?: Function, waitImpl?: Function, readImpl?: Function, integrityImpl?: Function, mkTempImpl?: Function, cleanupImpl?: Function}} [deps]
+ * @returns {{ok: boolean, state: 'installable'|'superseded'|'pending'|'failed'|'proof-missing', target: string, accepted: boolean, available: boolean, installable: boolean, attempts: number, reason: string, detail: string, proofPath: string}}
+ */
+export function reconcileRelease(repoRoot, target, deps = {}) {
+  const attempts = deps.attempts ?? 20;
+  const delaySeconds = deps.delaySeconds ?? 60;
+  const runImpl = deps.runImpl ?? run;
+  const waitImpl = deps.waitImpl ?? (() => runImpl('sleep', [String(delaySeconds)], { cwd: repoRoot }));
+  const base = { target, accepted: false, available: false, installable: false, attempts: 0 };
+
+  const read = readReleaseProof(repoRoot, target, { readImpl: deps.readImpl });
+  if (!read.ok) {
+    return { ...base, ok: false, state: 'proof-missing', reason: 'proof-missing', detail: read.detail, proofPath: read.path };
+  }
+  const { proof } = read;
+  if (proof.route === 'trusted-publishing') {
+    // GitHub packs its own tarball, so dist.integrity never has to equal the
+    // local archive's; comparing it would call a genuine release failed.
+    return { ...base, ok: false, state: 'failed', reason: 'trusted-route', detail: 'a trusted-publishing proof is verified by reconcileTrustedRelease (provenance + content digest), never by dist.integrity', proofPath: read.path };
+  }
+  const done = (state, step, attempt, extra) => ({ ...base, accepted: true, ...extra, ok: state === 'installable' || state === 'superseded', state, attempts: attempt, reason: step.reason, detail: step.detail, proofPath: read.path });
+
+  let last = { reason: 'not-run', detail: 'no attempt ran' };
+  let available = false;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    let view;
+    try {
+      view = runImpl('npm', ['view', `${PACKAGE_NAME}@${target}`, '--json'], { cwd: repoRoot, timeout: 60000 });
+    } catch (err) {
+      view = { status: null, stdout: '', stderr: err?.message ?? String(err) };
+    }
+    const manifest = evaluateRegistryManifest(view, target, proof);
+    if (manifest.state === 'failed') return done('failed', manifest, attempt, { available: false });
+    if (manifest.state === 'available' || manifest.state === 'superseded') {
+      available = true;
+      const install = checkInstallable(target, proof, deps);
+      if (install.state === 'installable') {
+        // Superseded keeps its own state (and exit 0): the release's bytes are
+        // verified installable, only the `latest` tag moved on — not a failure,
+        // but worth saying so the operator does not read it as "is latest".
+        if (manifest.state === 'superseded') return done('superseded', { reason: 'superseded', detail: `${manifest.detail}; ${install.detail}` }, attempt, { available: true, installable: true });
+        return done('installable', install, attempt, { available: true, installable: true });
+      }
+      if (install.state === 'failed') return done('failed', install, attempt, { available: true });
+      last = install;
+    } else {
+      available = false;
+      last = manifest;
+    }
+    if (attempt < attempts) {
+      let wait;
+      try { wait = waitImpl({ attempt, delaySeconds }); } catch (err) { wait = { status: null, error: err }; }
+      if (!wait || wait.status !== 0 || wait.error) {
+        return done('pending', { reason: 'wait-failed', detail: `wait failed after attempt ${attempt}/${attempts}; last state: ${last.detail}` }, attempt, { available });
+      }
+    }
+  }
+  return done('pending', { reason: last.reason, detail: `${last.detail} (after ${attempts} attempts; run \`--reconcile --target ${target}\` again later)` }, attempts, { available });
+}
+
+/**
+ * `--reconcile` for a route-B proof (`proof.route === 'trusted-publishing'`).
+ * Read-only: the trusted receipt with the proof's `handedOff.commit` and its
+ * content digest ({@link judgeTrustedReceipt}); never `dist.integrity`. A trusted
+ * proof without `handedOff.commit` is refused (fail-closed). States: `published`
+ * (ok), `pending`, `failed`, `proof-missing`.
+ *
+ * @param {string} repoRoot
+ * @param {string} target
+ * Before any registry read the proof's `handedOff.commit` must be anchored to
+ * `proof.commit` ({@link trustedAnchorProblem}; reason `proof-unanchored`).
+ *
+ * @param {{readImpl?: Function, fetchEvidenceImpl?: Function, attempts?: number, pollMs?: number, sleepImpl?: (ms: number) => Promise<void>,
+ *   readMirrorSettingImpl?: (repoRoot: string) => object, runImpl?: Function}} deps
+ * @param {ReturnType<typeof readReleaseProof>} read
+ */
+async function reconcileTrustedReceipt(repoRoot, target, deps, read) {
+  const base = { target, accepted: false, available: false, installable: false, attempts: 0 };
+  if (!read.ok) return { ...base, ok: false, state: 'proof-missing', reason: 'proof-missing', detail: read.detail, proofPath: read.path };
+  const { proof } = read;
+  const fail = (reason, detail, attempts = 0) => ({ ...base, ok: false, state: 'failed', reason, detail, attempts, proofPath: read.path });
+  if (proof.route !== 'trusted-publishing') return fail('not-trusted', 'the proof is not a trusted-publishing proof; use reconcileRelease');
+  const commit = proof.handedOff?.commit;
+  if (typeof commit !== 'string' || !FULL_SHA_RE.test(commit)) {
+    return fail('proof-incomplete', `${relativePath(repoRoot, read.path)} records no handedOff.commit — the hand-off push never completed, so no receipt can be bound to a commit`);
+  }
+  if (typeof proof.contentDigest !== 'string' || !/^[0-9a-f]{64}$/.test(proof.contentDigest)) {
+    return fail('proof-incomplete', `${relativePath(repoRoot, read.path)} records no content digest`);
+  }
+  const setting = (deps.readMirrorSettingImpl ?? readMirrorSetting)(repoRoot);
+  if (!setting.ok) return fail('mirror', `GitHub mirror mode unknown — ${setting.reason}; a receipt cannot be anchored`);
+  const runGit = deps.runImpl ?? run;
+  const anchor = trustedAnchorProblem(proof, setting.mirror, (args, o) => runGit('git', args, { cwd: repoRoot, ...(o?.env ? { env: { ...process.env, ...o.env } } : {}) }));
+  if (anchor) return fail('proof-unanchored', `${anchor} — no receipt is confirmed against an unanchored commit`);
+  const fetchEvidence = deps.fetchEvidenceImpl ?? fetchTrustedPublishEvidence;
+  const sleep = deps.sleepImpl ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+  const attempts = deps.attempts ?? 1;
+  let verdict = null;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    verdict = judgeTrustedReceipt({ target, evidence: await fetchEvidence(target), commit, contentDigest: proof.contentDigest });
+    if (verdict.state === 'confirmed') {
+      return { ...base, ok: true, accepted: true, available: true, state: 'published', reason: 'trusted-receipt', detail: verdict.detail, checks: verdict.checks, commit, attempts: attempt, proofPath: read.path };
+    }
+    if (verdict.state !== 'pending' && verdict.state !== 'unreadable') return { ...fail(verdict.state, verdict.detail, attempt), checks: verdict.checks };
+    if (attempt < attempts) await sleep(deps.pollMs ?? TRUSTED_POLL_MS);
+  }
+  return { ...base, ok: false, state: 'pending', reason: verdict?.state ?? 'pending', detail: `${verdict?.detail ?? 'not run'} — inspect the tag’s Actions run if it waits`, attempts, commit, proofPath: read.path };
+}
+
+/** A trusted receipt proves publication. Installability needs a recorded pass or one fresh job lookup. */
+export async function reconcileTrustedRelease(repoRoot, target, deps = {}) {
+  const read = readReleaseProof(repoRoot, target, { readImpl: deps.readImpl });
+  const receipt = await reconcileTrustedReceipt(repoRoot, target, deps, read);
+  if (!receipt.ok) return receipt;
+  const installCheck = read.proof.installCheck?.state === 'passed'
+    ? read.proof.installCheck
+    : await waitForInstallCheck(repoRoot, target, resolveTrustedRepoSpec(repoRoot, deps), {
+      runImpl: deps.runImpl, now: deps.nowImpl, sleep: deps.sleepImpl, waitMs: 0,
+    });
+  const reason = installCheck.reason ?? installCheck.conclusion;
+  const detail = `${receipt.detail}; install job ${installCheck.state}${reason ? ` (${reason})` : ''}`;
+  return { ...receipt, installable: installCheck.state === 'passed', installState: installCheck.state, detail };
+}
+
+/** Print the registry verdict. A confirmed trusted receipt exits 0 even when installability is unverified. */
+export function printReconcileResult(result, { json = false, log = console.log, error = console.error } = {}) {
+  if (json) {
+    log(JSON.stringify(result, null, 2));
+    return result.ok ? 0 : 1;
+  }
+  const mark = (flag) => (flag ? 'yes' : 'no');
+  // Trusted route only: an install job that is pending or not-measured was never judged,
+  // so printing "no" would claim a failed install. Only 'failed' prints "no".
+  const installState = result.installState;
+  const installable = installState === undefined || installState === 'passed' || installState === 'failed'
+    ? mark(result.installable)
+    : 'not measured';
+  log(`${PACKAGE_NAME}@${result.target}: ${result.state} — accepted ${mark(result.accepted)}, available ${mark(result.available)}, installable ${installable}`);
+  if (result.ok) {
+    log(`  ${result.detail}`);
+    if (result.state === 'superseded') log(`  Note: ${result.target} is installable but no longer \`latest\` — a later release took the tag.`);
+    return 0;
+  }
+  error(`  ${result.reason}: ${result.detail}`);
+  if (result.state === 'pending') {
+    error(`  Still pending, not failed. Run \`node scripts/release.mjs --reconcile --target ${result.target}\` again later;`);
+    error('  the owner-visible package state is on npmjs.com (package page / account notifications). Never rerun --publish.');
+  } else if (result.state === 'proof-missing') {
+    error('  Without the publish proof there is nothing to verify the registry bytes against; success is never inferred from `latest`.');
+  }
+  return 1;
+}
+
+/**
+ * The exact `npm publish` invocation: argv plus spawn options.
+ *
+ * WHY THE ENV PIN, AND WHY THIS IS A NAMED FUNCTION: `npm_config_loglevel` is
+ * INHERITED, and the `+ <pkg>@<version>` receipt line — the ONE piece of
+ * evidence `evaluatePublishReceipt` accepts as the irreversible boundary — is
+ * printed at `notice` level. Any ancestor that ran under `npm run --silent`
+ * (the husky pre-push gate does exactly that) therefore hands this child a
+ * silent loglevel, npm publishes successfully and prints nothing, the receipt
+ * reads as unconfirmed, `publish()` throws, and `main()` exits 2 = "pre-receipt,
+ * safe to rerun" while the registry already holds the version (exit 2 after an
+ * unconfirmed receipt does not prove a rerun is safe — the staged route writes
+ * its proof with staged.confirmed=false for exactly that case). That is the worst
+ * failure this file can produce, and it is the same inherited-silent trap the
+ * leakage gate's `npm pack --json` was already pinned against (see preflight
+ * step 7). The pin makes the receipt independent of the caller's environment.
+ *
+ * A named pure function because the invocation `publish()` (the irreversible
+ * act) builds is then testable for the pin without running npm.
+ *
+ * `opts.env` carries the full env, so it serializes to key names only (SEC-008,
+ * SO#1785). It must stay an ordinary enumerable property of `opts` with
+ * enumerable values: `run()` spreads `opts`, and the child must still see the
+ * pin. Ceiling of that redaction: scripts/lib/redacted-env.mjs.
+ *
+ * @param {string} repoRoot
+ * @param {string} userconfigPath — the 0600 temp npmrc carrying the token
+ * @param {{tarballPath: string, digest: string}} artifact — the checked archive
+ * @param {NodeJS.ProcessEnv} [env] — base env; tests pass a synthetic one
+ * @param {'direct'|'stage'} [mode] — `stage` runs `npm stage publish` (ADR-0018 route C):
+ *   same archive, same flags, but the version waits for the owner's 2FA approval
+ * @returns {{cmd: string, args: string[], opts: {cwd: string, env: object}}}
+ */
+export function publishInvocation(repoRoot, userconfigPath, artifact, env = process.env, mode = 'direct') {
+  if (!artifact?.tarballPath || !artifact.digest || archiveDigest(artifact.tarballPath) !== artifact.digest) throw new Error('refusing publish without unchanged checked archive');
+  const verb = mode === 'stage' ? ['stage', 'publish'] : ['publish'];
+  return {
+    cmd: 'npm',
+    args: [...verb, artifact.tarballPath, '--ignore-scripts', '--access', 'public', '--userconfig', userconfigPath],
+    opts: { cwd: repoRoot, env: redactedEnv({ ...env, npm_config_loglevel: 'notice' }) },
+  };
+}
+
+/**
+ * The irreversible act: `npm publish` of the checked archive, then
+ * {@link settlePublishReceipt} with the tail shield armed on the receipt.
+ *
+ * Exported ONLY for the shield wiring test (#1753,
+ * tests/scripts/release-tail-shield.test.mjs T3): a hand-built publish step in
+ * the test could not catch a dropped `onReceiptConfirmed`. Every production
+ * path still runs through main() -> preflight() (leakage, CI and dirty-tree
+ * gates); an importer calling this directly bypasses them, so no consumer may.
+ *
+ * @param {string} repoRoot
+ * @param {string} target
+ * @param {{artifact: {tarballPath: string, digest: string, integrity: string}, runImpl?: Function, waitImpl?: Function, attempts?: number, delaySeconds?: number}} [deps]
+ */
+export function publish(repoRoot, target, deps = {}) {
+  const token = loadNpmToken(repoRoot);
+  const runImpl = deps.runImpl ?? run;
+  const res = withTempUserconfig(token, (tmpRc) => {
+    const call = publishInvocation(repoRoot, tmpRc, deps.artifact);
+    return runImpl(call.cmd, call.args, call.opts);
+  });
+  return settlePublishReceipt(repoRoot, target, res, {
+    ...deps,
+    runImpl,
+    onReceiptConfirmed: () => armReleaseTailShield({ target }),
+  });
+}
+
+/**
+ * Find the staged entry for `target` in an `npm stage list <pkg> --json`
+ * answer. The list shape is NOT measured yet (npm 11.19.1 documents the
+ * command, not its JSON; the first real staged release measures it — ceiling
+ * named in skills/npm-publish/SKILL.md § Route C). So this reads defensively:
+ * any object anywhere in the answer whose `version` equals the target counts,
+ * and a string `id`/`stageId`/`stage_id` beside it is the stage id. Anything
+ * else is "not found", never "found".
+ *
+ * @param {{status: number|null, stdout?: string}|null|undefined} list
+ * @param {string} target
+ * @returns {{found: boolean, stageId: string|null}}
+ */
+export function findStagedVersion(list, target) {
+  if (!list || list.status !== 0) return { found: false, stageId: null };
+  let json;
+  try { json = JSON.parse((list.stdout || '').trim() || 'null'); } catch { return { found: false, stageId: null }; }
+  const stack = [json];
+  let seen = 0;
+  while (stack.length > 0 && seen < 10_000) {
+    const node = stack.pop();
+    seen += 1;
+    if (!node || typeof node !== 'object') continue;
+    if (Array.isArray(node)) { stack.push(...node); continue; }
+    if (node.version === target) {
+      const id = [node.id, node.stageId, node.stage_id].find((v) => typeof v === 'string' && v.length > 0);
+      return { found: true, stageId: id ?? null };
+    }
+    stack.push(...Object.values(node));
+  }
+  return { found: false, stageId: null };
+}
+
+/**
+ * Judge `npm stage publish` output plus the follow-up `npm stage list` for the
+ * receipt that proves the target version is staged (ADR-0018 route C). Exit 0
+ * alone is not a receipt: the version must be named, either by the
+ * `+ <pkg>@<target>` line `npm publish` prints (stage publish has parity with
+ * it) or by the staged list. A staged version is reversible (`npm stage
+ * reject`, 2FA) but occupies the version number, so an unconfirmed exit 0 is
+ * reported as "inspect npm stage list", never as success.
+ *
+ * @param {{status: number|null, stdout?: string, stderr?: string}} result — the `npm stage publish` result
+ * @param {string} target
+ * @param {{status: number|null, stdout?: string}|null} [list] — the `npm stage list <pkg> --json` result
+ * @returns {{confirmed: boolean, target: string, stageId: string|null, detail: string}}
+ */
+export function evaluateStageReceipt(result, target, list = null) {
+  const output = `${result?.stdout || ''}\n${result?.stderr || ''}`;
+  const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const line = new RegExp(`(?:^|\\n)\\+ ${esc(PACKAGE_NAME)}@${esc(target)}(?:\\r?$|\\s)`).test(output);
+  const listed = findStagedVersion(list, target);
+  if (result?.status !== 0) {
+    return {
+      confirmed: false,
+      target,
+      stageId: null,
+      detail: /\bE403\b|\bEOTP\b/.test(output)
+        ? `npm stage publish failed (exit ${result?.status}) with an auth error: the token cannot stage ${PACKAGE_NAME} — check write permission and scope (skills/npm-publish § Route C)`
+        : `npm stage publish exited ${result?.status} without staging ${PACKAGE_NAME}@${target}: ${output.trim().slice(-300)}`,
+    };
+  }
+  if (!line && !listed.found) {
+    return {
+      confirmed: false,
+      target,
+      stageId: null,
+      detail: `npm stage publish exited 0 but neither printed + ${PACKAGE_NAME}@${target} nor does npm stage list name that version — inspect \`npm stage list ${PACKAGE_NAME}\` before anything else; nothing is tagged`,
+    };
+  }
+  return {
+    confirmed: true,
+    target,
+    stageId: listed.stageId,
+    detail: `${PACKAGE_NAME}@${target} staged${listed.stageId ? ` (stage id ${listed.stageId})` : ''}${line ? ', receipt line present' : ', found via npm stage list'}`,
+  };
+}
+
+/**
+ * ADR-0018 route C: stage the checked archive with `npm stage publish`, prove
+ * it is staged, persist the publish proof and STOP. No tag, no push, no tail:
+ * the version becomes public only when the owner approves it with 2FA on
+ * npmjs.com, and the tail is `--resume-tail --target <target>`, which runs
+ * `--reconcile` first and refuses until the registry serves the proof's
+ * integrity. The proof carries `staged: {at, stageId}` so the later tail can
+ * tell a staged release from a direct one.
+ *
+ * Same token discipline as {@link publish}: `.env.local` only, temp userconfig
+ * at 0600, removed in a finally. The `npm stage list` for the receipt runs
+ * inside the same userconfig scope.
+ *
+ * @param {string} repoRoot
+ * @param {string} target
+ * @param {{artifact: {tarballPath: string, digest: string, integrity: string}, runImpl?: Function}} deps
+ * @returns {{staged: true, receipt: ReturnType<typeof evaluateStageReceipt>, proof: ReturnType<typeof writeReleaseProof>, commit: string|null}}
+ */
+export function stagePublish(repoRoot, target, deps = {}) {
+  const token = loadNpmToken(repoRoot);
+  const runImpl = deps.runImpl ?? run;
+  const { res, list } = withTempUserconfig(token, (tmpRc) => {
+    const call = publishInvocation(repoRoot, tmpRc, deps.artifact, process.env, 'stage');
+    const stageRes = runImpl(call.cmd, call.args, call.opts);
+    let listRes = null;
+    if (stageRes?.status === 0) {
+      try {
+        listRes = runImpl('npm', ['stage', 'list', PACKAGE_NAME, '--json', '--userconfig', tmpRc], { cwd: repoRoot });
+      } catch { listRes = null; /* the receipt line alone can still confirm */ }
+    }
+    return { res: stageRes, list: listRes };
+  });
+  const receipt = evaluateStageReceipt(res, target, list);
+  // A non-zero exit staged nothing: no proof, a plain abort (re-running
+  // --publish is safe).
+  if (res?.status !== 0) throw new Error(receipt.detail);
+  let commit = null;
+  try {
+    const head = runImpl('git', ['rev-parse', 'HEAD'], { cwd: repoRoot });
+    if (head.status === 0) commit = head.stdout.trim();
+  } catch { /* commit stays null; the proof is still useful */ }
+  // Exit 0 may have staged the version even when neither receipt signal was
+  // readable (both shapes are unmeasured, see evaluateStageReceipt). The proof
+  // is therefore written on EVERY exit 0, with `staged.confirmed` saying
+  // whether the version was proven: without it, an unconfirmed stage left no
+  // proof, and `--resume-tail` after the owner's approval failed with "proof
+  // missing" although the registry would serve the version (!328 review).
+  // The integrity in the proof comes from the checked archive, so
+  // `--reconcile` still gates the tail on what the registry really serves.
+  const stagedAt = new Date().toISOString();
+  const proof = writeReleaseProof(repoRoot, {
+    ...buildReleaseProof({ target, artifact: deps.artifact, commit, receiptAt: stagedAt }),
+    staged: {
+      at: stagedAt,
+      stageId: receipt.stageId,
+      confirmed: receipt.confirmed,
+      ...(receipt.confirmed ? {} : { reason: receipt.detail }),
+    },
+  });
+  if (!receipt.confirmed) {
+    throw new Error(
+      `${receipt.detail}. ${proof.ok ? `${proof.detail} with staged.confirmed=false: if \`npm stage list\` shows the version, let the owner approve it and run --resume-tail --target ${target}; do not rerun --publish` : `${proof.detail} — write it by hand before --resume-tail`}`,
+    );
+  }
+  return { staged: true, receipt, proof, commit };
+}
+
+/**
+ * Which route `--publish` takes (ADR-0018): `direct` only when the operator
+ * says so, `stage` otherwise. Exported so a test can pin the default — the
+ * review of !328 asked for a test that turns red when `--publish` silently
+ * publishes directly again — and so main() cannot carry a second copy of the
+ * rule. Ceiling: this pins the mode VALUE, not that main() dispatches
+ * `stagePublish` for it; main() is not testable without a registry.
+ *
+ * `--trusted` selects route B; `validateFlags` refuses it beside `--direct`.
+ *
+ * @param {{direct?: boolean, trusted?: boolean}} values
+ * @returns {'trusted'|'direct'|'stage'}
+ */
+export function resolvePublishMode(values) {
+  if (values?.trusted === true) return 'trusted';
+  return values?.direct === true ? 'direct' : 'stage';
+}
+
+/**
+ * The `staged-proof-absent` preflight row (ADR-0018 route C): a publish proof
+ * for the target that carries a `staged` block means `--publish` already
+ * staged this version. A second `--publish` would either fail at npm (the
+ * version is occupied by the staged one) or, after an approval, publish a
+ * second time on top of it; neither is wanted. The row is red and names the
+ * way on: approve and `--resume-tail`, or reject with 2FA. A proof WITHOUT a
+ * `staged` block (a completed direct publish) is left to `registry-version-free`,
+ * which sees the published version. A missing proof is green; a present-but-unusable
+ * proof (unparseable, wrong package/target, bad integrity or sha256) is red,
+ * because its `staged` block cannot be read — `registry-version-free` does not
+ * see a staged-only version and `--resume-tail` refuses such a proof.
+ *
+ * @param {ReturnType<typeof readReleaseProof>} read
+ * @param {string} target
+ * @returns {{ok: boolean, detail: string}}
+ */
+export function evaluateStagedProofRow(read, target) {
+  if (!read?.ok) {
+    // `=== false`: a read result without the `missing` field keeps the old green.
+    if (read && read.missing === false) {
+      return { ok: false, detail: `publish proof exists but is unusable (${read.detail}) — cannot rule out an earlier staged publish of ${PACKAGE_NAME}@${target}; repair or remove it by hand before --publish` };
+    }
+    return { ok: true, detail: 'no staged publish proof for this version' };
+  }
+  const staged = read.proof?.staged;
+  if (!staged || typeof staged !== 'object') return { ok: true, detail: 'publish proof present without a staged block' };
+  const at = typeof staged.at === 'string' ? staged.at : 'unknown time';
+  const confirmed = staged.confirmed === false ? 'unconfirmed' : 'confirmed';
+  return {
+    ok: false,
+    detail: `${PACKAGE_NAME}@${target} was already staged (${confirmed}, ${at}${staged.stageId ? `, stage id ${staged.stageId}` : ''}) — do not --publish again: let the owner approve it and run --resume-tail --target ${target}, or reject it with 2FA (npm stage reject) first`,
+  };
+}
+
+/**
+ * Print a staged (not yet public) release and return the CLI exit code: 0,
+ * because everything the script can do without the owner is done. The next
+ * steps are the owner's approval and `--resume-tail`.
+ *
+ * @param {{receipt: {detail: string, stageId: string|null}, proof: {ok: boolean, detail: string}, commit: string|null}} outcome
+ * @param {string} target
+ * @param {{log?: Function, error?: Function}} [io]
+ * @returns {number}
+ */
+export function printStagedOutcome(outcome, target, io = {}) {
+  const log = io.log ?? console.log;
+  const error = io.error ?? console.error;
+  log(`  staged: ${outcome.receipt.detail}.`);
+  if (outcome.proof?.ok) log(`  ${outcome.proof.detail}.`);
+  else error(`\nWARN: ${outcome.proof?.detail ?? 'publish proof not written'} — \`--resume-tail\` cannot finish this release without it.`);
+  log(`  not tagged, not pushed: ${PACKAGE_NAME}@${target} is not public until the owner approves it.`);
+  log('\nNext steps (ADR-0018 route C):');
+  log(`  1. Owner: approve ${PACKAGE_NAME}@${target} under "Staged packages" on npmjs.com (2FA)${outcome.receipt.stageId ? `, or: npm stage approve ${outcome.receipt.stageId}` : ''}.`);
+  log("     File it as an owner action: owner-queue add --class owner-handlung --owner-only 2fa (skills/npm-publish/SKILL.md § Route C).");
+  log(`  2. After the approval: node scripts/release.mjs --resume-tail --target ${target}`);
+  log('     (reconciles the registry first, then tags the recorded commit, pushes the tags, GitHub release, live site).');
+  log('     Run it AFTER the click: before the approval it polls the registry for up to 20 x 60 s and ends with RECONCILIATION, nothing tagged.');
+  log(`  Registry state meanwhile: node scripts/release.mjs --reconcile --target ${target} (read-only).`);
+  log('  Never rerun --publish for this version: the staged version already occupies it (reject it with 2FA first if it must go).');
+  return 0;
+}
+
+/**
+ * Everything `publish()` does AFTER `npm publish` returned: judge the receipt,
+ * persist the publish proof, then wait for the registry. Split out of the
+ * unexported publisher so the order "proof before registry wait" is testable
+ * (#1537) — this function receives an npm result and cannot publish anything.
+ * Pre-receipt failures throw; post-receipt propagation failures return.
+ *
+ * @param {string} repoRoot
+ * @param {string} target
+ * @param {{status: number|null, stdout?: string, stderr?: string}} res — the `npm publish` result
+ * @param {{artifact: {digest: string, integrity: string}, runImpl?: Function, waitImpl?: Function, attempts?: number, delaySeconds?: number, onReceiptConfirmed?: () => void}} deps
+ *   `onReceiptConfirmed` runs right after the receipt check passes, before the proof write and the
+ *   registry wait (`publish()` arms the tail shield there, #1753).
+ * @returns {{receipt: {confirmed: boolean, target: string, detail: string}, propagation: ReturnType<typeof waitForRegistryPropagation>, proof: ReturnType<typeof writeReleaseProof>}}
+ */
+export function settlePublishReceipt(repoRoot, target, res, deps = {}) {
+  const runImpl = deps.runImpl ?? run;
+  const receipt = evaluatePublishReceipt(res, target);
+  if (!receipt.confirmed) throw new Error(receipt.detail);
+  // The irreversible boundary: from here on the tail must run to its end
+  // (#1753). Before it, a normal abort stays possible.
+  deps.onReceiptConfirmed?.();
+
+  // Persist the proof BEFORE the registry wait: if this process dies while
+  // waiting, `--reconcile` can still resume from it (#1537). Never throws.
+  let commit = null;
+  try {
+    const head = runImpl('git', ['rev-parse', 'HEAD'], { cwd: repoRoot });
+    if (head.status === 0) commit = head.stdout.trim();
+  } catch { /* commit stays null; the proof is still useful */ }
+  const proof = writeReleaseProof(repoRoot, buildReleaseProof({
+    target, artifact: deps.artifact, commit, receiptAt: new Date().toISOString(),
+  }));
+
+  const propagation = waitForRegistryPropagation(repoRoot, target, {
+    attempts: deps.attempts,
+    delaySeconds: deps.delaySeconds,
+    runImpl,
+    waitImpl: deps.waitImpl,
+  });
+  return { receipt, propagation, proof };
+}
+
+/**
+ * Put the curated snapshot of `source` on github main and return its sha
+ * (`mirror: curated`, #1645). Mirrors session-end § 4.4: the export is built on
+ * the ls-remote-verified github main, re-verified BY SHA right before the push,
+ * and that sha — never a ref name, never HEAD — is pushed. When github main
+ * already is the snapshot of `source` (the normal case: `/close` published it
+ * and the preflight proved the trailer), nothing is pushed and that sha is
+ * returned; an unchanged tree whose trailer names another commit refuses,
+ * because the tag must point at the snapshot OF the release commit.
+ *
+ * @param {string} repoRoot
+ * @param {string} source — full sha of the release commit
+ * @param {{ snapshotCheck?: Function }} [deps]
+ * @returns {string}
+ */
+async function publishCuratedSnapshot(repoRoot, source, deps = {}) {
+  const tail = { cwd: repoRoot, timeoutMs: deps.tailTimeoutMs, log: deps.log };
+  // The export requires refs/remotes/github/main == the remote's main.
+  await mustRunTail('git', ['fetch', '--quiet', '--no-tags', 'github', '+refs/heads/main:refs/remotes/github/main'], tail);
+  const git = createGitRunner(repoRoot);
+  const built = buildGithubExport({ git, source, ...(deps.snapshotCheck ? { snapshotCheck: deps.snapshotCheck } : {}) });
+  for (const warning of built.warnings ?? []) console.error(warning);
+  if (built.status === 'created') {
+    const verdict = verifyExportCommit({ git, sha: built.sha, source });
+    if (!verdict.ok) throw new Error(`curated snapshot ${built.sha} failed verification — ${verdict.reason}`);
+    await mustRunTail('git', ['push', 'github', `${built.sha}:refs/heads/main`], tail);
+    return built.sha;
+  }
+  if (built.status === 'unchanged') {
+    const body = git(['cat-file', 'commit', built.sha]);
+    if (body.status !== 0 || parseSourceCommitTrailer(body.stdout) !== source) {
+      throw new Error(`github main ${built.sha} has the release tree but is not the snapshot of ${source} — refusing to tag it`);
+    }
+    const pushProblem = pushUrlProblem(git, 'github');
+    if (pushProblem) throw new Error(pushProblem);
+    return built.sha;
+  }
+  throw new Error(`curated export refused — ${built.reason}`);
+}
+
+/**
+ * Why the publish tail may still tag HEAD, or null when it may (#1645). The
+ * preflight checked one commit; minutes later (npm publish in between) HEAD can
+ * have moved — a parallel session switching branch is enough — and whatever
+ * HEAD is then gets tagged and, under `mirror: curated`, snapshotted onto
+ * GitHub main. So, right before `git tag`: HEAD must still be the preflight
+ * HEAD, on branch main, and equal origin's main read live (the same source
+ * anchor session-end § 4.4 uses for curated pushes).
+ *
+ * @param {string} repoRoot
+ * @param {string|undefined} expectedHead — the HEAD the preflight checked
+ * @returns {string|null}
+ */
+export function releaseAnchorProblem(repoRoot, expectedHead) {
+  if (typeof expectedHead !== 'string' || !/^[0-9a-f]{40}$/.test(expectedHead)) {
+    return 'no preflight HEAD handed in — the release commit is not anchored';
+  }
+  const head = run('git', ['rev-parse', 'HEAD'], { cwd: repoRoot });
+  const now = head.status === 0 ? head.stdout.trim() : '';
+  if (now !== expectedHead) return `HEAD moved since preflight (${expectedHead.slice(0, 8)} → ${now.slice(0, 8) || 'unreadable'})`;
+  const branch = run('git', ['branch', '--show-current'], { cwd: repoRoot });
+  const name = branch.status === 0 ? branch.stdout.trim() : '';
+  if (name !== 'main') return `HEAD is on '${name || 'detached'}', not main`;
+  const origin = evaluateRemoteHeadParity('origin', run('git', ['ls-remote', 'origin', 'refs/heads/main'], { cwd: repoRoot }), expectedHead);
+  return origin.ok ? null : `HEAD is not origin's main — ${origin.detail}`;
+}
+
+/**
+ * Tag the release commit and push main + tag to origin and the GitHub mirror.
+ *
+ * Under `mirror: curated` (read like session-end § 4.4) github never receives
+ * main or the release commit: it gets the export snapshot as main, and the tag
+ * `v<target>` is pushed onto THAT snapshot (#1645, decided: same tag name,
+ * different target sha — the GitLab tag is the annotated tag on the release
+ * commit, the GitHub tag a lightweight tag on its public snapshot). A plain
+ * mirror is unchanged, except that `plainPushGuard` must allow it. Under
+ * `mirror: none` GitHub is skipped entirely (`githubSkipped: true`). Nothing is
+ * tagged unless {@link releaseAnchorProblem} accepts HEAD.
+ *
+ * @param {string} repoRoot
+ * @param {string} target
+ * Every push and fetch runs through {@link runTailChild}: own process group,
+ * PID on stderr, deadline `deps.tailTimeoutMs ?? TAIL_CHILD_TIMEOUT_MS` (#1791).
+ * Ceiling: the `ls-remote` inside {@link releaseAnchorProblem} stays a plain
+ * synchronous child without a deadline; it moves no ref, and the anchor check is
+ * synchronous by contract. Revisit if a hung ls-remote is ever observed there.
+ *
+ * @param {{ expectedHead?: string, snapshotCheck?: Function, tailTimeoutMs?: number, log?: (s: string) => void }} [deps] —
+ *   `expectedHead`: the preflight HEAD (required); `snapshotCheck`: test seam (the default
+ *   leakage scan needs a host owner policy); `tailTimeoutMs`: per-child deadline
+ * @returns {Promise<{ tag: string, pushed: string[], githubSnapshot?: string, githubSkipped?: boolean }>}
+ */
+export async function tagAndPush(repoRoot, target, deps = {}) {
+  const tag = `v${target}`;
+  const tail = { cwd: repoRoot, timeoutMs: deps.tailTimeoutMs, log: deps.log };
+  const progress = { tag, localTagCreated: false, pushed: [], remotes: [] };
+  try {
+    const setting = readMirrorSetting(repoRoot);
+    if (!setting.ok) throw new Error(`GitHub mirror mode unknown — ${setting.reason}; nothing tagged or pushed`);
+    const curated = setting.mirror === 'curated';
+    const githubSkipped = setting.mirror === 'none';
+    const anchor = releaseAnchorProblem(repoRoot, deps.expectedHead);
+    if (anchor) throw new Error(`release anchor lost — ${anchor}; nothing tagged or pushed`);
+    const excerpt = changelogExcerpt(repoRoot, target);
+    const msgDir = mkdtempSync(join(tmpdir(), 'release-tagmsg-'));
+    const msgFile = join(msgDir, 'msg');
+    try {
+      writeFileSync(msgFile, `${tag}\n\n${excerpt}\n`);
+      mustRun('git', ['tag', '-a', tag, '-F', msgFile], { cwd: repoRoot });
+      progress.localTagCreated = true;
+    } finally {
+      rmSync(msgDir, { recursive: true, force: true });
+    }
+    for (const remote of githubSkipped ? ['origin'] : ['origin', 'github']) {
+      const remoteProgress = { remote, mainPushed: false, tagPushed: false };
+      progress.remotes.push(remoteProgress);
+      if (remote === 'github' && curated) {
+        const released = mustRun('git', ['rev-parse', `${tag}^{commit}`], { cwd: repoRoot, env: { ...process.env, ...GIT_NO_REPLACE_ENV } }).stdout.trim();
+        if (released !== deps.expectedHead) throw new Error(`${tag} points at ${released}, not the preflight HEAD — refusing to publish it to github`);
+        const snapshot = await publishCuratedSnapshot(repoRoot, released, deps);
+        remoteProgress.mainPushed = true;
+        progress.githubSnapshot = snapshot;
+        await mustRunTail('git', ['push', 'github', `${snapshot}:refs/tags/${tag}`], tail);
+        remoteProgress.tagPushed = true;
+        progress.pushed.push(remote);
+        continue;
+      }
+      if (remote === 'github') {
+        const verdict = plainPushGuard({ git: createGitRunner(repoRoot), explicitGithub: setting.mirror === 'github' });
+        if (!verdict.ok) throw new Error(`plain push to github refused — ${verdict.reason}`);
+      }
+      await mustRunTail('git', ['push', remote, 'main'], tail);
+      remoteProgress.mainPushed = true;
+      await mustRunTail('git', ['push', remote, tag], tail);
+      remoteProgress.tagPushed = true;
+      progress.pushed.push(remote);
+    }
+    return {
+      tag,
+      pushed: progress.pushed,
+      ...(progress.githubSnapshot ? { githubSnapshot: progress.githubSnapshot } : {}),
+      ...(githubSkipped ? { githubSkipped: true } : {}),
+    };
+  } catch (err) {
+    const failure = err instanceof Error ? err : new Error(String(err));
+    failure.releaseProgress = progress;
+    throw failure;
+  }
+}
+
+/**
+ * Run the irreversible-release tail after npm's target-confirmed receipt.
+ * A tag/push failure stops tag-dependent phases; every other post-receipt
+ * finding remains a returned reconciliation result rather than a retry signal.
+ *
+ * @param {string} repoRoot
+ * @param {string} target
+ * @param {{publishImpl?: Function, tagAndPushImpl?: Function, ensureGithubReleaseImpl?: Function, verifyLiveSiteImpl?: Function, expectedHead?: string}} [deps]
+ *   `expectedHead` — the HEAD the preflight checked; the tail refuses to tag any other commit.
+ *   `tailTimeoutMs` — per push/fetch deadline handed to tagAndPush (default TAIL_CHILD_TIMEOUT_MS).
+ * @returns {Promise<{status: 'complete'|'post-publish-reconciliation', receipt: object, tag: string|null, pushed: string[], tagProgress?: object, release: object, live: object, propagation: object, reconciliation: Array<{phase: string, kind?: string, detail: string}>}>}
+ */
+export async function runPublishRelease(repoRoot, target, deps = {}) {
+  // Fail-closed: the real publisher must be handed in explicitly. Defaulting to
+  // the live `npm publish --access public` meant an importer that merely forgot
+  // `publishImpl` performed an irreversible public release with the token from
+  // .env.local and no preflight. main() wires it at the one call site that sits
+  // behind the gate chain.
+  const publishImpl = deps.publishImpl;
+  if (typeof publishImpl !== 'function') {
+    throw new Error('runPublishRelease requires an explicit publishImpl — refusing to publish by default');
+  }
+  const tagAndPushImpl = deps.tagAndPushImpl ?? tagAndPush;
+  const ensureGithubReleaseImpl = deps.ensureGithubReleaseImpl ?? ensureGithubRelease;
+  const verifyLiveSiteImpl = deps.verifyLiveSiteImpl ?? verifyLiveSite;
+  const publication = publishImpl(repoRoot, target);
+
+  if (!publication?.receipt?.confirmed || publication.receipt.target !== target) {
+    throw new Error(`refusing release tail without a target-confirmed npm publish receipt for ${PACKAGE_NAME}@${target}`);
+  }
+
+  const propagation = publication.propagation;
+  let tagAndPushResult;
+  try {
+    tagAndPushResult = await tagAndPushImpl(repoRoot, target, { expectedHead: deps.expectedHead, tailTimeoutMs: deps.tailTimeoutMs });
+  } catch (err) {
+    const rawProgress = err?.releaseProgress;
+    const remotes = Array.isArray(rawProgress?.remotes)
+      ? rawProgress.remotes
+        .filter((remote) => typeof remote?.remote === 'string')
+        .map((remote) => ({
+          remote: remote.remote,
+          mainPushed: remote.mainPushed === true,
+          tagPushed: remote.tagPushed === true,
+        }))
+      : [];
+    const tagProgress = {
+      tag: typeof rawProgress?.tag === 'string' ? rawProgress.tag : null,
+      localTagCreated: rawProgress?.localTagCreated === true,
+      remotes,
+    };
+    const pushed = remotes.filter((remote) => remote.mainPushed && remote.tagPushed).map((remote) => remote.remote);
+    const prerequisite = 'skipped because tag-and-push did not complete';
+    await settleDeferredTailSignals();
+    return {
+      status: 'post-publish-reconciliation',
+      receipt: publication.receipt,
+      tag: tagProgress.tag,
+      pushed,
+      tagProgress,
+      release: { ok: false, skipped: true, state: 'skipped-prerequisite', detail: `GitHub release ${prerequisite}` },
+      live: { ok: false, skipped: true, state: 'skipped-prerequisite', detail: `live-site verification ${prerequisite}` },
+      propagation,
+      proof: publication.proof,
+      reconciliation: [
+        { phase: 'tag-and-push', kind: 'failed', detail: err instanceof Error ? err.message : String(err) },
+        { phase: 'github-release', kind: 'skipped-prerequisite', detail: `GitHub release ${prerequisite}` },
+        { phase: 'live-site', kind: 'skipped-prerequisite', detail: `live-site verification ${prerequisite}` },
+      ],
+    };
+  }
+
+  const { tag, pushed, githubSnapshot, githubSkipped } = tagAndPushResult;
+  const release = githubSkipped
+    ? { ok: true, skipped: true, state: 'skipped-mirror-none', detail: "GitHub release skipped — 'mirror: none'" }
+    : ensureGithubReleaseImpl(repoRoot, target);
+  const live = await verifyLiveSiteImpl(target);
+  const reconciliation = [];
+  if (!propagation?.ok) {
+    reconciliation.push({
+      phase: 'registry-propagation',
+      kind: propagation?.kind ?? 'unknown',
+      detail: propagation?.detail ?? 'registry propagation was not verified',
+    });
+  }
+  if (!release.ok) reconciliation.push({ phase: 'github-release', detail: release.detail });
+  if (!live.ok) reconciliation.push({ phase: 'live-site', detail: live.detail });
+  await settleDeferredTailSignals();
+
+  return {
+    status: reconciliation.length === 0 ? 'complete' : 'post-publish-reconciliation',
+    receipt: publication.receipt,
+    tag,
+    pushed,
+    ...(githubSnapshot ? { githubSnapshot } : {}),
+    release,
+    live,
+    propagation,
+    proof: publication.proof,
+    reconciliation,
+  };
+}
+
+/** Poll interval of the route-B receipt wait. */
+export const TRUSTED_POLL_MS = 15_000;
+/** Default deadline for the registry to serve the trusted workflow’s receipt. */
+export const TRUSTED_WAIT_MS = 20 * 60_000;
+
+/** Display name of the install job in .github/workflows/publish.yml; a test binds both. */
+export const INSTALL_CHECK_JOB = 'Verify public npm install';
+/** Allow the install job's 20-minute timeout plus five minutes for a runner. */
+export const INSTALL_CHECK_WAIT_MS = 25 * 60_000;
+
+/** Judge only the install job in the selected publish run. Other jobs may still be running. */
+export function evaluateInstallCheck(workflowRun, jobs) {
+  if (!Array.isArray(jobs)) return { state: 'not-measured', reason: 'invalid jobs response' };
+  const job = jobs.find((entry) => entry?.name === INSTALL_CHECK_JOB);
+  if (!job) {
+    const state = workflowRun.status === 'completed' ? 'not-measured' : 'pending';
+    return { state, reason: `job "${INSTALL_CHECK_JOB}" missing from run ${workflowRun.databaseId}` };
+  }
+  if (job.status !== 'completed') return { state: 'pending', reason: `job "${INSTALL_CHECK_JOB}" has not completed` };
+  if (typeof job.conclusion !== 'string' || !job.conclusion.trim()) {
+    return { state: 'not-measured', reason: 'completed install job has no conclusion' };
+  }
+  return { state: job.conclusion === 'success' ? 'passed' : 'failed', conclusion: job.conclusion };
+}
+
+async function waitForInstallCheck(repoRoot, target, spec, {
+  runImpl = run,
+  now = Date.now,
+  sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  waitMs = INSTALL_CHECK_WAIT_MS,
+}) {
+  // resolveRepoSpec returns [HOST/]OWNER/REPO, or its raw input for an
+  // unrecognized remote. Only a normalized identity can select a run.
+  const mirror = /^(?:(?<host>[a-z0-9.-]+(?::[0-9]+)?)\/)?(?<owner>[a-z0-9][a-z0-9-]*)\/(?<name>[a-z0-9_.-]+)$/i.exec(spec)?.groups;
+  if (!mirror || mirror.name === '.' || mirror.name === '..') {
+    return { state: 'not-measured', reason: 'GitHub mirror could not be resolved', url: `${expectedTrustedIdentity(target).repository}/actions/workflows/publish.yml` };
+  }
+  const host = mirror.host ?? 'github.com';
+  const repo = `${mirror.owner}/${mirror.name}`;
+  const repositoryUrl = `https://${host}/${repo}`;
+  let url = `${repositoryUrl}/actions/workflows/publish.yml`;
+  const deadline = now() + waitMs;
+  const gh = (args) => {
+    // With no retries, each gh request still needs time to start and read GitHub.
+    const timeout = waitMs === 0 ? 20_000 : Math.max(1, deadline - now());
+    const result = runImpl('gh', args, { cwd: repoRoot, timeout, killSignal: 'SIGKILL', env: { ...process.env, GH_HOST: host } });
+    if (result.error) throw result.error;
+    if (result.status !== 0) throw new Error(`gh run ${args[1]} exited ${result.status}: ${(result.stderr || 'no output').trim().slice(0, 300)}`);
+    try {
+      return JSON.parse(result.stdout);
+    } catch {
+      throw new Error(`gh run ${args[1]} returned no JSON`);
+    }
+  };
+  let reason;
+  do {
+    try {
+      // gh lists newest first. Older runs cannot supply evidence for a newer run.
+      const runs = gh(['run', 'list', '--repo', repo, '--workflow', 'publish.yml', '--branch', `v${target}`, '--json', 'databaseId,status,conclusion', '--limit', '5']);
+      if (!Array.isArray(runs)) throw new Error('invalid workflow run listing');
+      if (runs.length) {
+        const newest = runs[0];
+        if (!Number.isSafeInteger(newest?.databaseId) || newest.databaseId <= 0) throw new Error('invalid workflow run ID');
+        url = `${repositoryUrl}/actions/runs/${newest.databaseId}`;
+        const view = gh(['run', 'view', String(newest.databaseId), '--repo', repo, '--json', 'jobs']);
+        const verdict = evaluateInstallCheck(newest, view?.jobs);
+        if (verdict.state === 'passed' || verdict.state === 'failed') return { ...verdict, url };
+        reason = verdict.reason;
+      } else {
+        reason = 'no workflow run found for the tag';
+      }
+    } catch (err) {
+      reason = err?.message ?? err?.code ?? String(err);
+      if (err?.code === 'ENOENT' || err?.cause?.code === 'ENOENT') return { state: 'not-measured', reason, url };
+    }
+    const left = deadline - now();
+    if (left <= 0) break;
+    await sleep(Math.min(20_000, left));
+  } while (now() < deadline);
+  // A one-shot lookup (waitMs 0, --reconcile) never waited: no "timeout:" prefix there.
+  return { state: 'not-measured', reason: waitMs === 0 ? reason : `timeout: ${reason}`, url };
+}
+
+/**
+ * The receipt-wait deadline: `SO_RELEASE_TRUSTED_WAIT_MS` (positive integer ms,
+ * same env-override precedent as `SO_RELEASE_NOW`) or {@link TRUSTED_WAIT_MS}.
+ * An unreadable override throws instead of silently waiting the default.
+ *
+ * @param {Record<string, string|undefined>} [env]
+ * @returns {number}
+ * @throws {TrustedRouteError}
+ */
+export function resolveTrustedWaitMs(env = process.env) {
+  const raw = (env.SO_RELEASE_TRUSTED_WAIT_MS || '').trim();
+  if (!raw) return TRUSTED_WAIT_MS;
+  if (!/^\d+$/.test(raw) || Number(raw) <= 0) throw new TrustedRouteError(`SO_RELEASE_TRUSTED_WAIT_MS is not a positive integer: ${JSON.stringify(raw)}`);
+  return Number(raw);
+}
+
+/** Resolve the GitHub mirror once for the release and install job lookups. */
+function resolveTrustedRepoSpec(repoRoot, deps) {
+  const opts = { repoRoot, vcs: 'github' };
+  if (deps.resolveRepoSpec) return deps.resolveRepoSpec(opts) ?? '';
+  const gitRun = deps.runImpl && ((args) => {
+    const result = deps.runImpl('git', args, { cwd: repoRoot });
+    return { ...result, ok: result.status === 0 };
+  });
+  return resolveRepoSpec({ ...opts, gitRun }) ?? '';
+}
+
+/**
+ * ADR-0018 route B: hand the publish to `.github/workflows/publish.yml` and
+ * verify the result. Takes NO publisher — nothing here runs `npm publish`.
+ *
+ * Order: content manifest of the checked archive → proof written (before the
+ * first push; a write failure aborts with nothing pushed) → {@link tagAndPush}
+ * (the GitHub tag push triggers the workflow) → `handedOff.commit` persisted
+ * (curated mirror: the snapshot; plain mirror: the released HEAD) → poll the
+ * registry every `pollMs` until the deadline, judging each round with
+ * {@link judgeTrustedReceipt} → on `confirmed` write `receiptAt` + `receipt`,
+ * then GitHub release, live site and the public install job on the mirror.
+ *
+ * @param {string} repoRoot
+ * @param {string} target
+ * @param {{artifact: {tarballPath: string, digest: string, integrity: string}, expectedHead?: string,
+ *   tagAndPushImpl?: Function, fetchEvidenceImpl?: Function, ensureGithubReleaseImpl?: Function, verifyLiveSiteImpl?: Function,
+ *   writeImpl?: Function, readTarballImpl?: (p: string) => Buffer, sleepImpl?: (ms: number) => Promise<void>, nowImpl?: () => number,
+ *   waitMs?: number, pollMs?: number, tailTimeoutMs?: number, installWaitMs?: number, runImpl?: Function, resolveRepoSpec?: Function}} deps
+ * @returns {Promise<{status: 'complete'|'install-check-failed'|'install-check-not-measured'|'post-publish-reconciliation'|'awaiting-workflow'|'receipt-mismatch'|'handoff-incomplete',
+ *   target: string, tag: string|null, pushed: string[], expectedCommit: string|null, receipt: object|null,
+ *   release: object|null, live: object|null, proof: object, polls: number, detail: string, installCheck?: object, tagProgress?: object, githubSnapshot?: string}>}
+ * @throws {TrustedRouteError} before any push (publisher handed in, no artifact, proof not written)
+ */
+export async function runTrustedPublishRelease(repoRoot, target, deps = {}) {
+  if ('publishImpl' in deps) throw new TrustedRouteError('runTrustedPublishRelease takes no publisher: route B publishes in the GitHub workflow');
+  const artifact = deps.artifact;
+  if (!artifact || typeof artifact.tarballPath !== 'string') throw new TrustedRouteError('runTrustedPublishRelease requires the checked artifact');
+  const tagAndPushImpl = deps.tagAndPushImpl ?? tagAndPush;
+  const fetchEvidence = deps.fetchEvidenceImpl ?? fetchTrustedPublishEvidence;
+  const ensureGithubReleaseImpl = deps.ensureGithubReleaseImpl ?? ensureGithubRelease;
+  const verifyLiveSiteImpl = deps.verifyLiveSiteImpl ?? verifyLiveSite;
+  const sleep = deps.sleepImpl ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+  const now = deps.nowImpl ?? Date.now;
+  const waitMs = deps.waitMs ?? resolveTrustedWaitMs();
+  const pollMs = deps.pollMs ?? TRUSTED_POLL_MS;
+  const writeProof = (proof) => writeReleaseProof(repoRoot, proof, deps.writeImpl ? { writeImpl: deps.writeImpl } : {});
+
+  const local = archiveContentManifest((deps.readTarballImpl ?? readFileSync)(artifact.tarballPath));
+  let proof = buildTrustedReleaseProof({ target, artifact, commit: deps.expectedHead ?? null, content: local, at: new Date(now()).toISOString() });
+  let written = writeProof(proof);
+  if (!written.ok) throw new TrustedRouteError(`${written.detail} — nothing tagged or pushed`);
+
+  const base = { target, tag: `v${target}`, pushed: [], expectedCommit: null, receipt: null, release: null, live: null, polls: 0 };
+  let pushed;
+  try {
+    pushed = await tagAndPushImpl(repoRoot, target, { expectedHead: deps.expectedHead, tailTimeoutMs: deps.tailTimeoutMs });
+  } catch (err) {
+    await settleDeferredTailSignals();
+    return { ...base, status: 'handoff-incomplete', proof: written, tagProgress: err?.releaseProgress, detail: err instanceof Error ? err.message : String(err) };
+  }
+  if (pushed.githubSkipped) {
+    return { ...base, status: 'handoff-incomplete', pushed: pushed.pushed, proof: written, detail: "'mirror: none' — no GitHub tag was pushed, so the publish workflow never runs" };
+  }
+  const expectedCommit = pushed.githubSnapshot ?? deps.expectedHead ?? null;
+  proof = { ...proof, handedOff: { ...proof.handedOff, commit: expectedCommit } };
+  written = writeProof(proof);
+  const handed = { ...base, tag: pushed.tag, pushed: pushed.pushed, expectedCommit, ...(pushed.githubSnapshot ? { githubSnapshot: pushed.githubSnapshot } : {}) };
+
+  const deadline = now() + waitMs;
+  let verdict;
+  let polls = 0;
+  for (;;) {
+    polls += 1;
+    verdict = judgeTrustedReceipt({ target, evidence: await fetchEvidence(target), commit: expectedCommit, contentDigest: proof.contentDigest, localManifest: local });
+    if (verdict.state !== 'pending' && verdict.state !== 'unreadable') break;
+    const left = deadline - now();
+    if (left <= 0) break;
+    await sleep(Math.min(pollMs, left));
+  }
+  if (verdict.state === 'pending' || verdict.state === 'unreadable') {
+    await settleDeferredTailSignals();
+    return { ...handed, status: 'awaiting-workflow', receipt: verdict, proof: written, polls, detail: verdict.detail };
+  }
+  if (verdict.state !== 'confirmed') {
+    await settleDeferredTailSignals();
+    return { ...handed, status: 'receipt-mismatch', receipt: verdict, proof: written, polls, detail: verdict.detail };
+  }
+  proof = withTrustedReceipt(proof, verdict.checks, new Date(now()).toISOString());
+  writeProof(proof);
+  const repoSpec = resolveTrustedRepoSpec(repoRoot, deps);
+  const release = ensureGithubReleaseImpl(repoRoot, target, { repoSpec, runImpl: deps.runImpl });
+  const live = await verifyLiveSiteImpl(target);
+  const installCheck = await waitForInstallCheck(repoRoot, target, repoSpec, { runImpl: deps.runImpl, now, sleep, waitMs: deps.installWaitMs });
+  written = writeProof(withInstallCheck(proof, installCheck, new Date(now()).toISOString()));
+  const reconciliation = [];
+  if (!written.ok) reconciliation.push({ phase: 'install-check-proof', detail: written.detail });
+  if (!release.ok) reconciliation.push({ phase: 'github-release', detail: release.detail });
+  if (!live.ok) reconciliation.push({ phase: 'live-site', detail: live.detail });
+  await settleDeferredTailSignals();
+  const status = reconciliation.length ? 'post-publish-reconciliation'
+    : installCheck.state === 'passed' ? 'complete' : `install-check-${installCheck.state}`;
+  return { ...handed, status, receipt: verdict, release, live, installCheck, proof: written, polls, reconciliation, detail: verdict.detail };
+}
+
+/**
+ * An otherwise complete trusted publish with an unmeasured install job exits 3.
+ * Same conventions as {@link printPublishOutcome}: progress on stdout, every
+ * finding that needs the operator on stderr with the one command that resumes.
+ *
+ * @returns {number}
+ */
+export function printTrustedOutcome(outcome, target, io = {}) {
+  const log = io.log ?? console.log;
+  const error = io.error ?? console.error;
+  const resume = `node scripts/release.mjs --resume-tail --target ${target}`;
+  if (outcome.proof?.ok) log(`  ${outcome.proof.detail}.`);
+  else if (outcome.proof) error(`\nWARN: ${outcome.proof.detail} — --resume-tail cannot verify this release without it.`);
+  if (outcome.status === 'handoff-incomplete') {
+    error(`\nHAND-OFF INCOMPLETE: ${outcome.detail}`);
+    for (const line of describeTagProgress(outcome.tagProgress).slice(1)) error(line);
+    error(`  Nothing was published locally. Finish the tag pushes with: ${resume}`);
+    return 1;
+  }
+  log(`  tagged ${outcome.tag} and pushed to: ${outcome.pushed.join(', ')}; the workflow builds ${String(outcome.expectedCommit).slice(0, 12)}.`);
+  if (outcome.status === 'awaiting-workflow') {
+    error(`\nAWAITING WORKFLOW after ${outcome.polls} registry poll(s): ${outcome.detail}`);
+    error('  Inspect the tag’s Actions run, then:');
+    error(`  ${resume}`);
+    error('  Tag and push already happened; never rerun --publish.');
+    return 1;
+  }
+  if (outcome.status === 'receipt-mismatch') {
+    error(`\nRECEIPT MISMATCH: ${outcome.detail}`);
+    error('  Someone published outside the workflow, or from a different commit/content. No GitHub release, no site check. Inspect npm and the workflow run; never rerun --publish.');
+    return 1;
+  }
+  log(`  + ${PACKAGE_NAME}@${target} — trusted receipt confirmed: ${outcome.detail}.`);
+  if (outcome.release.ok) log(`  ${outcome.release.detail}.`);
+  else error(`\nRECONCILIATION: ${outcome.release.detail}`);
+  if (outcome.live.ok) log(`  site live at ${target} (${outcome.live.detail}).`);
+  else error(`\nRECONCILIATION: live site did not reach ${target}. ${outcome.live.detail}`);
+  const needsReconciliation = outcome.status === 'post-publish-reconciliation';
+  if (needsReconciliation) {
+    error(`  One command finishes the tail and skips what is already done: ${resume}`);
+  }
+  const { installCheck } = outcome;
+  if (installCheck.state === 'failed') {
+    error(`\n${PACKAGE_NAME}@${target} published, but install-check ${installCheck.conclusion} — check ${installCheck.url}`);
+    return 1;
+  }
+  if (installCheck.state === 'not-measured') {
+    error(`\n${PACKAGE_NAME}@${target} published; install-check not measured (${installCheck.reason}) — check ${installCheck.url}`);
+    return needsReconciliation ? 1 : 3;
+  }
+  if (needsReconciliation) {
+    log('  install-check passed.');
+    return 1;
+  }
+  log(`\nRelease complete: ${PACKAGE_NAME}@${target} is published by the trusted workflow, tagged, released and live; install-check passed.`);
+  return 0;
+}
+
+/**
+ * Render the partial tag/push state left behind by a failed post-receipt tail.
+ *
+ * Pure so the reconciliation lines are unit-testable against a synthetic
+ * outcome: the branch that produces them only exists after an irreversible npm
+ * publish, which no test may perform.
+ *
+ * Absent progress is reported as absent, never as "nothing happened": a
+ * `tagAndPushImpl` that threw before attaching `releaseProgress` leaves state
+ * genuinely unknown, and the operator must inspect rather than assume.
+ *
+ * @param {{tag?: string|null, localTagCreated?: boolean, remotes?: Array<{remote: string, mainPushed?: boolean, tagPushed?: boolean}>}} [tagProgress]
+ * @returns {string[]}
+ */
+export function describeTagProgress(tagProgress) {
+  const lines = ['\nPARTIAL TAG/PUSH STATE (the npm receipt is already irreversible):'];
+  if (!tagProgress || typeof tagProgress !== 'object') {
+    lines.push('  tag/push progress was not recorded — inspect `git tag -l` and both remotes manually.');
+    return lines;
+  }
+  const tag = tagProgress.tag || 'the release tag';
+  lines.push(
+    tagProgress.localTagCreated === true
+      ? `  local tag ${tag}: CREATED (the next \`--check\` will fail \`tag-free-local\` until it is pushed or deleted).`
+      : `  local tag ${tag}: not created.`,
+  );
+  const remotes = Array.isArray(tagProgress.remotes) ? tagProgress.remotes : [];
+  if (remotes.length === 0) {
+    lines.push('  no remote was reached — neither main nor the tag was pushed anywhere.');
+    return lines;
+  }
+  for (const remote of remotes) {
+    lines.push(
+      `  ${remote.remote}: main ${remote.mainPushed === true ? 'pushed' : 'NOT pushed'}, ` +
+        `tag ${remote.tagPushed === true ? 'pushed' : 'NOT pushed'}.`,
+    );
+  }
+  return lines;
+}
+
+/**
+ * Print a completed publish-tail outcome and return the CLI exit code.
+ *
+ * @param {{status: string, propagation: object, tag: string|null, pushed: string[], release: object, live: object, reconciliation: Array<{phase: string, kind?: string, detail: string}>}} outcome
+ * @param {string} target
+ * @param {{log?: Function, error?: Function}} [io]
+ * @returns {number}
+ */
+export function printPublishOutcome(outcome, target, io = {}) {
+  const log = io.log ?? console.log;
+  const error = io.error ?? console.error;
+  const tagAndPushFailed = outcome.reconciliation.some((item) => item.phase === 'tag-and-push');
+  const deferred = io.deferredSignals ?? deferredTailSignals();
+
+  log(`  + ${PACKAGE_NAME}@${target} — target-confirmed npm receipt.`);
+  for (const { signal, at } of deferred) error(`  deferred ${signal} at ${at}; the tail ran to its end`);
+  if (outcome.proof) {
+    if (outcome.proof.ok) log(`  ${outcome.proof.detail}.`);
+    else error(`\nWARN: ${outcome.proof.detail} — \`--reconcile\` cannot verify this release without it.`);
+  }
+  if (outcome.propagation.ok) {
+    log(`  registry verified (${outcome.propagation.detail}).`);
+  } else {
+    // An accepted upload can stay unserved for many minutes while npm's
+    // publish-time checks run (#1537) — this is not a short propagation delay.
+    error(`\nRECONCILIATION: registry availability is not yet verified — ${outcome.propagation.detail}`);
+    error(`  npm accepted the upload; resume verification with: node scripts/release.mjs --reconcile --target ${target}`);
+  }
+  if (!tagAndPushFailed) {
+    log(`  tagged ${outcome.tag} (AFTER publish) and pushed main+tag to: ${outcome.pushed.join(', ')}.`);
+    if (outcome.githubSnapshot) {
+      log(`  github (mirror: curated): main and ${outcome.tag} are the public snapshot ${outcome.githubSnapshot.slice(0, 12)}, not the release commit.`);
+    }
+  } else {
+    // The npm receipt is already irreversible at this point, so the ONLY thing
+    // that helps the operator is the exact partial state tag-and-push reached.
+    // `runPublishRelease` collects it (`tagProgress.localTagCreated` plus a
+    // per-remote `{mainPushed, tagPushed}`); this printer used to reference
+    // none of it and suppressed the `pushed:` line as well, so the operator was
+    // told only THAT it failed. The local-tag line matters twice over: a
+    // created local tag makes the next `--check` fail `tag-free-local`, which
+    // reads as a mysterious collision unless it was announced here.
+    for (const line of describeTagProgress(outcome.tagProgress)) error(line);
+  }
+
+  if (outcome.release.skipped) {
+    error(`\nSKIPPED: ${outcome.release.detail}.`);
+  } else if (outcome.release.ok) {
+    log(`  ${outcome.release.detail}.`);
+  } else {
+    error(`\nRECONCILIATION: ${outcome.release.detail}`);
+    const recovery = outcome.release.recovery;
+    if (recovery?.inspect) {
+      error(`  Inspect with: ${renderRecoveryCommand(recovery.inspect)}`);
+      if (outcome.release.state === 'create-failed' && recovery.create) {
+        error(`  Recover with: ${renderRecoveryCommand(recovery.create)}`);
+        error('  The notes file is retained for recovery; remove it after the release is reconciled.');
+      }
+    } else {
+      error('  Resolve the GitHub repository identity before inspecting or creating the release.');
+    }
+  }
+
+  if (outcome.live.skipped) {
+    error(`\nSKIPPED: ${outcome.live.detail}.`);
+  } else if (!outcome.live.ok) {
+    error(`\nRECONCILIATION: live site did not reach ${target}.`);
+    error(`  ${outcome.live.detail}`);
+    error('  Check https://vercel.com/kanevrys-projects/session-orchestrator for the deploy.');
+  } else {
+    log(`  site live at ${target} (${outcome.live.detail}).`);
+  }
+
+  if (outcome.status === 'post-publish-reconciliation') {
+    error('\nPost-publish reconciliation required: npm has accepted the target release.');
+    for (const item of outcome.reconciliation) {
+      error(`  - ${item.phase}${item.kind ? ` (${item.kind})` : ''}: ${item.detail}`);
+    }
+    error('  Do NOT rerun `--publish`; reconcile the listed post-publish state directly.');
+    error(`  One command finishes the tail and skips what is already done: node scripts/release.mjs --resume-tail --target ${target}`);
+    if (!outcome.propagation.ok) error(`  Registry state: \`node scripts/release.mjs --reconcile --target ${target}\` (read-only, resumable).`);
+    return 1;
+  }
+
+  log(`\nRelease complete: ${PACKAGE_NAME}@${target} is published, tagged, released and live.`);
+  log('\nPost-release checklist (manual):');
+  log('  1. Rotate/delete the npm token: https://www.npmjs.com/settings/<user>/tokens');
+  log('  2. pi.dev gallery indexes asynchronously — do not block on it.');
+  log('  3. Install the release on this host: npm run update:local -- --skip-pull, then restart the harness.');
+  return 0;
+}
+
+/** Render argv for a POSIX shell without interpreting paths as shell code. */
+function renderRecoveryCommand(argv) {
+  return argv.map((arg) => /^[\w./:@=+-]+$/.test(arg) ? arg : `'${arg.replaceAll("'", "'\\''")}'`).join(' ');
+}
+
+/**
+ * Create the GitHub release for `v<target>`, or confirm the existing one.
+ *
+ * WHY THIS IS CODE AND NOT A CHECKLIST LINE: it was a checklist line, and the
+ * evidence that a checklist line is not a mechanism is in the release history.
+ * The GitHub releases for v3.15, v3.18, v3.19 and v3.20 were all created within
+ * a THREE-SECOND window on 2026-08-19 — hand-backfilled in one sitting, 5 to 31
+ * days after their tags, where the releases that were not forgotten were made 19
+ * seconds to 2.5 minutes after theirs. The same class of gap left 3.18.0 with a
+ * tag, a GitHub release and a CHANGELOG entry that the npm registry has still
+ * never seen.
+ *
+ * Three properties make this safe to run unconditionally after a push:
+ *  - `--verify-tag` makes gh refuse when the tag is not on the remote, so
+ *    "release without a tag" is structurally impossible rather than merely
+ *    discouraged.
+ *  - The `gh release view` probe avoids a duplicate-release error when a
+ *    release is already present. It does not authorize rerunning `--publish`:
+ *    post-receipt failures are reconciled directly.
+ *  - The `-R` spec comes from `resolveRepoSpec({vcs:'github'})` (#1039), not a
+ *    hardcoded owner/repo, so a fork or a renamed remote targets its own repo.
+ *
+ * Never throws: the caller has already published to npm and pushed both tags by
+ * the time this runs, so an exception here would report a successful release as
+ * a crash. Failure comes back as `{ok:false}` with the recovery command.
+ *
+ * @param {string} repoRoot
+ * @param {string} target
+ * @param {{runImpl?: Function, repoSpec?: string}} [deps] — injection seam for tests
+ * @returns {{ok: boolean, created: boolean, tag: string, state: 'exists'|'created'|'unknown'|'create-failed', detail: string, argv?: string[], recovery?: {inspect: string[], create?: string[]}}}
+ */
+export function ensureGithubRelease(repoRoot, target, deps = {}) {
+  const runImpl = deps.runImpl ?? run;
+  const tag = `v${target}`;
+  let recovery;
+
+  try {
+    const spec = deps.repoSpec ?? resolveRepoSpec({ repoRoot, vcs: 'github' });
+    if (typeof spec !== 'string' || !spec.trim()) {
+      return { ok: false, created: false, tag, state: 'unknown', detail: 'GitHub repository identity could not be resolved' };
+    }
+    // Recovery must carry the same resolved identity as the real invocation.
+    // An absent identity cannot safely fall back to the caller's ambient repo.
+    const repoFlag = ['--repo', spec];
+    recovery = { inspect: ['gh', 'release', 'view', tag, ...repoFlag] };
+    const existing = runImpl(recovery.inspect[0], recovery.inspect.slice(1), { cwd: repoRoot });
+    const viewOutput = `${existing.stdout || ''}\n${existing.stderr || ''}`.trim();
+    if (existing.status === 0 && viewOutput) {
+      return { ok: true, created: false, tag, state: 'exists', detail: `GitHub release ${tag} already exists — no-op` };
+    }
+    // `gh release view` is tri-state. Only its documented absence response is
+    // permission to create; auth, network, empty and malformed responses leave
+    // release state unknown and must not trigger a write to GitHub.
+    if (!(existing.status === 1 && /^release not found$/i.test(viewOutput))) {
+      return {
+        ok: false,
+        created: false,
+        tag,
+        state: 'unknown',
+        recovery,
+        detail: `could not determine whether GitHub release ${tag} exists (gh release view exited ${existing.status}: ${viewOutput.slice(0, 300) || 'empty output'})`,
+      };
+    }
+
+    const notesDir = mkdtempSync(join(tmpdir(), 'release-ghnotes-'));
+    const notesFile = join(notesDir, 'notes.md');
+    let argv;
+    let retainNotes = false;
+    try {
+      const packageUrl = `https://www.npmjs.com/package/session-orchestrator/v/${target}`;
+      writeFileSync(notesFile, [
+        changelogExcerpt(repoRoot, target),
+        '',
+        `[npm package and provenance (when available)](${packageUrl})`,
+        '',
+      ].join('\n'));
+      argv = ['release', 'create', tag, ...repoFlag, '--verify-tag', '--title', tag, '--notes-file', notesFile];
+      const created = runImpl('gh', argv, { cwd: repoRoot });
+      if (created.status !== 0) {
+        // A recovery argv pointing to a file deleted by finally is unusable.
+        // Preserve only this failed-create excerpt; successful runs still clean up.
+        retainNotes = true;
+        return {
+          ok: false,
+          created: false,
+          tag,
+          state: 'create-failed',
+          argv,
+          recovery: { ...recovery, create: ['gh', ...argv] },
+          detail: `gh release create exited ${created.status}: ${(created.stderr || created.stdout || '').trim().slice(0, 300)}`,
+        };
+      }
+      return { ok: true, created: true, tag, state: 'created', argv, detail: `GitHub release ${tag} created (--verify-tag)` };
+    } finally {
+      if (!retainNotes) rmSync(notesDir, { recursive: true, force: true });
+    }
+  } catch (err) {
+    return { ok: false, created: false, tag, state: 'unknown', ...(recovery ? { recovery } : {}), detail: `gh could not be run: ${err.message}` };
+  }
+}
+
+/**
+ * Poll the live site until it serves `expected`, or give up.
+ *
+ * WHY POLLING: the Vercel git integration builds asynchronously after the push
+ * to `github`, so a single immediate check would report a false negative on
+ * every release. WHY AT ALL: the live site silently fell a release behind twice
+ * in four weeks (#1043) — a deploy that reports success at the push and is
+ * never re-read afterwards cannot tell "deployed" from "did not deploy".
+ *
+ * Fail-closed by design: a network error, a non-200, an unparseable body and a
+ * genuine version mismatch are four DISTINCT reported outcomes, never collapsed
+ * onto one "not ok" — collapsing them is the defect class this replaces.
+ *
+ * @param {string} expected — the version literal the site must serve
+ * @param {{url?: string, attempts?: number, delayMs?: number, fetchImpl?: Function}} [opts]
+ * @returns {Promise<{ok: boolean, detail: string}>}
+ */
+export async function verifyLiveSite(expected, opts = {}) {
+  const url = opts.url ?? 'https://session-orchestrator.com/llms.txt';
+  const attempts = opts.attempts ?? 12;
+  const delayMs = opts.delayMs ?? 10_000;
+  const doFetch = opts.fetchImpl ?? globalThis.fetch;
+  let last = 'no attempt made';
+
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      const res = await doFetch(url, { headers: { 'Cache-Control': 'no-cache' } });
+      if (!res.ok) {
+        last = `HTTP ${res.status} from ${url}`;
+      } else {
+        const body = await res.text();
+        const m = body.match(/^Version:\s*([0-9]+\.[0-9]+\.[0-9]+)/m);
+        if (!m) {
+          last = `no "Version: X.Y.Z" line in ${url} (${body.length} bytes) — the surface moved, fix the check`;
+        } else if (m[1] === expected) {
+          return { ok: true, detail: `attempt ${i}/${attempts}, ${url}` };
+        } else {
+          last = `live serves ${m[1]}, expected ${expected}`;
+        }
+      }
+    } catch (err) {
+      last = `fetch failed: ${err.message}`;
+    }
+    if (i < attempts) await new Promise((r) => setTimeout(r, delayMs));
+  }
+  return { ok: false, detail: `${last} (gave up after ${attempts} attempts)` };
+}
+
+// ---------------------------------------------------------------------------
+// --resume-tail (#1791). The shield (#1753) defers SIGTERM, but SIGKILL,
+// `timeout -k` or a host crash still stop the tail wherever it is. This path
+// finishes it from the publish proof alone and is idempotent: a step that is
+// already done is read back and skipped, so a second run changes nothing. It
+// never reaches publish(), `npm publish` or a pack of the repo.
+//
+// What it deliberately does NOT redo: pushing `main`. The preflight required
+// HEAD == origin main (and github main == HEAD, or its curated snapshot) before
+// the upload, so only the tag refs can be missing. It refuses to create or push
+// a new curated snapshot: github main may have moved on since, and rebuilding
+// an export of an older commit over it would regress the public mirror.
+// ---------------------------------------------------------------------------
+
+const FULL_SHA_RE = /^[0-9a-f]{40}$/;
+
+/** Commit a remote's `refs/tags/<tag>` points at (peeled), or null when the tag is absent. */
+function remoteTagCommit(lsRemoteOutput, tag) {
+  let direct = null;
+  let peeled = null;
+  for (const line of lsRemoteOutput.split('\n')) {
+    const [sha, ref] = line.trim().split(/\s+/);
+    if (ref === `refs/tags/${tag}^{}`) peeled = sha;
+    else if (ref === `refs/tags/${tag}`) direct = sha;
+  }
+  return peeled ?? direct;
+}
+
+/**
+ * Finish an interrupted publish tail for `target` (#1791): first the read-only
+ * registry reconcile (nothing is tagged or pushed unless the registry serves
+ * the proof's integrity), then tag the commit the publish proof recorded, push
+ * the tag where it is missing, then the GitHub release and the live-site
+ * check. An existing tag — local or remote — is accepted only when it points
+ * at the recorded commit (curated github: at a snapshot whose Source-Commit is
+ * that commit); a tag at any other commit is a refusal, never silently accepted.
+ *
+ * @param {string} repoRoot
+ * @param {string} target
+ * @param {{runImpl?: Function, tailRunImpl?: typeof runTailChild, tailTimeoutMs?: number, log?: (s: string) => void,
+ *   ensureGithubReleaseImpl?: Function, verifyLiveSiteImpl?: Function, reconcileReleaseImpl?: Function, readImpl?: Function,
+ *   reconcileTrustedReleaseImpl?: Function, fetchEvidenceImpl?: Function, writeImpl?: Function, nowImpl?: () => number,
+ *   sleepImpl?: (ms: number) => Promise<void>, installWaitMs?: number, resolveRepoSpec?: Function,
+ *   readMirrorSettingImpl?: (repoRoot: string) => object, gitRunnerImpl?: Function}} [deps]
+ *   `runImpl` runs local git (sync); `tailRunImpl` runs every network child (push, fetch, ls-remote);
+ *   `gitRunnerImpl` is the github-export runner of the push-URL and plain-push guards. Under a
+ *   trusted proof a confirmed receipt is written into the proof (`receiptAt` + `receipt`, step
+ *   `receipt-proof`) via {@link withTrustedReceipt}; `writeImpl` replaces the atomic writer.
+ * @returns {Promise<{target: string, status: 'complete'|'incomplete'|'refused', commit: string|null, steps: Array<{phase: string, state: 'done'|'present'|'skipped'|'failed'|'refused'|'ok'|'unmeasured', detail: string}>}>}
+ */
+export async function resumeReleaseTail(repoRoot, target, deps = {}) {
+  const runImpl = deps.runImpl ?? run;
+  const tailRun = deps.tailRunImpl ?? runTailChild;
+  const tailOpts = { cwd: repoRoot, timeoutMs: deps.tailTimeoutMs, log: deps.log };
+  const ensureGithubReleaseImpl = deps.ensureGithubReleaseImpl ?? ensureGithubRelease;
+  const verifyLiveSiteImpl = deps.verifyLiveSiteImpl ?? verifyLiveSite;
+  const reconcileReleaseImpl = deps.reconcileReleaseImpl ?? reconcileRelease;
+  const gitRunner = deps.gitRunnerImpl ?? createGitRunner(repoRoot);
+  const now = deps.nowImpl ?? Date.now;
+  const tag = `v${target}`;
+  const steps = [];
+  // Every local git call here runs with GIT_NO_REPLACE_OBJECTS=1 (SO#1925): a
+  // local refs/replace/* object steers ancestry (`merge-base --is-ancestor`)
+  // and tag peels (`rev-parse <tag>^{commit}`) — man git-replace: used by all
+  // commands except reachability traversal — while the push sends the REAL
+  // objects, so a graft or a replaced tag object could land the public tag on
+  // a commit that is not on origin main. A caller's `o.env` still wins.
+  const git = (args, o) => runImpl('git', args, { cwd: repoRoot, env: { ...process.env, ...GIT_NO_REPLACE_ENV, ...(o?.env ?? {}) } });
+  const refuse = (phase, detail, commit = null) => {
+    steps.push({ phase, state: 'refused', detail });
+    return { target, status: 'refused', commit, steps };
+  };
+  const network = async (args) => {
+    const res = await tailRun('git', args, tailOpts);
+    if (res.timedOut) {
+      const survivors = res.survivors?.length ? `; still alive after SIGKILL: ${res.survivors.join(', ')}` : '';
+      return { ok: false, detail: `git ${args.join(' ')} timed out after ${Math.round((deps.tailTimeoutMs ?? TAIL_CHILD_TIMEOUT_MS) / 1000)} s; process group ${res.pgid ?? 'unknown'} was sent ${res.killSignals.join(', ') || 'no signal'}${survivors}` };
+    }
+    if (res.status !== 0) return { ok: false, detail: `git ${args.join(' ')} exited ${res.status}: ${res.output.trim().slice(-300)}` };
+    return { ok: true, output: res.output };
+  };
+
+  // 1. The proof is the only source of the release commit.
+  const read = readReleaseProof(repoRoot, target, { readImpl: deps.readImpl });
+  if (!read.ok) return refuse('proof', `${read.detail} — without it there is no recorded commit to finish the tail for`);
+  let proof = read.proof;
+  const writeProof = (updated) => writeReleaseProof(repoRoot, updated, { writeImpl: deps.writeImpl });
+  const commit = proof.commit;
+  if (typeof commit !== 'string' || !FULL_SHA_RE.test(commit)) {
+    return refuse('proof', `${relativePath(repoRoot, read.path)} records no commit (HEAD was unreadable at the receipt) — finish the tail by hand (skills/release/SKILL.md § Tail interrupted)`);
+  }
+  steps.push({ phase: 'proof', state: 'ok', detail: `${tag} belongs to ${commit}` });
+  if (git(['rev-parse', '--verify', '--quiet', `${commit}^{commit}`]).status !== 0) {
+    return refuse('commit', `recorded commit ${commit} is not in this clone — fetch origin first`, commit);
+  }
+
+  const setting = (deps.readMirrorSettingImpl ?? readMirrorSetting)(repoRoot);
+  if (!setting.ok) return refuse('mirror', `GitHub mirror mode unknown — ${setting.reason}; nothing tagged or pushed`, commit);
+
+  // 2. Registry FIRST: the read-only --reconcile path, never a publish. A proof
+  // whose integrity the registry does not serve must not get a tag (SO#1791
+  // F4) — verify before anything is created or pushed.
+  //
+  // Route B (trusted proof): the receipt binds to handedOff.commit and the
+  // content digest, never dist.integrity. A still-pending receipt does NOT stop
+  // the tag pushes — the GitHub tag push is what triggers the workflow — but it
+  // stops the GitHub release and the site check (step 6).
+  const trusted = read.proof.route === 'trusted-publishing';
+  let trustedPending = false;
+  const handedCommit = read.proof.handedOff?.commit;
+  if (trusted) {
+    if (typeof handedCommit !== 'string' || !FULL_SHA_RE.test(handedCommit)) {
+      return refuse('proof', `${relativePath(repoRoot, read.path)} is a trusted-publishing proof without handedOff.commit — the commit the workflow builds is unknown; finish by hand (skills/release/SKILL.md § Tail interrupted)`, commit);
+    }
+    if (setting.mirror === 'none') return refuse('mirror', "trusted-publishing proof under 'mirror: none' — the workflow lives on the GitHub mirror", commit);
+    // The GitHub tag goes on handedCommit, so it must be anchored to the release
+    // commit (curated: its Source-Commit trailer) BEFORE anything is pushed.
+    const anchor = trustedAnchorProblem(read.proof, setting.mirror, git);
+    if (anchor) return refuse(setting.mirror === 'curated' ? 'github-tag' : 'proof', `${anchor} — nothing tagged or pushed`, commit);
+    // A pending receipt still gets tags, so the tagged commits must BE version
+    // `target`: a stale or hand-edited proof must not put v<target> on old code.
+    for (const [label, sha] of setting.mirror === 'curated' ? [['release commit', commit], ['handedOff.commit', handedCommit]] : [['release commit', commit]]) {
+      const version = trustedCommitVersion(git, sha);
+      if (version !== target) {
+        return refuse('proof', `${label} ${sha.slice(0, 12)} has package.json version ${version === null ? 'unreadable' : JSON.stringify(version)}, not ${target} — nothing tagged or pushed`, commit);
+      }
+    }
+    const receipt = await (deps.reconcileTrustedReleaseImpl ?? reconcileTrustedReceipt)(repoRoot, target, {
+      readImpl: deps.readImpl,
+      fetchEvidenceImpl: deps.fetchEvidenceImpl,
+      readMirrorSettingImpl: () => setting,
+      runImpl: deps.runImpl,
+    }, read);
+    if (!receipt.ok && receipt.state !== 'pending') {
+      return refuse('registry', `${receipt.state}: ${receipt.detail} — nothing tagged or pushed`, commit);
+    }
+    trustedPending = !receipt.ok;
+    steps.push({ phase: 'registry', state: receipt.ok ? 'ok' : 'skipped', detail: `${receipt.state}: ${receipt.detail}` });
+    // A confirmed receipt is persisted the way runTrustedPublishRelease does it.
+    // writeReleaseProof never throws; a failure is a failed step (status
+    // incomplete) and the next --resume-tail writes it again.
+    if (receipt.ok && (!proof.receiptAt || !proof.receipt)) {
+      proof = withTrustedReceipt(proof, receipt.checks, new Date(now()).toISOString());
+      const written = writeProof(proof);
+      steps.push({ phase: 'receipt-proof', state: written.ok ? 'done' : 'failed', detail: written.detail });
+    }
+  }
+  const registry = trusted ? { ok: true, state: 'trusted', detail: '' } : reconcileReleaseImpl(repoRoot, target);
+  const registryDetail = `${registry.state}: ${registry.detail}`;
+  if (!registry.ok) {
+    if (registry.state === 'pending') {
+      steps.push({ phase: 'registry', state: 'failed', detail: `${registryDetail} — nothing tagged or pushed; run --resume-tail again once the registry serves it` });
+      return { target, status: 'incomplete', commit, steps };
+    }
+    return refuse('registry', `${registryDetail} — the registry does not serve what the proof records; nothing tagged or pushed`, commit);
+  }
+  if (!trusted) steps.push({ phase: 'registry', state: 'ok', detail: registryDetail });
+
+  // 3. The commit must already be on origin main: a stale or hand-edited proof
+  // must not get a public tag on a commit that never reached origin.
+  const originMain = await network(['ls-remote', 'origin', 'refs/heads/main']);
+  if (!originMain.ok) {
+    steps.push({ phase: 'origin-main', state: 'failed', detail: originMain.detail });
+    return { target, status: 'incomplete', commit, steps };
+  }
+  const mainSha = (originMain.output.trim().split(/\s+/)[0] || '');
+  if (!FULL_SHA_RE.test(mainSha) || git(['merge-base', '--is-ancestor', commit, mainSha]).status !== 0) {
+    return refuse('origin-main', `recorded commit ${commit.slice(0, 12)} is not contained in origin main (${mainSha.slice(0, 12) || 'unreadable'}; fetch origin if it is just missing locally) — refusing to tag it`, commit);
+  }
+
+  // 4. Local tag: present at the commit, absent (create it), or foreign (refuse).
+  const local = git(['rev-parse', '--verify', '--quiet', `refs/tags/${tag}^{commit}`]);
+  const localSha = local.status === 0 ? local.stdout.trim() : null;
+  if (localSha && localSha !== commit) {
+    return refuse('local-tag', `local ${tag} points at ${localSha}, not the recorded commit ${commit} — inspect it; never move a release tag silently`, commit);
+  }
+  if (localSha) {
+    steps.push({ phase: 'local-tag', state: 'present', detail: `${tag} already at ${commit.slice(0, 12)}` });
+  } else {
+    const msgDir = mkdtempSync(join(tmpdir(), 'release-tagmsg-'));
+    try {
+      const msgFile = join(msgDir, 'msg');
+      writeFileSync(msgFile, `${tag}\n\n${changelogExcerpt(repoRoot, target)}\n`);
+      const created = git(['tag', '-a', tag, commit, '-F', msgFile]);
+      if (created.status !== 0) {
+        steps.push({ phase: 'local-tag', state: 'failed', detail: `git tag -a ${tag} exited ${created.status}: ${(created.stderr || '').trim().slice(0, 300)}` });
+        return { target, status: 'incomplete', commit, steps };
+      }
+    } finally {
+      rmSync(msgDir, { recursive: true, force: true });
+    }
+    steps.push({ phase: 'local-tag', state: 'done', detail: `created annotated ${tag} on ${commit.slice(0, 12)}` });
+  }
+
+  // 5. Remote tags, one push per remote and ref (the pre-push gate blocks a
+  // push that carries refs on more than one commit, #1787).
+  let tagsComplete = true;
+  const ensureRemoteTag = async (remote, expected, pushSource) => {
+    const phase = `${remote}-tag`;
+    const listed = await network(['ls-remote', remote, `refs/tags/${tag}`, `refs/tags/${tag}^{}`]);
+    if (!listed.ok) {
+      steps.push({ phase, state: 'failed', detail: listed.detail });
+      tagsComplete = false;
+      return 'failed';
+    }
+    const remoteSha = remoteTagCommit(listed.output, tag);
+    if (remoteSha && remoteSha !== expected) {
+      steps.push({ phase, state: 'refused', detail: `${remote} ${tag} points at ${remoteSha}, expected ${expected} — inspect it; never move a release tag silently` });
+      return 'refused';
+    }
+    if (remoteSha) {
+      steps.push({ phase, state: 'present', detail: `${remote} already has ${tag} at ${expected.slice(0, 12)}` });
+      return 'present';
+    }
+    const pushed = await network(['push', remote, `${pushSource}:refs/tags/${tag}`]);
+    if (!pushed.ok) {
+      steps.push({ phase, state: 'failed', detail: pushed.detail });
+      tagsComplete = false;
+      return 'failed';
+    }
+    steps.push({ phase, state: 'done', detail: `pushed ${tag} to ${remote}` });
+    return 'done';
+  };
+
+  // Curated mirror: an existing github tag is resolved to its snapshot commit,
+  // whose Source-Commit trailer must be the release commit. 'absent' when
+  // github has no such tag.
+  const curatedGithubTag = async () => {
+    const listed = await network(['ls-remote', 'github', `refs/tags/${tag}`, `refs/tags/${tag}^{}`]);
+    if (!listed.ok) return { state: 'failed', detail: listed.detail };
+    const existing = remoteTagCommit(listed.output, tag);
+    if (!existing) return { state: 'absent' };
+    const trackRef = `refs/remotes/github/tags/${tag}`;
+    const fetched = await network(['fetch', '--quiet', '--no-tags', 'github', `+refs/tags/${tag}:${trackRef}`]);
+    if (!fetched.ok) return { state: 'failed', detail: `github ${tag} at ${existing.slice(0, 12)} could not be fetched to check its Source-Commit — ${fetched.detail}` };
+    const resolved = git(['rev-parse', '--verify', '--quiet', `${trackRef}^{commit}`]);
+    // The ref only carried the fetch; leave no refs/remotes/github/tags/* behind.
+    git(['update-ref', '-d', trackRef]);
+    const snapshot = resolved.status === 0 ? resolved.stdout.trim() : '';
+    const body = snapshot === existing ? git(['cat-file', 'commit', snapshot], { env: GIT_NO_REPLACE_ENV }) : { status: 1, stdout: '' };
+    const source = body.status === 0 ? parseSourceCommitTrailer(body.stdout) : null;
+    if (source !== commit) {
+      return { state: 'refused', detail: `github ${tag} points at ${existing.slice(0, 12)}, whose Source-Commit: ${source ?? 'none'} is not the release commit ${commit} — inspect it; never move a release tag silently` };
+    }
+    return { state: 'present', detail: `github already has ${tag} at ${existing.slice(0, 12)}, the snapshot of ${commit.slice(0, 12)}` };
+  };
+
+  if ((await ensureRemoteTag('origin', commit, `refs/tags/${tag}`)) === 'refused') return { target, status: 'refused', commit, steps };
+
+  const githubSkipped = setting.mirror === 'none';
+  if (githubSkipped) {
+    steps.push({ phase: 'github-tag', state: 'skipped', detail: "'mirror: none'" });
+  } else {
+    const pushProblem = pushUrlProblem(gitRunner, 'github');
+    if (pushProblem) return refuse('github-tag', pushProblem, commit);
+    if (setting.mirror === 'curated' && trusted) {
+      // Route B: the snapshot is recorded in the proof (the commit the workflow
+      // built or will build); the github tag must point at exactly it.
+      if ((await ensureRemoteTag('github', handedCommit, handedCommit)) === 'refused') return { target, status: 'refused', commit, steps };
+    } else if (setting.mirror === 'curated') {
+      // The github tag goes on the public snapshot whose Source-Commit trailer
+      // names the release commit; that snapshot is github main (preflight).
+      const fetched = await network(['fetch', '--quiet', '--no-tags', 'github', '+refs/heads/main:refs/remotes/github/main']);
+      if (!fetched.ok) {
+        steps.push({ phase: 'github-tag', state: 'failed', detail: fetched.detail });
+        tagsComplete = false;
+      } else {
+        const snapshot = git(['rev-parse', '--verify', '--quiet', 'refs/remotes/github/main^{commit}']);
+        const snapshotSha = snapshot.status === 0 ? snapshot.stdout.trim() : '';
+        const body = snapshotSha ? git(['cat-file', 'commit', snapshotSha], { env: GIT_NO_REPLACE_ENV }) : { status: 1, stdout: '' };
+        const source = body.status === 0 ? parseSourceCommitTrailer(body.stdout) : null;
+        if (source !== commit) {
+          // github main moved on. A github tag that already exists counts only
+          // when ITS snapshot names the release commit (SO#1791 F3).
+          const existing = await curatedGithubTag();
+          if (existing.state === 'failed') {
+            steps.push({ phase: 'github-tag', state: 'failed', detail: existing.detail });
+            tagsComplete = false;
+          } else if (existing.state === 'present') {
+            steps.push({ phase: 'github-tag', state: 'present', detail: existing.detail });
+          } else if (existing.state === 'refused') {
+            return refuse('github-tag', existing.detail, commit);
+          } else {
+            return refuse('github-tag', `github main ${snapshotSha.slice(0, 12) || 'unreadable'} is not the snapshot of ${commit.slice(0, 12)} (Source-Commit: ${source ?? 'none'}) — push the snapshot tag by hand (skills/release/SKILL.md § Tail interrupted)`, commit);
+          }
+        } else if ((await ensureRemoteTag('github', snapshotSha, snapshotSha)) === 'refused') {
+          return { target, status: 'refused', commit, steps };
+        }
+      }
+    } else {
+      // A plain tag push carries the release commit's whole history to the
+      // mirror. The checkout's Session Config can predate `mirror: curated`
+      // while the proof came from a curated publish, so the export policy
+      // decides — the same guard as preflight and tagAndPush (SO#1791).
+      const verdict = plainPushGuard({ git: gitRunner, explicitGithub: setting.mirror === 'github' });
+      if (!verdict.ok) return refuse('github-tag', `plain push to github refused — ${verdict.reason}`, commit);
+      if ((await ensureRemoteTag('github', commit, `refs/tags/${tag}`)) === 'refused') {
+        return { target, status: 'refused', commit, steps };
+      }
+    }
+  }
+
+  // 6. GitHub release and live site need the tags (mirrors runPublishRelease)
+  // and, under route B, the confirmed trusted receipt.
+  if (trustedPending) {
+    const why = 'skipped: the trusted receipt is not confirmed yet — inspect the tag’s Actions run, then rerun --resume-tail';
+    steps.push({ phase: 'github-release', state: 'failed', detail: why });
+    steps.push({ phase: 'live-site', state: 'skipped', detail: why });
+  } else if (!tagsComplete) {
+    steps.push({ phase: 'github-release', state: 'skipped', detail: 'skipped because a tag push did not complete' });
+    steps.push({ phase: 'live-site', state: 'skipped', detail: 'skipped because a tag push did not complete' });
+  } else {
+    if (githubSkipped) {
+      steps.push({ phase: 'github-release', state: 'skipped', detail: "'mirror: none'" });
+    } else {
+      const release = ensureGithubReleaseImpl(repoRoot, target);
+      steps.push({ phase: 'github-release', state: release.ok ? (release.created ? 'done' : 'present') : 'failed', detail: release.detail });
+    }
+    const live = await verifyLiveSiteImpl(target);
+    steps.push({ phase: 'live-site', state: live.ok ? 'ok' : 'failed', detail: live.detail });
+    if (trusted && proof.installCheck?.state === 'passed') {
+      steps.push({ phase: 'install-check', state: 'ok', detail: 'install job passed (recorded in proof)' });
+    } else if (trusted) {
+      const repoSpec = resolveTrustedRepoSpec(repoRoot, deps);
+      const installCheck = await waitForInstallCheck(repoRoot, target, repoSpec, {
+        runImpl, now, sleep: deps.sleepImpl, waitMs: deps.installWaitMs,
+      });
+      if (installCheck.state === 'not-measured') {
+        steps.push({ phase: 'install-check', state: 'unmeasured', detail: `install job not measured (${installCheck.reason}) — check ${installCheck.url}` });
+      } else if (installCheck.state === 'failed') {
+        steps.push({ phase: 'install-check', state: 'failed', detail: `install job ${installCheck.conclusion} — check ${installCheck.url}` });
+      } else {
+        steps.push({ phase: 'install-check', state: 'ok', detail: `install job passed — ${installCheck.url}` });
+      }
+      const written = writeProof(withInstallCheck(proof, installCheck, new Date(now()).toISOString()));
+      if (!written.ok) steps.push({ phase: 'install-check-proof', state: 'failed', detail: written.detail });
+    }
+  }
+
+  const done = steps.every((s) => !['failed', 'refused', 'unmeasured'].includes(s.state));
+  return { target, status: done ? 'complete' : 'incomplete', commit, steps };
+}
+
+/**
+ * Print a {@link resumeReleaseTail} outcome; exit 0 only when complete.
+ *
+ * @returns {number}
+ */
+export function printResumeTailOutcome(outcome, { json = false, log = console.log, error = console.error } = {}) {
+  const failed = outcome.status === 'refused' || outcome.steps.some((s) => s.state === 'failed' || s.state === 'refused');
+  const unmeasured = outcome.steps.find((s) => s.phase === 'install-check' && s.state === 'unmeasured');
+  const code = failed ? 1 : unmeasured ? 3 : outcome.status === 'complete' ? 0 : 1;
+  if (json) {
+    log(JSON.stringify(outcome, null, 2));
+    return code;
+  }
+  for (const step of outcome.steps) {
+    const line = `  ${step.state.padEnd(7)} ${step.phase}: ${step.detail}`;
+    if (step.state === 'failed' || step.state === 'refused') error(line);
+    else log(line);
+  }
+  if (code === 3) {
+    error(`\n${PACKAGE_NAME}@${outcome.target} tail done; ${unmeasured.detail}`);
+    return 3;
+  }
+  if (code === 0) {
+    log(`\nTail complete for ${PACKAGE_NAME}@${outcome.target}: tagged, pushed, released, live and installable. A second run changes nothing.`);
+    return 0;
+  }
+  if (outcome.status === 'refused') {
+    error(`\nRESUME REFUSED for ${PACKAGE_NAME}@${outcome.target}: nothing past the refused step was changed. Resolve it by hand; never rerun --publish.`);
+    return 1;
+  }
+  error(`\nRECONCILIATION: the tail of ${PACKAGE_NAME}@${outcome.target} is not finished yet. Run \`node scripts/release.mjs --resume-tail --target ${outcome.target}\` again — it skips what is already done. Never rerun --publish.`);
+  return 1;
+}
+
+function printChecks(checks, asJson, version) {
+  const ok = checks.every((c) => c.ok);
+  if (asJson) {
+    console.log(JSON.stringify({ ok, version, checks }, null, 2));
+  } else {
+    for (const c of checks) {
+      console.log(`${c.ok ? '  ok ' : 'FAIL '} ${c.name}${c.detail ? ` — ${c.detail}` : ''}`);
+    }
+    console.log(ok ? `\nAll ${checks.length} checks green for v${version}.` : `\n${checks.filter((c) => !c.ok).length} of ${checks.length} checks FAILED for v${version}.`);
+  }
+  return ok;
+}
+
+async function main() {
+  const { values } = parseArgs({
+    options: {
+      'set-version': { type: 'string' },
+      check: { type: 'boolean', default: false },
+      publish: { type: 'boolean', default: false },
+      direct: { type: 'boolean', default: false },
+      trusted: { type: 'boolean', default: false },
+      'skip-ci': { type: 'boolean', default: false },
+      reconcile: { type: 'boolean', default: false },
+      'resume-tail': { type: 'boolean', default: false },
+      target: { type: 'string' },
+      json: { type: 'boolean', default: false },
+      help: { type: 'boolean', default: false },
+      version: { type: 'boolean', default: false },
+    },
+  });
+
+  if (values.help) {
+    console.log('Usage: node scripts/release.mjs [--set-version X.Y.Z | --check [--trusted] | --publish [--direct | --trusted] | --reconcile [--target X.Y.Z] | --resume-tail --target X.Y.Z] [--skip-ci] [--json]');
+    console.log('Release als ein Dispatch: surface sync, preflight checks, staged publish, owner approval, tag AFTER the registry serves it.');
+    console.log('  --publish  stages the checked archive (npm stage publish, ADR-0018 route C), writes the proof and stops: the owner approves');
+    console.log('             the version on npmjs.com with 2FA, then `--resume-tail --target X.Y.Z` finishes tag, push, GitHub release and site.');
+    console.log('  --direct   with --publish only: the pre-2027 route (npm publish with a Bypass-2FA token, tail in the same run).');
+    console.log('  --trusted  with --publish (ADR-0018 route B): no local npm publish; proof, tag and push, then the GitHub workflow');
+    console.log('             publishes in environment npm-publish; waits for the provenance + content receipt (SO_RELEASE_TRUSTED_WAIT_MS).');
+    console.log('             After a confirmed receipt, checks Verify public npm install every 20 s for up to 15 min.');
+    console.log('             With --check: the route-B preflight only, incl. the publish-route row with the trusted-publisher evidence; publishes nothing.');
+    console.log('             Refused with --direct, --reconcile, --resume-tail, --set-version and alone.');
+    console.log('  Receipt boundary (--direct): before the confirmed npm receipt, failure aborts; after it, never rerun --publish.');
+    console.log('  Tag/push failure after receipt skips GitHub-release and site phases and returns reconciliation guidance.');
+    console.log('  --skip-ci  allowed with --check only; REFUSED with --publish (it verifies nothing).');
+    console.log('  --reconcile  read-only resume after an accepted upload: proof -> available -> installable. Never publishes, tags or pushes.');
+    console.log('               --target defaults to package.json version; needs .orchestrator/runtime/release-<target>.json from --publish.');
+    console.log('  --resume-tail  finish an interrupted publish tail with one command: --reconcile first (no tag unless the registry serves the');
+    console.log('               proof\'s integrity), tag the commit recorded in the proof (an existing tag must point at it), push the tag where');
+    console.log('               missing, GitHub release, live site. Idempotent; never publishes.');
+    console.log('               Trusted proof (route B): the receipt binds to handedOff.commit (under mirror: curated its Source-Commit must be the');
+    console.log('               release commit, else refused before any push); a pending receipt still pushes missing tags (the GitHub tag starts');
+    console.log('               the workflow); GitHub release and site wait for a confirmed receipt.');
+    console.log(`               Every tail push/fetch runs in its own process group with a ${TAIL_CHILD_TIMEOUT_MS / 1000} s deadline; its PID is printed on stderr.`);
+    console.log('Exit codes: 0 success (--trusted: install job passed; --reconcile: installable, superseded or trusted receipt confirmed; --resume-tail: tail complete), 1 preflight/check failure, post-publish reconciliation, a measured non-successful --trusted install-check, --reconcile pending/failed/proof missing or --resume-tail incomplete/refused, 2 system/usage error before any npm receipt, OR an unconfirmed --publish stage (npm exited 0 but no receipt could be read: the version MAY be staged and the proof is written with staged.confirmed=false; check npm stage list, never rerun --publish), 3 published, install job not measured — look at the Actions URL; never rerun --publish.');
+    return 0;
+  }
+
+  const flags = validateFlags(values);
+  if (!flags.ok) {
+    console.error(flags.message);
+    return flags.code;
+  }
+  if (values.version) {
+    console.log(readPackageVersion(repoRootOf()));
+    return 0;
+  }
+
+  const repoRoot = repoRootOf();
+
+  if (values.reconcile) {
+    // Deliberately before and apart from the --check/--publish branch: no
+    // preflight, no withCheckedPackage (no pack of the repo), no publisher.
+    const target = values.target ?? readPackageVersion(repoRoot);
+    if (!/^\d+\.\d+\.\d+$/.test(target)) {
+      console.error(`invalid package.json version for --reconcile: ${target} (expected X.Y.Z; pass --target)`);
+      return 2;
+    }
+    const proofRead = readReleaseProof(repoRoot, target);
+    if (proofRead.ok && proofRead.proof.route === 'trusted-publishing') {
+      return printReconcileResult(await reconcileTrustedRelease(repoRoot, target), { json: values.json });
+    }
+    return printReconcileResult(reconcileRelease(repoRoot, target), { json: values.json });
+  }
+
+  if (values['resume-tail']) {
+    // Like --reconcile: no preflight, no pack, no publisher. validateFlags
+    // already required --target.
+    return printResumeTailOutcome(await resumeReleaseTail(repoRoot, values.target), { json: values.json });
+  }
+
+  if (values['set-version']) {
+    const target = values['set-version'];
+    if (!/^\d+\.\d+\.\d+$/.test(target)) {
+      console.error(`invalid version: ${target}`);
+      return 2;
+    }
+    const changed = applyVersion(repoRoot, target);
+    mustRun('npm', ['install', '--package-lock-only', '--ignore-scripts', '--no-audit', '--no-fund'], { cwd: repoRoot });
+
+    // Re-stamp the site's measured census (#1043, second drift level). The
+    // version literals above are only half the problem: the "Measured in this
+    // repository" block was typed once on 2026-08-03 and 5 of its 8 figures
+    // were wrong twelve days later. Release time is the RIGHT moment and CI is
+    // the wrong one — `sessions` and `learnings` grow on every session, so a
+    // pipeline gate on them would be permanently red. The page discloses that
+    // by stamping the date and SHA it was counted at, which this refreshes too.
+    mustRun('node', ['scripts/site-numbers.mjs', '--write'], { cwd: repoRoot });
+
+    console.log(`Rewrote ${changed.length} surface file(s) to ${target}:`);
+    for (const f of changed) console.log(`  ${f}`);
+    console.log('  package-lock.json (via npm install --package-lock-only)');
+    console.log('  site/ page cells + site/_census.json + site/sitemap.xml lastmod re-stamped (scripts/site-numbers.mjs --write) — commit ALL of them');
+    console.log('\nEditorial TODOs (enforced by --check):');
+    console.log(`  1. CHANGELOG.md — write the "## [${target}] - YYYY-MM-DD" entry, fold [Unreleased].`);
+    return 0;
+  }
+
+  if (values.check || values.publish) {
+    const target = readPackageVersion(repoRoot);
+    const mode = resolvePublishMode(values);
+    const { checks, head, curated } = await preflight(repoRoot, target, { skipCi: values['skip-ci'], mode });
+    const checked = await withCheckedPackage(repoRoot, async (artifact) => {
+      checks.push({ name: 'leakage-gate', ok: true, detail: 'packed filenames and required owner-policy content scan verified' });
+      const ok = printChecks(checks, values.json && !values.publish, target);
+      if (!ok) return 1;
+      if (!values.publish) return 0;
+      if (mode === 'stage') {
+        // ADR-0018 route C: stage, prove, stop. The tail belongs to
+        // --resume-tail after the owner's approval; no tag or push here.
+        console.log(`\nStaging ${PACKAGE_NAME}@${target} (npm stage publish; the owner approves it on npmjs.com) ...`);
+        return printStagedOutcome(stagePublish(repoRoot, target, { artifact }), target);
+      }
+      if (mode === 'trusted') {
+        console.log(`\nHanding ${PACKAGE_NAME}@${target} to the GitHub workflow (trusted publishing, ADR-0018 route B) ...`);
+        console.log('  Tag and push happen now; the receipt wait may take many minutes; do not kill it mid-run.');
+        return printTrustedOutcome(await runTrustedPublishRelease(repoRoot, target, { artifact, expectedHead: head }), target);
+      }
+      console.log(`\nPublishing ${PACKAGE_NAME}@${target} ...`);
+      console.log('  Publish and post-receipt reconciliation may take several minutes; do not kill it mid-run.');
+      const outcome = await runPublishRelease(repoRoot, target, {
+        publishImpl: (root, version) => publish(root, version, { artifact }),
+        expectedHead: head,
+      });
+      return printPublishOutcome(outcome, target);
+    }, { requireConfidentialNames: curated });
+    if (!checked.ok) {
+      checks.push({ name: 'leakage-gate', ok: false, detail: checked.detail });
+      printChecks(checks, values.json && !values.publish, target);
+      return 1;
+    }
+    return checked.value;
+  }
+
+  console.error('Nothing to do — pass --check, --publish, --reconcile, --resume-tail, or --set-version X.Y.Z (see --help).');
+  return 2;
+}
+
+function repoRootOf() {
+  const res = spawnSync('git', ['rev-parse', '--show-toplevel'], SPAWN_OPTS);
+  if (res.status !== 0) throw new Error('not inside a git repository');
+  return res.stdout.trim();
+}
+
+const isMain = (() => {
+  try {
+    return realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
+})();
+
+if (isMain) {
+  main().then(
+    (code) => process.exit(code),
+    (err) => {
+      console.error(`release.mjs: ${err.message}`);
+      process.exit(2);
+    },
+  );
+}

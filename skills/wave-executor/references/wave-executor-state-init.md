@@ -1,0 +1,115 @@
+# Wave Executor — STATE.md Initialization (Pre-Wave 1b)
+
+> Reference of the wave-executor skill, split out of `SKILL.md` (#1246). Body moved **byte-identical**; since then only the `<state-dir>` resolution at the top of § Pre-Wave 1b, in the YAML template and at the `mkdir` line was added (#1790), plus the Outcome slot paragraph (#1824).
+> **Sibling-file paths inside this body are relative to the parent directory, not to `references/`**: `SKILL.md` → `../SKILL.md`, `wave-loop.md` → `../wave-loop.md`, `circuit-breaker.md` → `../circuit-breaker.md`. They were deliberately NOT rewritten, so the moved bytes stay verifiable against the pre-split file.
+> Read at Pre-Wave 1b, before dispatching Wave 1 — see `../SKILL.md` § Pre-Wave 1b for the pointer.
+
+## Pre-Wave 1b: Initialize STATE.md
+
+Check [User-authorized housekeeping execution deviation](../../session-plan/SKILL.md#user-authorized-housekeeping-execution-deviation) before applying a default shape or mismatch prompt. When active, use the actual agreed plan's wave count and preserve its authorization record; the resolver's one-wave housekeeping result remains the audited default.
+
+> Skip this section entirely if `persistence: false`.
+
+Before dispatching Wave 1, write `<state-dir>/STATE.md` with YAML frontmatter and Markdown body. `<state-dir>` is the platform state directory `resolveStateDir()` returns (`scripts/lib/platform.mjs`): `.claude/` on Claude Code, `.codex/` on Codex CLI, `.cursor/` on Cursor, `.pi/` on Pi — so the file is e.g. `<repoRoot>/.claude/STATE.md`. Never `.orchestrator/`: that directory holds the session lock, `current-session.json` and metrics, not STATE.md (#1790).
+
+```yaml
+# file: <repoRoot>/.claude/STATE.md on Claude Code (resolveStateDir()) — never .orchestrator/STATE.md (#1790)
+---
+schema-version: 1
+session-type: feature|deep|housekeeping
+branch: <current branch>
+issues: [<issue numbers from plan>]
+session: <semantic session label, e.g. main-2026-01-01-deep-1>
+session-id: <raw session_id from .orchestrator/session.lock — OMIT the key when no lock exists>
+started_at: <resolveSessionStartedAt({ repoRoot }) — the lock's own started_at; the writer's clock only where the command itself falls back (see below), NEVER a new Date() you type yourself (#1368)>
+session-start-ref: <full sha from git -C <session checkout (repoRoot)> rev-parse HEAD at init (#1652)>
+status: active
+current-wave: 0
+total-waves: <from session plan>
+---
+```
+
+```markdown
+## Current Wave
+
+Wave 0 — Initializing
+
+## Wave History
+
+(none yet)
+
+## Deviations
+
+(none yet)
+```
+
+**Outcome slot (#1824).** When the plan's `### Execution Config` carries an `Outcome:` line other than `none`, the same init write adds the three optional keys `outcome-statement`, `outcome-observable`, `outcome-source` — through `setOutcome(contents, { statement, observable, source })` from `${PLUGIN_ROOT}/scripts/lib/state-md.mjs`, never typed as prose frontmatter (it validates `source` against the closed set and refuses blank values). `Outcome: none` or no line → write nothing; absence is the contract. session-end reads the keys back with `readOutcome` for the summary and `scripts/emit-session.mjs` for the record.
+
+**`started_at` and `session-id` are SOURCED, not typed (#1368).** Read both from the live session-lock before writing — never from the clock, and never from memory:
+
+```bash
+node --input-type=module -e "
+import { resolveSessionStartedAt, resolveSessionIds } from '${PLUGIN_ROOT}/scripts/lib/state-md.mjs';
+import { resolveOwnLockRootFor } from '${PLUGIN_ROOT}/scripts/lib/own-lock-root.mjs';
+import { readProcessLocalSessionIds } from '${PLUGIN_ROOT}/scripts/lib/session-identity/own-session.mjs';
+const [sessionId = null] = readProcessLocalSessionIds();
+const repoRoot = resolveOwnLockRootFor({ sessionId }).root;
+console.log(JSON.stringify({ started_at: resolveSessionStartedAt({ repoRoot }), ...resolveSessionIds({ repoRoot }) }));
+"
+```
+
+The modules load from `${PLUGIN_ROOT}`, never relative to the shell's cwd: a cwd-relative import resolved against whatever checkout the shell stood in — a consumer repo has no `scripts/lib/`, and a main checkout behind the plugin ran an older resolver.
+
+`resolveSessionStartedAt()` returns `.orchestrator/session.lock`'s own `started_at`, which the `orchestrator.session.lock.acquired` and `orchestrator.session.started` events agree with to the millisecond; it falls back to the current time only when no lock exists (`persistence: false`, or the acquire failed) or when the lock is provably a PEER's (#1730 Pkt 8). Writing `new Date()` here instead put STATE.md 48 minutes ahead of the lock (measured 2026-09-13) and made `/close`'s #429 pre-check unable to join STATE.md to its own ledger record. The lock is read at the root `resolveOwnLockRootFor()` (`scripts/lib/own-lock-root.mjs`) finds for this process's own raw id, not at the cwd: a worktree session keeps its lock in the worktree while its shell may stand in the main checkout, where another session's lock — the Lead's — can sit (#1730). Without an own id the resolver answers the `.git` ancestor of the cwd, the checkout the cwd stands in.
+
+`session-id` is the raw/native harness id (`resolveSessionIds().session_id`), `session` the semantic label (`.semantic_session_id`). Both are OPTIONAL (`schema-version` stays `1`): when the command yields `null`, OMIT the key entirely — never write a placeholder. **The guard is in the command, not in you (#1663):** the lock is repo-global and can name a PEER (a lost acquire race, or a pre-#1641 lock without `claude_pid` that stays until its TTL), so `resolveSessionIds()` returns `session_id` only when the lock's raw id is one of `readProcessLocalSessionIds()` (this process's own native id) and `null` otherwise; a provably foreign lock also nulls `semantic_session_id`. A foreign lock id therefore means the key is OMITTED — never copy it from the lock by hand, because `/close` compares STATE.md `session-id` against the own native id (#1661) and a peer's id would make this session's own STATE.md read `foreign`. Neither field grants lock or registry ownership; see `skills/_shared/state-ownership.md`.
+
+`session-start-ref` is the commit the session started on, in the session's OWN checkout (#1652): `git -C <repoRoot> rev-parse HEAD`, full SHA — the tree this STATE.md lives in, because every consumer below runs `<ref>..HEAD` there. In a promoted or EnterWorktree session that tree is the WORKTREE (its STATE.md lives there), never the main checkout it came from. A ref taken from ANOTHER tree is wrong in both directions: a foreign worktree's HEAD or a stale main checkout's HEAD turns the two-dot diff into a diff between two unrelated trees. Commits a coordinator (or its subagents) makes in additional worktrees of its own (coordinator in the main checkout, branches in `_wt/…`) are NOT covered by this single ref; they are attributed separately (#1659): `hooks/pre-bash-staging-fence.mjs` records `(tree, start_ref)` as an `orchestrator.session.work_tree` event before every `git commit`, and `node scripts/session-commit-files.mjs [--session-id <raw-id>] [--json]` lists the files per tree and their union, each tree diffed only inside itself. Remaining limits: commits nested in `bash -c "…"`, `cd` operands needing shell expansion, commits after `pushd`/`popd`/`chdir`/`builtin cd` in the same command and the first commit on an unborn HEAD are not recorded; subshell scope is not modelled, so in `(cd x && git commit); git commit` the second commit is attributed to `x` as well; a commit inside `$( … )` or backticks is recorded for the start directory only when no outer statement changed directory, otherwise not at all (#1670); `SO_DISABLED_HOOKS=pre-bash-staging-fence` disables recording; Codex sessions record nothing (the fence is not in `hooks/hooks-codex.json`); two sessions committing in the same tree after one's start ref cannot be separated by a ref diff. Never substitute `origin/main` or another upstream ref: the consumers run the two-dot tree diff `git diff <ref>..HEAD`, which against a ref that is not an ancestor of HEAD lists the upstream's foreign files too. `scripts/emit-session.mjs` derives the ledger's `session_start_ref` from it and, when the key is absent, falls back to the `head_sha` of this session's own `orchestrator.session.started` event (#1443) — omitted with a WARN when that event measured `behind > 0`, because after a pull `<head_sha>..HEAD` would include the pulled-in upstream commits (#1668); when the session committed in more than its own tree, the record also carries `session_work_trees` (`[{ tree, start_ref }]`, #1659). `hooks/pre-task-scope-disjoint.mjs` no longer reads it: since #1485 its stale-worktree check on `isolation: "worktree"` dispatches compares HEAD against the base the harness actually branches from (`origin/HEAD` unless `worktree.baseRef: "head"`, then HEAD), and DENIES a measured mismatch. The other reader is `scripts/lib/scope-baseline.mjs` (`readBaseline()` reads the key into `sessionStartRef`, `computeDrift()` consumes it): with the key present its numerator is the union of the committed `<ref>..HEAD` diff, the working tree vs HEAD (staged + unstaged) and the untracked files (#1027 Pkt 2), all in the coordinator's own checkout, plus (#1659) the files committed in the session's OTHER own work trees of the same repository, read from its `orchestrator.session.work_tree` records and each diffed `<start_ref>..HEAD` only inside its own tree (the own tree keeps the STATE.md ref; trees of another repository are left out), reported in the additive result field `otherWorkTrees: { counted, skipped, otherRepo, malformed, invalid }`, present only when at least one other own tree is recorded; absent, it resolves a base itself (the preferred remote's default branch, else a local `main`/`master`; nothing resolvable skips with `no-baseline-ref`); a present-but-dead ref skips with `unresolvable-ref`, and so does any failed, oversized or timed-out numerator query. The three own-checkout git queries run with `cwd` = repoRoot, so they never read an agent worktree's contents (the worktree directory itself is excluded from the untracked list); another tree contributes only its committed diff, never its working tree or untracked files. The ref bounds only the committed source, which gives the ratio two edges in opposite directions. Under-report: this template takes HEAD at wave-executor init rather than at session start, so files changed by a commit landed between session start and wave-executor init are missing from the committed source. Over-report: the working-tree and untracked sources are not tied to the ref at all, so files already dirty when the session started and a same-checkout peer session's files count as drift and can raise a false WARN. That second edge is a named ceiling in `computeDrift()`'s JSDoc; removing it needs a start-dirty snapshot persisted at freeze time, a storage change outside this template.
+
+Create the `<state-dir>` directory if needed (`mkdir -p <state-dir>`, e.g. `mkdir -p <repoRoot>/.claude` on Claude Code — the `resolveStateDir()` directory, never `.orchestrator/`, #1790) before writing. This file is the persistent state record — other skills and resumed sessions read it.
+
+**Then VALIDATE `total-waves` against the resolved shape — do not skip this.** A plan whose wave count the shape does not produce must never be dispatched silently:
+
+```bash
+node scripts/session-shape.mjs --repo-root "$PWD" \
+  --session-type <session-type> [--profile <session-profile>] [--known-scope true|false] \
+  --no-event | jq .totalWaves
+```
+
+`--no-event` is used HERE because the plan-time run already recorded `orchestrator.session.shape_resolved` — this is a re-read, not a second resolution. Compare the printed number with the plan's wave count (the value just written to `total-waves`):
+
+- **User-authorized housekeeping deviation active** → before the first dispatch, persist the plan's execution-deviation record in STATE.md `## Deviations` via `appendDeviationOnDisk()` from `scripts/lib/state-md.mjs`, including the user request, default shape and actual plan/count. Validate `total-waves` against the actual plan, then continue with its normal scoped dispatch and review flow. Apply this branch even if both counts are one but the plan dispatches agents. Do not ask again to approve the same already-authorized shape, and do not rewrite the default-shape event to claim it describes the actual plan.
+- **No authorized deviation and equal** → continue to Wave 1.
+- **No authorized deviation and mismatch** → STOP. Surface it via `AskUserQuestion` per `.claude/rules/ask-via-tool.md`, with the shape's number and the plan's number both in the option descriptions: **re-plan to the shape (Recommended)** — rebuild the wave plan at the shape's wave count — versus **proceed with a logged Deviation**, which requires appending the divergence to STATE.md `## Deviations` (`appendDeviationOnDisk()` from `scripts/lib/state-md.mjs`) before the first dispatch.
+
+#### Pre-Wave 1b Extension: Docs Tasks Persistence (A3 / #230)
+
+After writing the base STATE.md frontmatter above, conditionally persist the docs tasks block emitted by session-plan:
+
+**Condition:** BOTH of the following must be true:
+1. The session plan contains a `### Docs Tasks (machine-readable)` section with a YAML code block.
+2. `$CONFIG."docs-orchestrator".enabled` is `true`.
+
+If either condition is false → omit the `docs-tasks` field entirely. Do NOT write an empty key (`docs-tasks: []`). Absence means "no docs tasks planned this session" — downstream consumers (session-end Phase 3.2) treat absence the same as an empty list.
+
+When the condition is met, parse the YAML block from the session plan's `### Docs Tasks (machine-readable)` section and append the following field to the STATE.md YAML frontmatter (alongside the base fields above):
+
+```yaml
+docs-tasks:
+  - id: <task id from plan>
+    audience: <user|dev|vault>
+    target-pattern: <glob pattern from plan>
+    rationale: <rationale string from plan>
+    wave: <wave number the task is assigned to>
+    status: planned
+```
+
+Each entry's `status` is initialized to `planned`. session-end Phase 3.2 (Docs Verify) writes the terminal value per task: `ok` (diff is substantive), `partial` (diff region contains `<!-- REVIEW: source needed -->` markers), or `gap` (no matching diff). wave-executor does NOT perform intermediate status updates — `planned` remains until session-end runs.
+
+> **Schema note:** `schema-version: 1` now includes the optional `docs-tasks` array. The field is backwards-compatible — its absence is a valid schema-version-1 STATE.md meaning "no docs tasks planned". Readers MUST treat a missing `docs-tasks` key identically to `docs-tasks: []`.
+
+> **Ownership clarification:** session-plan does NOT write STATE.md directly. The wave-executor owns ALL STATE.md writes — initialization here (Pre-Wave 1b) is the canonical write point for `docs-tasks`. session-plan only emits the source `### Docs Tasks (machine-readable)` block for the coordinator to consume. See `skills/_shared/state-ownership.md` for the full ownership matrix.
+
+> **Consumer cross-reference:** session-end reads `STATE.md` frontmatter's `docs-tasks` field (if present) during Phase 3.2 Docs Verify — see `skills/session-end/SKILL.md`. The field is also readable by the docs-writer agent if it needs to know which tasks were planned for the current session.
+
+> **Ownership:** STATE.md is owned by the wave-executor. Only the wave-executor writes to it (initialization + post-wave updates). session-end reads it for metrics extraction and sets `status: completed`. session-start reads it only for continuity checks (Phase 0.5). No other skill should write to STATE.md.

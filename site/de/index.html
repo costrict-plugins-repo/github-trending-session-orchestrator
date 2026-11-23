@@ -1,0 +1,334 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Session Orchestrator | Plugin für Claude Code, Codex CLI und Cursor</title>
+<meta name="description" content="Plane deine Session in Claude Code, Codex CLI, Cursor oder Pi. Das kostenlose Plugin prüft jede Runde mit deinen Tests und hält fest, wo du beim nächsten Mal weitermachst.">
+<link rel="canonical" href="https://session-orchestrator.com/de">
+<link rel="alternate" hreflang="en" href="https://session-orchestrator.com/">
+<link rel="alternate" hreflang="de" href="https://session-orchestrator.com/de">
+<link rel="alternate" hreflang="x-default" href="https://session-orchestrator.com/">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Session Orchestrator">
+<meta property="og:url" content="https://session-orchestrator.com/de">
+<meta property="og:title" content="Session Orchestrator | Plugin für Claude Code, Codex CLI und Cursor">
+<meta property="og:description" content="Plane deine Session in Claude Code, Codex CLI, Cursor oder Pi. Das kostenlose Plugin prüft jede Runde mit deinen Tests und hält fest, wo du beim nächsten Mal weitermachst.">
+<meta property="og:image" content="https://session-orchestrator.com/de/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Session Orchestrator: Dein KI-Agent, mit Plan und Gedächtnis. Die Befehle /session, /go und /close neben einer illustrierten Agentenwerkstatt unter menschlicher Leitung.">
+<meta property="og:locale" content="de_DE">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Session Orchestrator | Plugin für Claude Code, Codex CLI und Cursor">
+<meta name="twitter:description" content="Plane deine Session in Claude Code, Codex CLI, Cursor oder Pi. Das kostenlose Plugin prüft jede Runde mit deinen Tests und hält fest, wo du beim nächsten Mal weitermachst.">
+<meta name="twitter:image" content="https://session-orchestrator.com/de/og.png">
+<meta name="twitter:image:alt" content="Session Orchestrator: Dein KI-Agent, mit Plan und Gedächtnis. Die Befehle /session, /go und /close neben einer illustrierten Agentenwerkstatt unter menschlicher Leitung.">
+
+<!-- Entity consolidation (issue #1046): the site, the repository, the package
+     and the person who maintains them are one entity with stable @id anchors.
+     No rating, no review, no invented field: none of those would be true.
+     softwareVersion is deliberately absent: the version literal lives in the
+     markup under data-metric="version" and is written by one generator only. -->
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@graph": [
+    {
+      "@type": "WebPage",
+      "@id": "https://session-orchestrator.com/de",
+      "url": "https://session-orchestrator.com/de",
+      "name": "Session Orchestrator | Plugin für Claude Code, Codex CLI und Cursor",
+      "inLanguage": "de",
+      "isPartOf": {
+        "@id": "https://session-orchestrator.com/#website"
+      },
+      "breadcrumb": {
+        "@id": "https://session-orchestrator.com/de#breadcrumb"
+      }
+    },
+    {
+      "@type": "BreadcrumbList",
+      "@id": "https://session-orchestrator.com/de#breadcrumb",
+      "itemListElement": [
+        {
+          "@type": "ListItem",
+          "position": 1,
+          "name": "Session Orchestrator",
+          "item": "https://session-orchestrator.com/"
+        },
+        {
+          "@type": "ListItem",
+          "position": 2,
+          "name": "Deutsch",
+          "item": "https://session-orchestrator.com/de"
+        }
+      ]
+    },
+    {
+      "@type": "WebSite",
+      "@id": "https://session-orchestrator.com/#website",
+      "url": "https://session-orchestrator.com/",
+      "name": "Session Orchestrator",
+      "alternateName": "session-orchestrator",
+      "inLanguage": [
+        "en",
+        "de"
+      ],
+      "publisher": {
+        "@id": "https://www.gotzendorfer.at/#person"
+      },
+      "about": {
+        "@id": "https://session-orchestrator.com/#software"
+      }
+    },
+    {
+      "@type": "SoftwareApplication",
+      "@id": "https://session-orchestrator.com/#software",
+      "name": "Session Orchestrator",
+      "url": "https://session-orchestrator.com/",
+      "applicationCategory": "DeveloperApplication",
+      "operatingSystem": "macOS, Linux",
+      "description": "Plane deine Session in Claude Code, Codex CLI, Cursor oder Pi. Das kostenlose Plugin prüft jede Runde mit deinen Tests und hält fest, wo du beim nächsten Mal weitermachst.",
+      "license": "https://opensource.org/licenses/MIT",
+      "codeRepository": "https://github.com/Kanevry/session-orchestrator",
+      "downloadUrl": "https://www.npmjs.com/package/session-orchestrator",
+      "sameAs": [
+        "https://github.com/Kanevry/session-orchestrator",
+        "https://www.npmjs.com/package/session-orchestrator"
+      ],
+      "author": {
+        "@id": "https://www.gotzendorfer.at/#person"
+      },
+      "publisher": {
+        "@id": "https://www.gotzendorfer.at/#person"
+      },
+      "isAccessibleForFree": true,
+      "offers": {
+        "@type": "Offer",
+        "price": 0,
+        "priceCurrency": "USD"
+      },
+      "mainEntityOfPage": {
+        "@id": "https://session-orchestrator.com/de"
+      }
+    },
+    {
+      "@type": "Person",
+      "@id": "https://www.gotzendorfer.at/#person",
+      "name": "Bernhard Götzendorfer",
+      "url": "https://www.gotzendorfer.at",
+      "sameAs": [
+        "https://github.com/Kanevry"
+      ]
+    }
+  ]
+}
+</script>
+
+<link rel="alternate" type="text/plain" href="/llms.txt" title="llms.txt">
+<link rel="preload" as="font" type="font/woff2" href="/fonts/space-grotesk-latin.woff2" crossorigin>
+<link rel="preload" as="font" type="font/woff2" href="/fonts/source-sans-3-var.woff2" crossorigin>
+<link rel="preload" as="font" type="font/woff2" href="/fonts/ibm-plex-mono-400.woff2" crossorigin>
+<script src="/assets/thread.js?v=20261113"></script>
+<link rel="stylesheet" href="/assets/site.css?v=20261118">
+</head>
+<body class="home">
+<a class="skip" href="#main">Zum Inhalt</a>
+<header class="top">
+  <div class="wrap">
+    <a class="brand" href="/de"><span class="brand-mark" aria-hidden="true"></span><span>session orchestrator</span><span class="brand-version">v<span class="num" data-metric="version">5.21.2</span></span></a>
+    <nav class="nav" aria-label="Hauptnavigation"><a href="/guide#how-it-works" hreflang="en">Ablauf</a><a href="/de/commands">Befehle</a><a href="/guide" hreflang="en">Anleitung (Englisch)</a><a href="/lead" hreflang="en">Lead</a><a href="https://github.com/Kanevry/session-orchestrator">GitHub</a></nav>
+    <p class="lang"><a href="/" lang="en">EN</a><a href="/de" aria-current="page" lang="de">DE</a></p>
+    <details class="nav-menu"><summary>Menü</summary><nav class="nav" aria-label="Mobile Navigation"><a href="/guide#how-it-works" hreflang="en">Ablauf</a><a href="/de/commands">Befehle</a><a href="/guide" hreflang="en">Anleitung (Englisch)</a><a href="/lead" hreflang="en">Lead</a><a href="https://github.com/Kanevry/session-orchestrator">GitHub</a><a class="menu-de" href="/" lang="en" hreflang="en">English</a></nav></details>
+    <a class="top-install" href="#install">Installieren</a>
+  </div>
+</header>
+
+<main id="main">
+  <svg class="thread-svg" id="thread" aria-hidden="true" focusable="false"></svg>
+
+  <section class="hero" id="top" aria-labelledby="h1" data-group="hero">
+    <div class="wrap hero-top">
+      <h1 class="h1" id="h1"><span><span class="nw">Dein KI-Agent,</span> <span class="nw">mit Plan</span></span> <span>und Gedächtnis.</span></h1>
+      <div class="act">
+        <p class="what">Dein Coding-Tool schreibt den Code: Claude Code, Codex, Cursor oder Pi. <b>Dieses kostenlose Plugin hält die Arbeit in Ordnung.</b></p>
+        <a class="h-btn" href="#install">Plugin installieren <svg viewBox="0 0 14 14" aria-hidden="true" focusable="false"><path d="M2.5 5l4.5 4.5L11.5 5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></a>
+      </div>
+    </div>
+
+    <p class="sr">Du tippst drei Befehle entlang einer Linie. /session: Du sagst, was du willst, und der Plan ist erst eine gestrichelte Linie. /go: Es setzt erst nach deinem Ja um; ab dann ist die Linie durchgezogen. Es arbeitet in Runden, drei für ein Feature, geprüft mit deinen Tests. /close: Es hält fest, was für das nächste Mal erledigt ist.</p>
+    <div class="zone" id="zone">
+      <div class="st st-ask"><span class="dot run" data-t="0.08"></span><p class="lab lab-ask run" data-t="0.1"><code class="h-cmd">/session</code>Sag, was<br> du willst.</p></div>
+      <div class="st st-yes" id="st-yes">
+        <button class="dot dot-yes run" id="yes" type="button" data-t="0.7" aria-expanded="true" aria-controls="yes-card" aria-label="Echte Zeile aus einem Lauf: das Ende von /session"></button>
+        <p class="lab lab-yes run" data-t="0.74"><code class="h-cmd">/go</code>Es setzt erst nach<br> deinem Ja um.</p>
+        <span class="yes-card" id="yes-card" role="note"><span class="ck">Echter Lauf, gekürzt</span><code>Ready to execute? Use /go to begin&nbsp;…</code></span>
+      </div>
+      <div class="st st-rounds" id="rounds-st">
+        <p class="lab lab-rounds run" data-t="1.0">Runden, geprüft mit deinen Tests.</p>
+      </div>
+      <div class="st st-done"><span class="dot dot-done run" data-t="1.88"></span><p class="lab lab-done run" data-t="1.9"><code class="h-cmd">/close</code>Fürs nächste<br> Mal notiert.</p></div>
+    </div>
+  </section>
+
+  <section class="h-sec wrap" id="how" aria-labelledby="how-h" data-group="s1">
+    <div class="sec-head">
+      <h2 class="h2" id="how-h">Zwischen deinem Ja und fertig.</h2>
+      <p class="h-lede">Jede Schleife ist eine Runde: Agents setzen um, deine Tests laufen zwischendurch. <code>/close</code> führt die volle Prüfung aus.</p>
+    </div>
+    <div class="jobs">
+      <div class="job">
+        <div><p class="job-k">Aufräumen<code>/session housekeeping</code></p><p class="job-n">Eine Runde, direkt erledigt.</p></div>
+        <div class="job-line" data-n="1"></div>
+      </div>
+      <div class="job">
+        <div><span class="tag">Hier anfangen</span><p class="job-k">Etwas bauen<code>/session feature</code></p><p class="job-n">Drei Runden.</p></div>
+        <div class="job-line" data-n="3" data-real="1" data-fix="1">
+          <div class="callout" id="callout">
+            <span class="ck">Zweite Runde des echten Laufs und der Rückweg</span>
+            <code>The weakness is in the tests: two of the 4 new tests do not catch real breakages, <span class="cutm">…</span></code>
+            <code><strong>Fix pass:</strong> done. Three tests were added, <span class="cutm">…</span></code>
+            <code><strong>Tests:</strong> 10 passed, 0 failed <span class="cutm">…</span></code>
+          </div>
+        </div>
+      </div>
+      <div class="job">
+        <div><p class="job-k">Etwas Großes<code>/session deep</code></p><p class="job-n">Vier Runden, oder fünf, wenn es sich erst umsieht, ohne etwas zu ändern.</p></div>
+        <div class="job-line" data-n="5" data-ghost="1"></div>
+      </div>
+    </div>
+    <div class="cap-row"><p class="cap">Echte Zeilen aus einem Lauf an einem Demo-Projekt, gekürzt. Claude Code, Plugin 5.19.0, 13. Nov. 2026.</p><a class="all" href="/de/commands">Alle Befehle</a></div><!-- site-numbers:historical: the version of that one dated run, not the current release -->
+  </section>
+
+  <section class="h-sec wrap" id="next" aria-labelledby="next-h" data-group="s2">
+    <div class="sec-head">
+      <h2 class="h2" id="next-h">Beim nächsten Mal geht es weiter.</h2>
+      <p class="h-lede">Sein Gedächtnis ist reiner Text in deinem Projekt: was erledigt ist, was als Nächstes ansteht und die Regeln, denen du zugestimmt hast. <code>/close</code> hinterlässt den Faden dort, wo deine nächste <code>/session</code> ihn aufnimmt.</p>
+    </div>
+    <div class="h-proof" id="proof">
+      <div class="said">
+        <p class="p-k">Die letzten Zeilen von <code>/close</code></p>
+        <p class="mono"><strong>Next session</strong><br>Recommended mode is <code>feature</code>. The natural next step is<br class="wide"> <mark id="from">the date filter from <code>ISSUES.md</code></mark><span id="comma">,</span><br class="wide"> together with empty cells for missing fields in the export.</p>
+      </div>
+      <div class="file" id="file">
+        <p class="f-name">ISSUES.md<span>nach dem Lauf</span></p>
+        <div class="fl"><i>1</i><span class="k"># Backlog</span></div>
+        <div class="fl"><i>2</i><span></span></div>
+        <div class="fl"><i>3</i><span><mark id="to">- Date filter for the order list (from/to)</mark></span></div>
+        <div class="fl cutl"><i></i><span></span></div>
+        <div class="fl"><i>7</i><span class="k">## Done</span></div>
+        <div class="fl"><i>8</i><span></span></div>
+        <div class="fl"><i>9</i><span>- CSV export of orders <span class="cutm">…</span></span></div>
+      </div>
+    </div>
+    <div class="lesson">
+      <p class="lesson-txt">Eine Lehre wird erst mit deinem Ja zur Regel.<span>In diesem Lauf kam keine Lehre dazu.</span></p>
+      <ol class="stops" id="stops">
+        <li class="stop"><span class="sdot"></span><code>/evolve</code> schlägt eine Lehre vor</li>
+        <li class="stop"><span class="sdot"></span>du behältst, korrigierst oder verwirfst sie</li>
+        <li class="stop"><span class="sdot"></span><code>/reconcile</code> schreibt die Regel</li>
+      </ol>
+    </div>
+    <p class="cap">Derselbe Lauf, gekürzt. Der Datumsfilter stand schon vorher auf der Liste; der Lauf hat den CSV-Export nach Done verschoben.</p>
+  </section>
+
+  <section class="h-sec wrap" id="install" aria-labelledby="install-h" data-group="s3">
+    <div class="sec-head">
+      <h2 class="h2" id="install-h">Installation für Claude Code, Codex CLI, Cursor und Pi.</h2>
+      <p class="h-lede">Die <a href="/de/commands">Befehlsübersicht</a> zeigt, wie jedes Tool einen Befehl ausführt.</p>
+    </div>
+    <div class="toolbox">
+      <div class="tool-list" data-tabs aria-label="Dein Coding-Tool">
+        <button class="tool" type="button" id="t-claude" aria-controls="p-claude"><b>Claude</b><small>Claude Code</small><span class="str"><svg viewBox="0 0 66 26" aria-hidden="true" focusable="false"><path d="M2 5H64M2 13H64M2 21H64"/></svg>nebeneinander</span></button>
+        <button class="tool" type="button" id="t-codex" aria-controls="p-codex"><b>Codex</b><small>Die Codex-App oder die CLI</small><span class="str"><svg viewBox="0 0 66 26" aria-hidden="true" focusable="false"><path d="M2 5H64M2 13H64M2 21H64"/></svg>nebeneinander</span></button>
+        <button class="tool" type="button" id="t-cursor" aria-controls="p-cursor"><b>Cursor</b><small>Cursor IDE</small><span class="str"><svg viewBox="0 0 66 26" aria-hidden="true" focusable="false"><path d="M2 17H14a6 6 0 1 1 6 0H28a6 6 0 1 1 6 0H42a6 6 0 1 1 6 0H64"/></svg>nacheinander</span></button>
+        <button class="tool" type="button" id="t-pi" aria-controls="p-pi"><b>Pi</b><small>Der Pi-Coding-Agent</small><span class="str"><svg viewBox="0 0 66 26" aria-hidden="true" focusable="false"><path d="M2 17H14a6 6 0 1 1 6 0H28a6 6 0 1 1 6 0H42a6 6 0 1 1 6 0H64"/></svg>nacheinander</span></button>
+      </div>
+      <div class="panel">
+        <p class="need">Du brauchst Node.js 24 oder neuer und ein Git-Repository.</p>
+        <div class="pane" id="p-claude">
+          <h3 class="pane-h">Claude Code</h3>
+          <p><strong>Tippe diese beiden Zeilen in den Claude-Code-Chat</strong>, nacheinander.</p>
+          <div class="cmd-row"><code><b>/plugin</b> marketplace add Kanevry/<span class="nw">session-orchestrator</span></code><button class="copy" type="button" data-copy="/plugin marketplace add Kanevry/session-orchestrator">Kopieren</button></div>
+          <div class="cmd-row"><code><b>/plugin</b> install <span class="nw">session-orchestrator</span><wbr>@kanevry</code><button class="copy" type="button" data-copy="/plugin install session-orchestrator@kanevry">Kopieren</button></div>
+          <p class="then">Einmal pro Projekt: <code class="i">/bootstrap <span class="nw">--fast</span> <span class="nw">--no-interview</span></code>. Danach gibt dir <code class="i">/session</code> einen Plan, und dein Code bleibt unverändert, bis du mit <code class="i">/go</code> antwortest.</p>
+        </div>
+        <div class="pane" id="p-codex">
+          <h3 class="pane-h">Codex</h3>
+          <p><strong>Einmal im Terminal.</strong> Braucht Codex CLI 0.160 oder neuer.</p>
+          <div class="cmd-row"><code>git clone https://github.com/Kanevry/session-orchestrator.git ~/Projects/session-orchestrator</code><button class="copy" type="button" data-copy="git clone https://github.com/Kanevry/session-orchestrator.git ~/Projects/session-orchestrator">Kopieren</button></div>
+          <div class="cmd-row"><code>cd ~/Projects/session-orchestrator &amp;&amp; npm install &amp;&amp; node scripts/codex-install.mjs</code><button class="copy" type="button" data-copy="cd ~/Projects/session-orchestrator &amp;&amp; npm install &amp;&amp; node scripts/codex-install.mjs">Kopieren</button></div>
+          <p class="then">Starte danach eine neue Codex-Aufgabe, tippe <code class="i">/hooks</code> und gib die Hooks von Session Orchestrator frei. Einmal pro Projekt: <code class="i">$session-orchestrator:bootstrap <span class="nw">--fast</span> <span class="nw">--no-interview</span></code>.</p>
+          <p>Im Codex-Chat, in der App oder der CLI, sind die Befehle Skills: <code class="i">$session-orchestrator:session</code>, <code class="i">$session-orchestrator:go</code>, <code class="i">$session-orchestrator:close</code>.</p>
+        </div>
+        <div class="pane" id="p-cursor">
+          <h3 class="pane-h">Cursor</h3>
+          <p><strong>Einmal im Terminal:</strong></p>
+          <div class="cmd-row"><code>git clone https://github.com/Kanevry/session-orchestrator.git</code><button class="copy" type="button" data-copy="git clone https://github.com/Kanevry/session-orchestrator.git">Kopieren</button></div>
+          <div class="cmd-row"><code>cd session-orchestrator &amp;&amp; npm install</code><button class="copy" type="button" data-copy="cd session-orchestrator &amp;&amp; npm install">Kopieren</button></div>
+          <div class="cmd-row"><code>node scripts/cursor-install.mjs /absolute/path/to/your/project</code><button class="copy" type="button" data-copy="node scripts/cursor-install.mjs /absolute/path/to/your/project">Kopieren</button></div>
+          <p class="then">Danach einmal <code class="i">/bootstrap</code> und dann <code class="i">/session</code> im Cursor-Chat.</p>
+        </div>
+        <div class="pane" id="p-pi">
+          <h3 class="pane-h">Pi</h3>
+          <p><strong>Einmal im Terminal:</strong></p>
+          <div class="cmd-row"><code>npm install -g --ignore-scripts @earendil-works/pi-coding-agent</code><button class="copy" type="button" data-copy="npm install -g --ignore-scripts @earendil-works/pi-coding-agent">Kopieren</button></div>
+          <div class="cmd-row"><code>pi install npm:session-orchestrator</code><button class="copy" type="button" data-copy="pi install npm:session-orchestrator">Kopieren</button></div>
+          <p class="then">Danach einmal <code class="i">/bootstrap</code> und dann <code class="i">/session</code> in Pi.</p>
+        </div>
+        <p class="more">Das Plugin ist kostenlos; die Kosten deines Coding-Tools bleiben davon unabhängig. <a href="/guide" hreflang="en">Schritt für Schritt in der Anleitung (Englisch)</a></p>
+      </div>
+    </div>
+  </section>
+
+  <section class="band wrap" id="lead" aria-labelledby="lead-h" data-group="lead">
+    <div class="band-in">
+      <div class="band-txt">
+        <h2 class="band-h" id="lead-h">Mehrere Sessions gleichzeitig? Nimm den Lead dazu.</h2>
+        <p>Eine <a href="/lead" hreflang="en">Lead-Session</a> behält sie im Blick und sammelt jede Frage, die dich braucht, in einer Inbox.</p>
+        <p class="opt">Optional. Session Orchestrator funktioniert auch ohne.</p>
+      </div>
+      <div class="band-fig" id="lead-fig" role="img" aria-label="Drei Session-Fäden laufen in einem Knoten zusammen: der Inbox."><span class="inbox-lab" aria-hidden="true">Inbox</span></div>
+    </div>
+  </section>
+
+  <section class="h-sec wrap made" id="made" aria-labelledby="made-h" data-group="s4">
+    <h2 class="h2 made-h" id="made-h">Von Bernhard Götzendorfer, der es für seine eigenen Projekte nutzt.</h2>
+    <p class="h-lede">Kostenlos · MIT-Lizenz · Kein Konto · Läuft auf deinem Rechner. Hier sind die Grenzen:</p>
+    <ul class="limits" id="limits">
+      <li>Es schreibt selbst keinen Code.<span>Das macht dein Coding-Tool.</span></li>
+      <li>Es trainiert kein Modell.</li>
+      <li>Windows: bestmöglich.<span>macOS und Linux werden vor jedem Release geprüft. Windows läuft, wird aber nicht vor jedem Release nativ abgenommen; gemeldete Fehler werden behoben.</span></li>
+    </ul>
+  </section>
+
+  <section class="h-sec wrap" id="next-step" aria-labelledby="next-step-h">
+    <div class="section-heading">
+      <h2 class="h2" id="next-step-h">Nächster Schritt</h2>
+    </div>
+    <div class="choose-grid">
+      <article class="choose-card">
+        <h3 class="choose-when"><a href="https://agenticbuilders.at/so?utm_source=session-orchestrator&amp;utm_medium=next-step">Den Einstiegskurs machen</a></h3>
+        <p class="choose-get">Der kostenlose Einstiegskurs begleitet dich durch deine erste geplante Session.</p>
+      </article>
+      <article class="choose-card">
+        <h3 class="choose-when"><a href="/lead" hreflang="en">Mehrere Sessions leiten</a></h3>
+        <p class="choose-get">Eine Lead-Session verteilt die Arbeit und sammelt die Fragen, die dein Ja brauchen.</p>
+      </article>
+      <article class="choose-card">
+        <h3 class="choose-when"><a href="https://www.gotzendorfer.at/de/angebot?utm_source=session-orchestrator&amp;utm_medium=next-step#umgebung">Das Plugin gemeinsam einrichten</a></h3>
+        <p class="choose-get">Der Autor richtet mit dir die Pipeline, die Regeln und die Grenzen in deinem Repository ein.</p>
+      </article>
+    </div>
+  </section>
+</main>
+
+<footer class="foot"><div class="wrap"><div class="footer-main"><a class="brand" href="/de">session-orchestrator</a><p>Ein Open-Source-Projekt von <a href="https://www.gotzendorfer.at/?utm_source=session-orchestrator&amp;utm_medium=footer&amp;utm_campaign=cross-promo" rel="author">Bernhard Götzendorfer</a>.</p>
+<p>Auch vom Autor · WalkAITalkie zum Diktieren am Mac</p></div><div class="footer-links"><nav aria-label="Weitere Links"><a href="https://github.com/Kanevry/session-orchestrator">GitHub</a><a href="https://www.npmjs.com/package/session-orchestrator">npm</a><a href="/guide" hreflang="en">Anleitung (Englisch)</a><a href="/lead" hreflang="en">Lead-Session</a><a href="/llms.txt">llms.txt</a><a href="/impressum">Impressum</a><a href="/datenschutz">Datenschutz</a></nav><a class="support-link" href="https://paypal.me/Kanevry">Hilft dir das? Ein Kaffee ist willkommen.</a></div></div></footer>
+<script src="/_vercel/insights/script.js" defer></script>
+<script src="/assets/ui.js?v=20261118" defer></script>
+</body>
+</html>

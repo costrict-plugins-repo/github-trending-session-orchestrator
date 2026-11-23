@@ -1,0 +1,20 @@
+*.sh        text eol=lf
+*.md        text eol=lf
+*.json      text eol=lf
+*.yaml      text eol=lf
+*.yml       text eol=lf
+*.js        text eol=lf
+*.mjs       text eol=lf
+hooks/*.sh  text eol=lf
+# Extensionless shell scripts: a CRLF checkout (Windows core.autocrlf) breaks sh (#1743)
+.husky/**   text eol=lf
+tests/fixtures/bin/node-script-launcher text eol=lf
+tests/fixtures/claude       text eol=lf
+tests/fixtures/glab         text eol=lf
+tests/fixtures/tmux/tmux    text eol=lf
+# eol=lf on every line-ending rule: the Claude plugin directory scanner refuses a
+# plugin whose .gitattributes carries any other line-ending rule, text=auto included.
+*           text=auto eol=lf
+
+# Test fixtures intentionally preserve their line endings
+tests/fixtures/config-crlf.md -text

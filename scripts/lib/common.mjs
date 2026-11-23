@@ -1,0 +1,373 @@
+/**
+ * common.mjs — Shared I/O utilities for session-orchestrator scripts.
+ *
+ * Pure ESM, Node stdlib only. Replaces the generic helpers from common.sh.
+ *
+ * Part of v3.0.0 migration (Epic #124, issue #136).
+ * Shell-helper ports added for issue #218.
+ */
+
+import os from 'node:os';
+import path from 'node:path';
+import crypto from 'node:crypto';
+import { promises as fs, existsSync, statSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { commandOnPath } from './native-command.mjs';
+
+// ---------------------------------------------------------------------------
+// Path helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Returns a unique temp path (does NOT create the file/directory).
+ * @param {string} prefix - non-empty string prepended to the filename
+ * @returns {string}
+ */
+export function makeTmpPath(prefix) {
+  if (typeof prefix !== 'string' || prefix.length === 0) {
+    throw new TypeError('makeTmpPath: prefix must be a non-empty string');
+  }
+  const rand = crypto.randomBytes(4).toString('hex');
+  return path.join(os.tmpdir(), `${prefix}-${Date.now()}-${rand}`);
+}
+
+/**
+ * Expand a leading `~` (home-directory shorthand) to the current user's home
+ * directory. Non-`~`-prefixed strings, non-strings, and the empty string pass
+ * through unchanged.
+ *
+ * Canonical shared implementation for vault-dir-consuming call-sites added
+ * under Epic #774 (docs Public-Split) — see `scripts/lib/vault-archive.mjs`
+ * and `scripts/export-hw-learnings.mjs`. Several pre-existing inline copies
+ * of this exact shape (e.g. `scripts/lib/vault-status/board-writer.mjs`,
+ * `narrative-mirror.mjs`, `scripts/lib/dispatcher/enumerate.mjs`) are
+ * intentionally NOT migrated to this shared helper here — that consolidation
+ * is a separate follow-up, not this fix's scope.
+ *
+ * @param {string} p
+ * @returns {string}
+ */
+export function expandTilde(p) {
+  if (typeof p !== 'string' || p.length === 0) return p;
+  if (p === '~') return os.homedir();
+  if (p.startsWith('~/')) return path.join(os.homedir(), p.slice(2));
+  return p;
+}
+
+/**
+ * Replace the current user's home directory with `~` wherever it occurs in
+ * `text` — the inverse of {@link expandTilde}, for free text as well as a bare
+ * path: an `err.message` from `node:fs` (`ENOENT: …, open '/Users/bob/v/x.md'`),
+ * git stderr, a resolved vault dir. Every occurrence is replaced.
+ *
+ * Log lines of the vault writers and the session-end shell land in CI logs and
+ * session transcripts, where the home dir is an owner-privacy leak (#1490,
+ * `.claude/rules/security.md` § Owner-Privacy).
+ *
+ * Boundary-aware on both sides. On the right the home dir must end at a path
+ * separator, the end of the text, whitespace, a quote/bracket/list delimiter
+ * (`'"\`)]},;:`) or a sentence-final `.`, so `/Users/bob` never rewrites
+ * `/Users/bobby/x` or `/Users/bob.old`. On the left it must not continue a
+ * path segment, so `/data/Users/bob` stays. A home dir that is empty, the
+ * filesystem root or a bare drive root is a no-op — collapsing it would
+ * rewrite every absolute path. Non-strings pass through unchanged.
+ *
+ * @param {string} text
+ * @param {string} [home] — defaults to `os.homedir()`; an unresolvable home
+ *   leaves `text` unchanged (a log redactor must never turn an error path into
+ *   a crash)
+ * @returns {string}
+ */
+export function redactHomeDir(text, home) {
+  if (typeof text !== 'string' || text.length === 0) return text;
+  let h = home;
+  if (h === undefined) {
+    try {
+      h = os.homedir();
+    } catch {
+      return text;
+    }
+  }
+  h = String(h ?? '').replace(/[/\\]+$/, '');
+  if (h.length === 0 || /^[a-z]:$/i.test(h)) return text;
+  const escaped = h.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const re = new RegExp(`(?<![\\w.~-])${escaped}(?=$|[/\\\\\\s'"\`)\\]},;:]|\\.(?:$|\\s))`, 'g');
+  return text.replace(re, '~');
+}
+
+// ---------------------------------------------------------------------------
+// Timestamp helpers
+// ---------------------------------------------------------------------------
+
+/** Returns the current time as an ISO 8601 UTC string. */
+export function utcTimestamp() {
+  return new Date().toISOString();
+}
+
+/** Returns the current Unix time in milliseconds. */
+export function epochMs() {
+  return Date.now();
+}
+
+// ---------------------------------------------------------------------------
+// JSON file helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Reads and parses a JSON file; throws on missing file or parse error.
+ * @param {string} filePath
+ * @returns {Promise<unknown>}
+ */
+export async function readJson(filePath) {
+  const raw = await fs.readFile(filePath, 'utf8');
+  return JSON.parse(raw);
+}
+
+/**
+ * Serialises obj as pretty-printed JSON and writes it to filePath,
+ * creating any missing parent directories automatically.
+ * @param {string} filePath
+ * @param {unknown} obj
+ * @returns {Promise<void>}
+ */
+export async function writeJson(filePath, obj) {
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
+  await fs.writeFile(filePath, JSON.stringify(obj, null, 2) + '\n', 'utf8');
+}
+
+/**
+ * Appends obj as a single JSONL line to filePath, creating missing parent
+ * directories automatically. Single appendFile call — atomic for lines under
+ * PIPE_BUF (4 KiB).
+ * @param {string} filePath
+ * @param {unknown} obj
+ * @param {{ mode?: number }} [opts] — file mode on creation (e.g. 0o600 for host-private logs, #1632)
+ * @returns {Promise<void>}
+ */
+export async function appendJsonl(filePath, obj, { mode } = {}) {
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
+  await fs.appendFile(filePath, JSON.stringify(obj) + '\n', mode === undefined ? 'utf8' : { encoding: 'utf8', mode });
+}
+
+// ---------------------------------------------------------------------------
+// Shell-helper ports (issue #218) — equivalents of common.sh functions
+// ---------------------------------------------------------------------------
+
+/**
+ * Print an error message to stderr and exit with code 1.
+ * Equivalent to die() in common.sh.
+ * @param {string} message
+ * @returns {never}
+ */
+export function die(message) {
+  process.stderr.write(`ERROR: ${message}\n`);
+  process.exit(1);
+}
+
+/**
+ * Print a warning message to stderr (does not exit).
+ * Equivalent to warn() in common.sh.
+ * @param {string} message
+ */
+export function warn(message) {
+  process.stderr.write(`WARNING: ${message}\n`);
+}
+
+/**
+ * Verify that jq is available on PATH.
+ * Throws an Error if jq is not found (instead of exiting, so callers can decide).
+ * For scripts that want exit-on-failure behaviour, wrap with die():
+ *   try { requireJq(); } catch (e) { die(e.message); }
+ * Equivalent to require_jq() in common.sh.
+ * @returns {void}
+ * @throws {Error} when jq is not on PATH
+ */
+export function requireJq() {
+  if (!commandOnPath('jq')) {
+    throw new Error('jq is required but not installed. Install via: brew install jq');
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Internal helpers for project/plugin root detection
+// ---------------------------------------------------------------------------
+
+/** Return true when `dir` exists as a directory. */
+function _isDirSync(dir) {
+  try { return statSync(dir).isDirectory(); } catch { return false; }
+}
+
+/** Return true when `file` exists (file or directory). */
+function _isFileSync(file) {
+  return existsSync(file);
+}
+
+/**
+ * Walk up the directory tree from `startDir` until a directory satisfying
+ * `predicate(dir)` is found. Returns the matching directory or null.
+ * @param {string} startDir
+ * @param {(dir: string) => boolean} predicate
+ * @returns {string|null}
+ */
+function _walkUpUntil(startDir, predicate) {
+  let dir = path.resolve(startDir);
+  while (true) {
+    if (predicate(dir)) return dir;
+    const parent = path.dirname(dir);
+    if (parent === dir) break; // reached filesystem root
+    dir = parent;
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// findProjectRoot
+// ---------------------------------------------------------------------------
+
+/**
+ * Walk up from `startDir` (defaults to process.cwd()) looking for CLAUDE.md,
+ * .claude/, AGENTS.md, .codex/, or .pi/ markers. Returns the found project root, or
+ * `startDir` if nothing is found.
+ *
+ * Respects CLAUDE_PROJECT_DIR, CODEX_PROJECT_DIR, and PI_PROJECT_DIR environment variables as
+ * fast-paths (same semantics as common.sh find_project_root).
+ *
+ * Equivalent to find_project_root() in common.sh.
+ *
+ * @param {string} [startDir] - directory to start the walk from (default: process.cwd())
+ * @returns {string} Absolute path of the project root
+ */
+export function findProjectRoot(startDir) {
+  const base = startDir ? path.resolve(startDir) : process.cwd();
+
+  // Fast path: CLAUDE_PROJECT_DIR
+  const claudeDir = process.env.CLAUDE_PROJECT_DIR;
+  if (claudeDir) {
+    if (_isFileSync(path.join(claudeDir, 'CLAUDE.md')) || _isDirSync(path.join(claudeDir, '.claude'))) {
+      return claudeDir;
+    }
+  }
+
+  // Fast path: CODEX_PROJECT_DIR
+  const codexDir = process.env.CODEX_PROJECT_DIR;
+  if (codexDir) {
+    if (_isFileSync(path.join(codexDir, 'AGENTS.md')) || _isDirSync(path.join(codexDir, '.codex'))) {
+      return codexDir;
+    }
+  }
+
+  // Fast path: PI_PROJECT_DIR
+  const piDir = process.env.PI_PROJECT_DIR;
+  if (piDir) {
+    if (_isFileSync(path.join(piDir, 'AGENTS.md')) || _isDirSync(path.join(piDir, '.pi'))) {
+      return piDir;
+    }
+  }
+
+  const found = _walkUpUntil(base, (dir) =>
+    _isFileSync(path.join(dir, 'CLAUDE.md')) ||
+    _isDirSync(path.join(dir, '.claude')) ||
+    _isFileSync(path.join(dir, 'AGENTS.md')) ||
+    _isDirSync(path.join(dir, '.codex')) ||
+    _isDirSync(path.join(dir, '.pi')),
+  );
+
+  return found ?? base;
+}
+
+// ---------------------------------------------------------------------------
+// resolvePluginRoot
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolve the session-orchestrator plugin root directory.
+ *
+ * Resolution order (stops at first success):
+ *   1. CLAUDE_PLUGIN_ROOT env var
+ *   2. CODEX_PLUGIN_ROOT  env var
+ *   3. PI_PLUGIN_ROOT     env var
+ *   4. Walk up from import.meta.url of this file looking for plugin.json / skills/ / .codex-plugin/
+ *   5. Walk up from process.cwd() looking for the same markers
+ *
+ * Equivalent to resolve_plugin_root() in common.sh, but throws instead of calling die()
+ * so that callers in a non-process context (tests) can catch the error.
+ *
+ * @param {string} [callerUrl] - import.meta.url of the calling module (optional override for level-3 walk)
+ * @returns {string} Absolute path to the plugin root
+ * @throws {Error} when all resolution levels fail
+ */
+export function resolvePluginRoot(callerUrl) {
+  const isPluginDir = (dir) =>
+    _isFileSync(path.join(dir, 'plugin.json')) ||
+    _isDirSync(path.join(dir, 'skills')) ||
+    _isDirSync(path.join(dir, '.codex-plugin'));
+
+  // Level 1: CLAUDE_PLUGIN_ROOT
+  const claudeRoot = process.env.CLAUDE_PLUGIN_ROOT;
+  if (claudeRoot && _isDirSync(claudeRoot)) return claudeRoot;
+
+  // Level 2: CODEX_PLUGIN_ROOT
+  const codexRoot = process.env.CODEX_PLUGIN_ROOT;
+  if (codexRoot && _isDirSync(codexRoot)) return codexRoot;
+
+  // Level 3: PI_PLUGIN_ROOT
+  const piRoot = process.env.PI_PLUGIN_ROOT;
+  if (piRoot && _isDirSync(piRoot)) return piRoot;
+
+  // Level 4: walk up from caller / this file
+  const startFromFile = callerUrl
+    ? path.dirname(fileURLToPath(callerUrl))
+    : path.dirname(fileURLToPath(import.meta.url));
+  const byFile = _walkUpUntil(startFromFile, isPluginDir);
+  if (byFile) return byFile;
+
+  // Level 5: walk up from cwd
+  const byCwd = _walkUpUntil(process.cwd(), isPluginDir);
+  if (byCwd) return byCwd;
+
+  throw new Error(
+    'Could not locate plugin root. Set CLAUDE_PLUGIN_ROOT, CODEX_PLUGIN_ROOT, or PI_PLUGIN_ROOT to the plugin directory, ' +
+    'or ensure plugin.json / skills/ exists in an ancestor of the cwd.',
+  );
+}
+
+// ---------------------------------------------------------------------------
+// resolveInstructionFile (issue #33)
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolve the canonical project-instruction file at the given repo root.
+ *
+ * `CLAUDE.md` (Claude Code / Cursor IDE) and `AGENTS.md` (Codex CLI) are
+ * transparent aliases. Precedence:
+ *
+ *   1. `<repoRoot>/CLAUDE.md` exists and is non-empty → kind: 'claude'
+ *   2. `<repoRoot>/AGENTS.md` exists and is non-empty → kind: 'agents'
+ *   3. otherwise → null (caller decides what to do)
+ *
+ * Never merge both. Never read both. Pick one.
+ *
+ * SSOT for the alias rule: `skills/_shared/instruction-file-resolution.md`.
+ *
+ * @param {string} [repoRoot] - absolute repo root (default: findProjectRoot())
+ * @returns {{ path: string, kind: 'claude' | 'agents' } | null}
+ */
+export function resolveInstructionFile(repoRoot) {
+  const root = repoRoot ?? findProjectRoot();
+  if (!root) return null;
+  const candidates = [
+    { file: 'CLAUDE.md', kind: 'claude' },
+    { file: 'AGENTS.md', kind: 'agents' },
+  ];
+  for (const c of candidates) {
+    const p = path.join(root, c.file);
+    if (existsSync(p)) {
+      try {
+        if (statSync(p).size > 0) return { path: p, kind: c.kind };
+      } catch {
+        // stat failure (race, permissions) — skip this candidate, try next
+      }
+    }
+  }
+  return null;
+}

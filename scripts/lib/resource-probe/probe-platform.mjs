@@ -1,0 +1,343 @@
+/**
+ * probe-platform.mjs — platform-specific resource sampling (RAM, CPU, processes, swap).
+ *
+ * Handles all async I/O: spawning `ps`/`tasklist`, reading `/proc/meminfo`,
+ * calling `sysctl`, `memory_pressure`. Pure parsing is delegated to parsers.mjs.
+ *
+ * Part of v3.1.0 Epic #157 / Issue #163.
+ * Extended in v3.2 Phase C-2 (#296): swap_used_mb + memory_pressure_pct_free signals.
+ * Split from resource-probe.mjs in #287 (hotspot 2/2).
+ */
+
+import os from 'node:os';
+import { SO_IS_WINDOWS } from '../platform.mjs';
+import {
+  countProcessMatches,
+  countZombieProcesses,
+  parseSwapUsageOutput,
+  parseMemoryPressureOutput,
+  parseVmStatAvailableGb,
+} from './parsers.mjs';
+import { hookProgram } from '../program-lookup.mjs';
+import { spawn } from '../native-command.mjs';
+
+// ---------------------------------------------------------------------------
+// RAM / CPU primitives (synchronous, via Node os module)
+// ---------------------------------------------------------------------------
+
+/**
+ * @returns {{ ram_free_gb: number, ram_used_pct: number }}
+ */
+export function ramSnapshot() {
+  const total = os.totalmem();
+  const free = os.freemem();
+  const usedPct = Math.round(((total - free) / total) * 100);
+  const freeGb = Math.round((free / (1024 * 1024 * 1024)) * 10) / 10;
+  return { ram_free_gb: freeGb, ram_used_pct: usedPct };
+}
+
+/**
+ * Derive CPU usage percentage from per-core times (used on Windows and when
+ * load-average is 0).
+ * @returns {number} 0-100
+ */
+function cpuPctFromTimes() {
+  const cpus = os.cpus() || [];
+  if (cpus.length === 0) return 0;
+  let totalBusy = 0;
+  let total = 0;
+  for (const c of cpus) {
+    const t = c.times;
+    const busy = t.user + t.nice + t.sys + t.irq;
+    totalBusy += busy;
+    total += busy + t.idle;
+  }
+  if (total === 0) return 0;
+  return Math.min(100, Math.round((totalBusy / total) * 100));
+}
+
+/**
+ * @returns {{ cpu_load_1m: number, cpu_load_pct: number }}
+ */
+export function cpuSnapshot() {
+  const load1m = os.loadavg()[0];
+  const cores = (os.cpus() || []).length || 1;
+  // load-average is a Unix concept and reports 0 on Windows. When zero, we
+  // fall back to per-core user+sys % derived from cpus() times (still rough,
+  // but non-zero on Windows so the threshold logic has a signal).
+  let loadPct;
+  if (SO_IS_WINDOWS || load1m === 0) {
+    loadPct = cpuPctFromTimes();
+  } else {
+    loadPct = Math.min(100, Math.round((load1m / cores) * 100));
+  }
+  return { cpu_load_1m: Math.round(load1m * 10) / 10, cpu_load_pct: loadPct };
+}
+
+// ---------------------------------------------------------------------------
+// Process listing helpers (async, shell-based)
+// ---------------------------------------------------------------------------
+
+/**
+ * Run a command and collect stdout, with a timeout. Returns null on failure.
+ * @param {string} cmd
+ * @param {string[]} args
+ * @param {number} timeoutMs
+ * @returns {Promise<string|null>}
+ */
+export function runCommand(cmd, args, timeoutMs = 1500) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    };
+    try {
+      const child = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'ignore'] });
+      const chunks = [];
+      child.stdout.on('data', (c) => chunks.push(c));
+      child.on('error', () => finish(null));
+      child.on('close', (code) => {
+        if (code !== 0) return finish(null);
+        finish(Buffer.concat(chunks).toString('utf8'));
+      });
+      setTimeout(() => {
+        try { child.kill('SIGKILL'); } catch { /* ignore */ }
+        finish(null);
+      }, timeoutMs);
+    } catch {
+      finish(null);
+    }
+  });
+}
+
+/**
+ * Run `ps -A -o comm` (or `tasklist` on Windows) and return stdout, or null on failure.
+ * @param {number} [timeoutMs]
+ * @returns {Promise<string|null>}
+ */
+function runPs(timeoutMs = 2000) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    };
+    try {
+      const cmd = hookProgram(SO_IS_WINDOWS ? 'tasklist' : 'ps');
+      const args = SO_IS_WINDOWS
+        ? ['/FO', 'CSV', '/NH']
+        : ['-A', '-o', 'comm'];
+      const child = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'ignore'] });
+      const chunks = [];
+      child.stdout.on('data', (c) => chunks.push(c));
+      child.on('error', () => finish(null));
+      child.on('close', (code) => {
+        if (code !== 0) return finish(null);
+        finish(Buffer.concat(chunks).toString('utf8'));
+      });
+      setTimeout(() => {
+        try { child.kill('SIGKILL'); } catch { /* ignore */ }
+        finish(null);
+      }, timeoutMs);
+    } catch {
+      finish(null);
+    }
+  });
+}
+
+/**
+ * Run `ps` collecting PID, command name, elapsed time, and CPU% — used for zombie detection.
+ * Returns raw stdout string or null on failure.
+ * @param {number} [timeoutMs]
+ * @returns {Promise<string|null>}
+ */
+function runPsDetailed(timeoutMs = 2000) {
+  return new Promise((resolve) => {
+    if (SO_IS_WINDOWS) { resolve(null); return; }
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    };
+    try {
+      // -A: all processes; output: pid, comm (basename), etime, %cpu
+      const child = spawn(hookProgram('ps'), ['-A', '-o', 'pid,comm,etime,%cpu'], { stdio: ['ignore', 'pipe', 'ignore'] });
+      const chunks = [];
+      child.stdout.on('data', (c) => chunks.push(c));
+      child.on('error', () => finish(null));
+      child.on('close', (code) => {
+        if (code !== 0) return finish(null);
+        finish(Buffer.concat(chunks).toString('utf8'));
+      });
+      setTimeout(() => {
+        try { child.kill('SIGKILL'); } catch { /* ignore */ }
+        finish(null);
+      }, timeoutMs);
+    } catch {
+      finish(null);
+    }
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Process pattern matching defaults
+// ---------------------------------------------------------------------------
+
+export const DEFAULT_PATTERNS = [
+  {
+    key: 'claude',
+    // Matches the `claude` CLI process plus `Claude Code` macOS app names.
+    match: (l) => /(^|[\s/,"])claude([\s",]|$)/.test(l) || l.includes('claude code') || l.includes('claude.app'),
+  },
+  {
+    key: 'codex',
+    match: (l) => /(^|[\s/,"])codex([\s",]|$)/.test(l) || l.includes('codex cli'),
+  },
+  {
+    key: 'other_node',
+    // All node processes; caller subtracts claude/codex-related node procs.
+    match: (l) => /(^|[\s/,"])node([\s",]|$)/.test(l),
+  },
+];
+
+/**
+ * Collect process counts (claude, codex, node) and optionally zombie count.
+ * @param {number|null} [zombieThresholdMin]
+ * @returns {Promise<{ claude_processes_count: number|null, codex_processes_count: number|null, other_node_processes: number|null, zombie_processes_count: number|null }>}
+ */
+export async function processCounts(zombieThresholdMin = null) {
+  // Run simple ps (for counts) and detailed ps (for zombie detection) in parallel.
+  const [output, detailedOutput] = await Promise.all([
+    runPs(),
+    zombieThresholdMin !== null ? runPsDetailed() : Promise.resolve(null),
+  ]);
+  if (output === null || output === undefined) {
+    return {
+      claude_processes_count: null,
+      codex_processes_count: null,
+      other_node_processes: null,
+      zombie_processes_count: null,
+    };
+  }
+  const raw = countProcessMatches(output, DEFAULT_PATTERNS);
+  // Subtract self (the currently running probe process counts as 1 node).
+  const otherNode = Math.max(0, (raw.other_node ?? 0) - 1);
+  const zombie_processes_count =
+    zombieThresholdMin !== null
+      ? countZombieProcesses(detailedOutput, zombieThresholdMin)
+      : null;
+  return {
+    claude_processes_count: raw.claude ?? 0,
+    codex_processes_count: raw.codex ?? 0,
+    other_node_processes: otherNode,
+    zombie_processes_count,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Swap usage (async, spawn-based) — macOS + Linux only
+// ---------------------------------------------------------------------------
+
+/**
+ * Probe swap usage. Returns used MB as integer, or null on unsupported/failure.
+ * @returns {Promise<number|null>}
+ */
+export async function swapUsedMb() {
+  if (SO_IS_WINDOWS) return null;
+
+  if (process.platform === 'darwin') {
+    const output = await runCommand(hookProgram('sysctl'), ['vm.swapusage']);
+    return parseSwapUsageOutput(output);
+  }
+
+  if (process.platform === 'linux') {
+    // Read /proc/meminfo and compute SwapTotal - SwapFree (values in kB)
+    const output = await runCommand(hookProgram('cat'), ['/proc/meminfo']);
+    if (output === null) return null;
+    const totalMatch = /SwapTotal:\s*(\d+)\s*kB/i.exec(output);
+    const freeMatch = /SwapFree:\s*(\d+)\s*kB/i.exec(output);
+    if (!totalMatch || !freeMatch) return null;
+    const totalKb = parseInt(totalMatch[1], 10);
+    const freeKb = parseInt(freeMatch[1], 10);
+    if (Number.isNaN(totalKb) || Number.isNaN(freeKb)) return null;
+    return Math.round((totalKb - freeKb) / 1024);
+  }
+
+  return null;
+}
+
+/**
+ * Probe macOS memory_pressure free percentage. Returns integer 0..100, or null.
+ * @param {number} [timeoutMs=1500]
+ * @returns {Promise<number|null>}
+ */
+export async function memoryPressurePctFree(timeoutMs = 1500) {
+  if (process.platform !== 'darwin') return null;
+
+  const output = await runCommand(hookProgram('memory_pressure'), [], timeoutMs);
+  return parseMemoryPressureOutput(output);
+}
+
+/**
+ * Probe macOS AVAILABLE RAM (free + reclaimable) via `vm_stat`.
+ *
+ * On macOS, `os.freemem()` reflects only `Pages free` and routinely reads
+ * sub-1 GB even when 100+ GB is reclaimable cache. This derives the real
+ * headroom from vm_stat (see parseVmStatAvailableGb for the page-class formula).
+ *
+ * Darwin-only — returns null on Linux/Windows/unknown (those platforms already
+ * surface an accurate `os.freemem()`, so no override is needed) or on
+ * spawn/parse failure.
+ * @param {number} [timeoutMs=1500]
+ * @returns {Promise<number|null>} available GB rounded to 1 decimal, or null
+ */
+export async function ramAvailableGb(timeoutMs = 1500) {
+  if (process.platform !== 'darwin') return null;
+
+  const output = await runCommand(hookProgram('vm_stat'), [], timeoutMs);
+  return parseVmStatAvailableGb(output);
+}
+
+/**
+ * Count LIVE PEER SESSIONS on this host from the session registry (#1089).
+ *
+ * This is the signal `concurrent-sessions-warn` was always named for. Until
+ * #1089 the threshold was compared against `claude_processes_count` instead —
+ * a measured 6x unit error (median processes:sessions = 6.0 over 1461 paired
+ * samples), which is why a threshold of 5 fired on 93.6% of session starts
+ * while the same threshold against the real count fired on 4.2% at the time.
+ * Re-measured 2026-10-17 (#1650) it fires on 67.4% (M4) / 25.7% (M5) — a
+ * standing signal (HR-101), so the banner icon follows a start wave instead.
+ *
+ * Semantics mirror `detectPeers()` exactly: EXCLUDES the calling session and
+ * counts only entries whose `last_heartbeat` is within `freshnessMin` minutes.
+ * That matches the `peer_count` field already recorded on
+ * `orchestrator.session.started` events, so historical telemetry and live
+ * probes are denominated identically.
+ *
+ * Best-effort: returns null when the registry directory cannot be listed
+ * (EACCES, ENOTDIR, EMFILE — sandboxed test environments, a foreign
+ * `SO_SESSION_REGISTRY_DIR`). A registry that was never created (ENOENT, first
+ * run before any registration) is a measured 0. Consumers treat null as
+ * "unknown" and fall back to the rescaled process count.
+ *
+ * @param {object} [opts]
+ * @param {string|null} [opts.sessionId] — own session id, excluded from the count
+ * @param {number} [opts.freshnessMin=15]
+ * @returns {Promise<number|null>}
+ */
+export async function peerSessionsCount({ sessionId = null, freshnessMin = 15 } = {}) {
+  try {
+    const { detectPeers } = await import('../session-registry.mjs');
+    // strict (#1946): an unlistable registry (EACCES, ENOTDIR, EMFILE) must
+    // land in the catch below as null, never as a measured 0 peers.
+    const peers = await detectPeers({ sessionId, freshnessMin, strict: true });
+    return Array.isArray(peers) ? peers.length : null;
+  } catch {
+    return null;
+  }
+}

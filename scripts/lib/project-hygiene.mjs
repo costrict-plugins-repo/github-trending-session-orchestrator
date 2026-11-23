@@ -1,0 +1,1023 @@
+/**
+ * project-hygiene.mjs — Project-hygiene probe family (housekeeping canon).
+ *
+ * WHY THIS EXISTS
+ * ---------------
+ * session-start Phase 4 runs 13 probes. Exactly one of them (`ci-status`)
+ * inspects the PROJECT; the rest inspect the orchestrator's own substrate
+ * (vault, peer-cards, loop readiness, instruction budget, its own ledger).
+ * A read-only diagnostic run of the housekeeping flow across six real
+ * consumer repos (9 to 2099 tracked files) found the checks the flow does
+ * NOT perform outscored the ones it does in every single repo — by up to 7x.
+ *
+ * This module adds the highest-yield missing checks. Each one was selected by
+ * measured hit rate across those six repos, not by intuition:
+ *
+ *   releaseHygiene   6/6 repos    tags/CHANGELOG vs. commits since
+ *   ignoredBallast   6/6 repos    ignored-and-untracked working-tree mass
+ *   staleArtifacts   5/6 repos    aged .orchestrator/ artifacts
+ *   ciConfig         5/6 repos    pipeline present, audit job, image pinning
+ *
+ * DELIBERATE OMISSIONS (documented so nobody "completes" the set later):
+ *
+ *   docs-drift (6/6 hit rate) is NOT reimplemented here. `claude-md-drift-check`
+ *   already covers it with ten checks; it merely runs at session-END, i.e.
+ *   after the work. The fix is scheduling, not a second implementation.
+ *
+ *   env-hygiene (5/6 hit rate) is NOT implemented as a dead-variable list.
+ *   The naive approach — diff `process.env.X` reads against `.env.example` —
+ *   produced a 100% false-positive rate in the largest repo tested, because
+ *   variables were read centrally through a Zod schema rather than at their
+ *   use sites. This module reports only the falsifiable part: whether an
+ *   `.env.example` exists at all when env vars are read. Counting or naming
+ *   "dead" variables requires resolving indirection and is left to the
+ *   per-repo parity tests that some repos already implement correctly.
+ *
+ * CONTRACT
+ * --------
+ * Mirrors the established banner-probe shape (see ci-status-banner.mjs):
+ * returns `null` for a silent no-op, or `{ severity, message, findings }`.
+ * Never throws, never writes, never blocks. Every finding carries `fixable`
+ * so a caller can split mechanical work from work needing human judgement.
+ */
+
+import { existsSync, lstatSync, readFileSync, readdirSync, statSync } from 'node:fs';
+import { join } from 'node:path';
+import * as yaml from 'js-yaml';
+import { tokenizeCommand, splitChainSegments, resolveSegmentVerb } from './command-blocker.mjs';
+import { parsePorcelainEntries } from './git-porcelain.mjs';
+import { hookProgram } from './program-lookup.mjs';
+import { execFileSync } from './native-command.mjs';
+
+/** Commits on HEAD past its nearest reachable tag before release hygiene is worth mentioning. */
+export const DEFAULT_RELEASE_DRIFT_COMMITS = 50;
+/** Megabytes of ignored working-tree mass before it is worth mentioning. */
+export const DEFAULT_BALLAST_MB = 500;
+/** Days before an .orchestrator/ artifact counts as aged. */
+export const DEFAULT_ARTIFACT_AGE_DAYS = 30;
+
+/**
+ * Run a git command, returning trimmed stdout or null on any failure.
+ * Never throws — a missing repo, missing ref, or absent git all yield null.
+ * @param {string[]} args
+ * @param {string} cwd
+ * @returns {string|null}
+ */
+function git(args, cwd) {
+  try {
+    return execFileSync(hookProgram('git', cwd), args, {
+      cwd,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 10_000,
+    }).trim();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * H1 — Release hygiene.
+ *
+ * Measured 6/6. The severe real-world case: 980 commits, live in production,
+ * zero release tags, CHANGELOG frozen 460 commits back — no rollback anchor.
+ * Distinguishes "no tags at all" from "tags exist but HEAD has run far past
+ * the nearest reachable one", because the remedies differ.
+ *
+ * @param {string} repoRoot
+ * @param {number} driftCommits
+ * @returns {object|null}
+ */
+export function checkReleaseHygiene(repoRoot, driftCommits = DEFAULT_RELEASE_DRIFT_COMMITS) {
+  const totalCommits = Number(git(['rev-list', '--count', 'HEAD'], repoRoot));
+  if (!Number.isFinite(totalCommits) || totalCommits === 0) return null;
+
+  const tags = git(['tag', '--list'], repoRoot);
+  if (tags === null) return null;
+  const tagList = tags.split('\n').filter(Boolean);
+
+  // A young repo without tags is normal, not a finding.
+  if (tagList.length === 0) {
+    if (totalCommits < driftCommits) return null;
+    return {
+      check: 'release-hygiene',
+      fixable: false,
+      message: `no release tags across ${totalCommits} commits — no rollback anchor and no deploy identity`,
+    };
+  }
+
+  // `--tags` includes lightweight tags; describe measures only local HEAD history.
+  const described = git(['describe', '--tags', '--abbrev=0'], repoRoot);
+  if (!described) {
+    return {
+      check: 'release-hygiene',
+      fixable: false,
+      message: `${tagList.length} tag(s) exist but none is reachable from HEAD (git describe fails) — releases are not anchored to this history`,
+    };
+  }
+
+  const since = Number(git(['rev-list', '--count', `${described}..HEAD`], repoRoot));
+  if (!Number.isFinite(since) || since < driftCommits) return null;
+
+  // lead report 2026-11-10: cached upstream distance qualifies a stale local HEAD.
+  const upstream = git(['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{upstream}'], repoRoot);
+  const behind = upstream ? Number(git(['rev-list', '--count', 'HEAD..@{upstream}'], repoRoot)) : 0;
+  const staleHead = behind > 0
+    ? ` (HEAD is behind ${upstream} by ${behind}; fetch tags/pull before judging)` : '';
+  return {
+    check: 'release-hygiene',
+    fixable: false,
+    // `amount` (#2196): the magnitude the session-start repeat gate compares
+    // against the last REPORTED value — a doubling is news, +1 commit is not.
+    amount: since,
+    message: `${since} commits on HEAD since the nearest reachable tag ${described}${staleHead}`,
+  };
+}
+
+/**
+ * The plugin's own runtime output under `.orchestrator/` is not a stray.
+ *
+ * Measured on a fresh consumer repo: the very first `SessionStart` hook writes
+ * `.orchestrator/` state, and the banner rendered on that same run accused the
+ * operator of 5 files "neither tracked nor ignored" — all 5 written seconds
+ * earlier by the tool that was complaining (`find <consumer>/.orchestrator -type f`
+ * returned exactly the 5 reported files). A first-run accusation about the
+ * tool's own output is the single loudest false positive this probe can emit.
+ *
+ * Excluding here rather than having bootstrap append a `.gitignore` line is
+ * deliberate, and it does NOT weaken the check for genuine strays:
+ *
+ *   - `.orchestrator/` is only PARTLY ignorable. `.orchestrator/policy/*.json`
+ *     and `.orchestrator/steering/*.md` are meant to be TRACKED — `checkStaleArtifacts`
+ *     below depends on exactly that. A blanket ignore line would tell git to
+ *     ignore files the plugin wants versioned, which is a worse defect than the
+ *     one it fixes, and it would mutate a consumer repo uninvited.
+ *   - Untracked mass under `.orchestrator/` is already covered, by a check built
+ *     for it: `checkStaleArtifacts` (H3) counts untracked AGED files there with
+ *     its own retained-artifact carve-outs. Nothing goes unwatched.
+ *   - Everything outside `.orchestrator/` is untouched, which is where a real
+ *     "nothing currently decides" stray lives.
+ *
+ * Prefix match on the porcelain path. The caller reads `git status -z`, whose
+ * paths are NUL-terminated and therefore never quoted or escaped — the value
+ * arriving here is the literal path, so it is compared verbatim. Do not
+ * reintroduce a leading-quote strip: under `-z` a path that really begins with
+ * `"` is a path, not a quoting artefact.
+ *
+ * @param {string} porcelainPath path field of a `?? ` porcelain entry
+ * @returns {boolean}
+ */
+function isOwnRuntimeArtifact(porcelainPath) {
+  return porcelainPath === '.orchestrator' || porcelainPath.startsWith('.orchestrator/');
+}
+
+/**
+ * H2 — Ignored working-tree ballast.
+ *
+ * Measured 6/6. Largest observed: a 7.4 GB working tree carrying 30.8 MB of
+ * tracked content (factor 240), entirely invisible to `git status`, which
+ * reported clean, and to `git count-objects`, which reported a healthy pack.
+ *
+ * Also reports files that are NEITHER tracked NOR ignored — the state where a
+ * `.gitignore` intends to version something that was never committed. In one
+ * repo this hid 23 rule files the `.gitignore` explicitly un-ignored.
+ *
+ * Reads `git status -z`: without it git QUOTES any path carrying a space, tab or
+ * non-ASCII byte (`"ign dir/"`, `"ign\tt.bin"`, `"ign\303\244.bin"`), and the
+ * quoted string does not exist on disk — so `duBytesBatch` dropped it and its
+ * bytes never reached the sum. Measured (#1348): a tree with `ign dir/` 3 MB,
+ * `ign<TAB>t.bin` 5 MB, `ignä.bin` 5 MB and `big.bin` 5 MB reported "5 MB
+ * (largest: big.bin 5MB)" against an actual 18 MB, low enough to fall under the
+ * report threshold entirely. `-z` is NUL-separated and never quotes.
+ *
+ * Sizing honours one caller deadline (#84): when `host.deadline` passes before
+ * every path is sized, the size is reported as NOT MEASURED — never as a
+ * partial sum, never as silence that reads like "no ballast".
+ *
+ * @param {string} repoRoot
+ * @param {number} ballastMb
+ * @param {{platform?: string, deadline?: number, clock?: () => number}} [host]
+ *   platform and clock seams for regression tests; `deadline` (epoch ms on
+ *   `clock`) bounds the whole sizing pass
+ * @returns {object[]}
+ */
+export function checkIgnoredBallast(repoRoot, ballastMb = DEFAULT_BALLAST_MB, host = {}) {
+  const findings = [];
+
+  const ignored = git(
+    ['status', '--ignored=matching', '--porcelain', '--untracked-files=all', '-z'],
+    repoRoot,
+  );
+  if (ignored === null) return findings;
+
+  const ignoredPaths = [];
+  let untrackedUnignored = 0;
+  // Porcelain v1 `-z` parsing (including the bare rename/copy source field that
+  // follows an `R`/`C` entry) lives in the shared parser — see
+  // `scripts/lib/git-porcelain.mjs`. Only `!!`/`??` are of interest here, so a
+  // rename/copy entry falls through both branches exactly as before.
+  for (const { status, path } of parsePorcelainEntries(ignored)) {
+    if (status === '!!') ignoredPaths.push(path);
+    else if (status === '??' && !isOwnRuntimeArtifact(path)) untrackedUnignored++;
+  }
+
+  // Size only the top-level ignored entries — recursing every path would cost
+  // more than the finding is worth on a large tree.
+  let totalBytes = 0;
+  const heaviest = [];
+  const { sizes, expired } = duBytesBatch(repoRoot, ignoredPaths, host);
+  if (expired) {
+    // Third state, distinct from "measured" and from "git unreadable" (silent
+    // above): the sum is incomplete, so no total and no threshold verdict.
+    findings.push({
+      check: 'ignored-ballast',
+      fixable: false,
+      measured: false,
+      message: `size of ${ignoredPaths.length} ignored path(s) not measured — sizing ran out of the probe time budget (ballast unknown, not zero)`,
+    });
+  }
+  for (const p of expired ? [] : ignoredPaths) {
+    const bytes = sizes.get(stripTrailingSlash(p));
+    if (bytes === undefined) continue;
+    totalBytes += bytes;
+    heaviest.push({ path: p, bytes });
+  }
+
+  const totalMb = Math.round(totalBytes / (1024 * 1024));
+  if (totalMb >= ballastMb) {
+    heaviest.sort((a, b) => b.bytes - a.bytes);
+    const top = heaviest
+      .slice(0, 3)
+      .map((h) => `${h.path} ${Math.round(h.bytes / (1024 * 1024))}MB`)
+      .join(', ');
+    findings.push({
+      check: 'ignored-ballast',
+      fixable: true,
+      amount: totalMb,
+      message: `${totalMb} MB of ignored files in the working tree (largest: ${top}) — invisible to git status`,
+    });
+  }
+
+  if (untrackedUnignored > 0) {
+    findings.push({
+      check: 'untracked-unignored',
+      fixable: false,
+      amount: untrackedUnignored,
+      message: `${untrackedUnignored} file(s) are neither tracked nor ignored (excluding the plugin's own .orchestrator/ runtime output) — either commit them or add them to .gitignore, since nothing currently decides`,
+    });
+  }
+
+  return findings;
+}
+
+// Ceiling on operands per `du` call. Every path is one argv entry and macOS
+// caps argv+environment at ARG_MAX = 1 048 576 bytes; 500 paths stay far below
+// that even at ~1 KB each. On win32 (no `du`, in-process walk) it bounds the
+// paths one 30 s budget covers. Today: 298 ignored top-level entries in this repo
+// (2026-09-12) — one call. Revisit trigger: repos with more than ~5000 ignored
+// entries, where `git status --ignored` itself turns expensive — then move the
+// probe into a detached child with a cache (see the revisit note in
+// scripts/lib/session-start-probes.mjs).
+const DU_CHUNK_SIZE = 500;
+
+/** @param {string} p */
+function stripTrailingSlash(p) {
+  return p.replace(/\/+$/, '');
+}
+
+/**
+ * Sizes of repo-relative paths in bytes via batched `du -sk`, one process per
+ * {@link DU_CHUNK_SIZE} paths instead of one per path (spawn overhead was the
+ * whole cost: 298 single calls 0.685 s vs. one batched call 0.051 s).
+ * Native Windows has no `du`: there an in-process walk ({@link walkWinBytes})
+ * sizes the paths instead, otherwise the map came back empty and the ballast
+ * check went silent (#1743).
+ *
+ * Keys are the paths without trailing slash; a path absent from the map could
+ * not be sized. `du` exits non-zero when ANY operand vanished or is unreadable
+ * but still sizes the rest on stdout, so that stdout is parsed rather than
+ * discarded — otherwise one bad path would silence the whole ballast check.
+ * `-l` keeps parity with the old per-path measurement: without it a batched
+ * `du` counts an inode shared by hard links only under the FIRST operand
+ * (pnpm `node_modules/` pointing into one store → the later ones read ~0).
+ * BSD and GNU `du` both define `-l` as "count sizes many times if hard linked".
+ * @param {string} repoRoot
+ * @param {string[]} relPaths porcelain paths relative to repoRoot
+ *
+ * `deadline` (#84): one bound for the WHOLE batch, checked between chunks,
+ * inside the win32 walk, and as the `du` child's timeout (clamped to the time
+ * left). Once it passes, `expired` is true and `sizes` is a partial map the
+ * caller must not sum. Without a deadline the old per-chunk 30 s budget holds.
+ * @param {string} repoRoot
+ * @param {string[]} relPaths porcelain paths relative to repoRoot
+ * @param {{platform?: string, deadline?: number, clock?: () => number}} [host]
+ *   platform and clock seams for regression tests
+ * @returns {{sizes: Map<string, number>, expired: boolean}}
+ */
+function duBytesBatch(repoRoot, relPaths, { platform = process.platform, deadline, clock = Date.now } = {}) {
+  const sizes = new Map();
+  const bounded = Number.isFinite(deadline);
+  let expired = false;
+  const existing = relPaths.filter((p) => existsSync(join(repoRoot, p)));
+  for (let i = 0; i < existing.length; i += DU_CHUNK_SIZE) {
+    if (bounded && clock() >= deadline) { expired = true; break; }
+    const chunk = existing.slice(i, i + DU_CHUNK_SIZE);
+    if (platform === 'win32') {
+      // Without a caller deadline: the same 30 s budget per chunk the `du`
+      // child has; on expiry the rest of the chunk stays unsized (absent),
+      // like a timed-out `du`'s stdout.
+      const chunkDeadline = bounded ? deadline : clock() + 30_000;
+      for (const p of chunk) {
+        const bytes = walkWinBytes(join(repoRoot, p), chunkDeadline, clock);
+        if (bytes === WALK_EXPIRED) {
+          if (bounded) { expired = true; break; }
+          continue;
+        }
+        if (bytes !== null) sizes.set(stripTrailingSlash(p), bytes);
+      }
+      if (expired) break;
+      continue;
+    }
+    let out;
+    try {
+      out = execFileSync(hookProgram('du', repoRoot), ['-skl', '--', ...chunk], {
+        cwd: repoRoot,
+        // macOS du rewrites a non-ASCII name's bytes under the C locale (`ä`,
+        // c3 a4, comes back as e4), so the echoed path no longer matched the
+        // Map key and the directory's size vanished. The navigator push path
+        // runs hooks with LC_ALL=C, which made this a pre-push failure (#1884).
+        // A host without C.UTF-8 falls back to C: today's behaviour.
+        env: { ...process.env, LC_ALL: 'C.UTF-8' },
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+        // A synchronous child is not preempted by the caller's deadline, so
+        // its own timeout is the time left (at least 1 ms: 0 means "none").
+        timeout: bounded ? Math.max(1, Math.min(30_000, deadline - clock())) : 30_000,
+      });
+    } catch (err) {
+      // Killed by a deadline-clamped timeout: its stdout is a partial sum.
+      if (bounded && err?.code === 'ETIMEDOUT') { expired = true; break; }
+      out = typeof err?.stdout === 'string' ? err.stdout : '';
+    }
+    for (const line of out.split('\n')) {
+      const tab = line.indexOf('\t');
+      if (tab <= 0) continue;
+      const kb = Number(line.slice(0, tab));
+      if (!Number.isFinite(kb)) continue;
+      sizes.set(stripTrailingSlash(line.slice(tab + 1)), kb * 1024);
+    }
+  }
+  return { sizes, expired };
+}
+
+/** {@link walkWinBytes} result when the deadline passed mid-walk. */
+const WALK_EXPIRED = Symbol('walk-expired');
+
+/**
+ * `du -skl <root>` for native Windows, which has no `du` (#1743). Windows
+ * reports no allocated block count (`st.blocks` is undefined), so each entry
+ * counts its apparent size in 512-byte units, rounded up to whole KiB like
+ * `du -k`. Ceiling (BV-004): sparse/compressed NTFS files count at apparent
+ * size; revisit if Node exposes allocation size on win32. Symlinks are never
+ * followed (`du -P`). Hard links count under every path (`-l`). Unreadable
+ * subtrees are skipped. Returns null when the root vanished and
+ * {@link WALK_EXPIRED} when the deadline passed (unsized, never a partial
+ * undercount).
+ * @param {string} root
+ * @param {number} deadline epoch ms on `clock`
+ * @param {() => number} [clock]
+ * @returns {number|null|typeof WALK_EXPIRED} bytes (KiB multiple)
+ */
+function walkWinBytes(root, deadline, clock = Date.now) {
+  let blocks512 = 0;
+  const stack = [root];
+  let first = true;
+  while (stack.length > 0) {
+    if (clock() > deadline) return WALK_EXPIRED;
+    const current = stack.pop();
+    let st;
+    try { st = lstatSync(current); } catch { if (first) return null; continue; }
+    first = false;
+    blocks512 += Math.ceil(st.size / 512);
+    if (!st.isDirectory()) continue;
+    let names;
+    try { names = readdirSync(current); } catch { continue; }
+    for (const name of names) stack.push(join(current, name));
+  }
+  return Math.ceil(blocks512 / 2) * 1024;
+}
+
+/**
+ * Human-readable byte size. Sub-megabyte totals are the common case once the
+ * aged subset is sized correctly, and `Math.round(bytes / MB)` renders every
+ * one of them as "0 MB" — which is why the unit is chosen, not fixed.
+ * @param {number} bytes
+ * @returns {string}
+ */
+function formatBytes(bytes) {
+  const mb = bytes / (1024 * 1024);
+  if (mb >= 10) return `${Math.round(mb)} MB`;
+  if (mb >= 1) return `${mb.toFixed(2)} MB`;
+  if (bytes >= 1024) return `${Math.round(bytes / 1024)} KB`;
+  return `${bytes} B`;
+}
+
+/**
+ * Untracked is not the same as disposable. Three classes of untracked file
+ * under .orchestrator/ are load-bearing, so they are removed from the candidate
+ * set ENTIRELY rather than merely downgraded: a finding an operator must not
+ * act on is noise, and `fixable: true` routes it to the batch-work lane where
+ * acting on it is precisely what happens.
+ *
+ *   `.backfilled-*.marker` — the TOCTOU idempotency guards written by
+ *       scripts/lib/session-close-backfill.mjs (`markerName()`). The file's
+ *       EXISTENCE is the whole state: delete one and the next backfill pass
+ *       re-runs for that session id and duplicates its record. Age is the
+ *       NORMAL condition of a marker whose session closed months ago.
+ *   `*.jsonl` — append-only telemetry ledgers (audit, autopilot,
+ *       vault-staleness, repair-candidates). They ARE the history every metric
+ *       is computed from; mtime says when the ledger last grew, never whether
+ *       its contents are still needed.
+ *   `*.log` — append-only diagnostic logs (reconcile.rejected.log and
+ *       siblings). Same argument as the ledgers.
+ *
+ * Everything else stays reportable: stray `*.json` scratch, `research/*.md`,
+ * abandoned run directories, and the 147 MB of test-run captures this check was
+ * built for.
+ *
+ * @param {string} name basename of the candidate file
+ * @returns {boolean}
+ */
+function isRetainedArtifact(name) {
+  if (name.startsWith('.backfilled-') && name.endsWith('.marker')) return true;
+  return name.endsWith('.jsonl') || name.endsWith('.log');
+}
+
+/**
+ * H3 — Aged orchestrator artifacts.
+ *
+ * Measured 5/6. Largest observed: 184 MB under .orchestrator/, of which
+ * 147 MB were Playwright test-run captures dating back seven weeks, plus
+ * 592 files older than 30 days.
+ *
+ * Counts and sizes ONLY untracked aged files. Two properties are load-bearing
+ * and were both defects until 2026-08-22:
+ *
+ *   1. The byte total describes the set the sentence names — the aged files —
+ *      not the whole directory. Sizing the directory overstated the reachable
+ *      win by a factor of ~18 in this repo (11 MB claimed, 0.68 MB real).
+ *   2. Version-tracked paths are excluded. `.orchestrator/policy/*.json` and
+ *      `.orchestrator/steering/*.md` are read at runtime by hooks and skills;
+ *      their age is a sign of stability, not decay. Proposing them for
+ *      "pruning" is proposing to delete source.
+ *
+ *   3. Untracked is not the same as disposable. Three classes are untracked BY
+ *      DESIGN and load-bearing, and are excluded outright (see
+ *      `isRetainedArtifact`). Measured in this repo 2026-08-24: 24 of the 25
+ *      reported candidates were one of those three, so the finding was 96%
+ *      unactionable while carrying `fixable: true`.
+ *
+ * @param {string} repoRoot
+ * @param {number} ageDays
+ * @param {number} now
+ * @returns {{check: string, fixable: boolean, agedFiles: number, agedBytes: number, message: string}|null}
+ */
+export function checkStaleArtifacts(repoRoot, ageDays = DEFAULT_ARTIFACT_AGE_DAYS, now = Date.now()) {
+  const dir = join(repoRoot, '.orchestrator');
+  if (!existsSync(dir)) return null;
+
+  // Resolve the tracked set ONCE per call — `git ls-files --error-unmatch` per
+  // file would cost one process per candidate for the same answer.
+  //
+  // FAIL-SAFE, NOT FAIL-OPEN: when git cannot answer (no repo, git absent,
+  // non-zero exit) source and artifact are indistinguishable, so the probe
+  // stays SILENT rather than falling back to "nothing is tracked" — that
+  // fallback IS the defect this exclusion closes, and it would return
+  // invisibly. Losing an advisory finding costs nothing; proposing to delete
+  // versioned files costs a restore. `-z` suppresses git's path quoting, so
+  // non-ASCII and space-bearing paths compare byte-exactly.
+  const trackedRaw = git(['ls-files', '-z', '--', '.orchestrator'], repoRoot);
+  if (trackedRaw === null) return null;
+  const tracked = new Set(
+    trackedRaw
+      .split('\0')
+      .filter(Boolean)
+      .map((p) => join(repoRoot, p)),
+  );
+
+  const cutoff = now - ageDays * 24 * 60 * 60 * 1000;
+  let aged = 0;
+  let agedBytes = 0;
+  let scanned = 0;
+
+  /** @param {string} d @param {number} depth */
+  const walk = (d, depth) => {
+    // Bounded: a runaway scan on a huge artifact tree would cost more than
+    // the finding. 20k entries is far above any healthy .orchestrator/.
+    if (depth > 6 || scanned > 20_000) return;
+    let entries;
+    try {
+      entries = readdirSync(d, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of entries) {
+      const full = join(d, e.name);
+      if (e.isDirectory()) {
+        walk(full, depth + 1);
+      } else if (e.isFile()) {
+        // Counted before the tracked-skip so the 20k bound still measures the
+        // walk, not the reportable subset.
+        scanned++;
+        if (tracked.has(full)) continue;
+        // Untracked BY DESIGN and load-bearing — never a pruning candidate.
+        if (isRetainedArtifact(e.name)) continue;
+        try {
+          const st = statSync(full);
+          if (st.mtimeMs < cutoff) {
+            aged++;
+            agedBytes += st.size;
+          }
+        } catch {
+          /* vanished mid-scan — ignore */
+        }
+      }
+    }
+  };
+  walk(dir, 0);
+
+  if (aged === 0) return null;
+
+  // `fixable: true` stays. The only consumer is skills/session-start/SKILL.md
+  // (Phase 4), which routes fixable findings to "safe batch work" instead of
+  // the operator Q&A — prose guidance to the coordinator, not an automatic
+  // deletion run; `grep -rn "fixable" scripts/ skills/ hooks/` finds no other
+  // reader than the `mechanical` count below. With tracked paths AND the
+  // retained classes excluded the claim is now true: every reported path is an
+  // untracked artifact whose deletion loses nothing but disk.
+  return {
+    check: 'stale-artifacts',
+    fixable: true,
+    agedFiles: aged,
+    agedBytes,
+    amount: aged,
+    message: `${aged} untracked file(s) under .orchestrator/ older than ${ageDays}d${agedBytes > 0 ? ` (${formatBytes(agedBytes)} total)` : ''} — candidates for pruning (idempotency markers + ledgers excluded)`,
+  };
+}
+
+/**
+ * H4 — CI configuration hygiene.
+ *
+ * Measured 5/6. Checks locally declared executable commands without evaluating
+ * pipeline conditions or external includes; when no local audit step is found
+ * but `.gitlab-ci.yml` declares `include:`, the finding is downgraded to an
+ * unverifiable, non-fixable one. The dependency-audit gap is the load-bearing one: three
+ * of the tested repos carried known-vulnerable dependencies that no pipeline
+ * would ever surface.
+ *
+ * @param {string} repoRoot
+ * @returns {object[]}
+ */
+export function checkCiConfig(repoRoot) {
+  const findings = [];
+  const gitlabCi = join(repoRoot, '.gitlab-ci.yml');
+  const ghWorkflows = join(repoRoot, '.github', 'workflows');
+  const hasGitlab = existsSync(gitlabCi);
+  const hasGithub = existsSync(ghWorkflows);
+
+  // Only meaningful for repos that actually build something.
+  const hasManifest = ['package.json', 'pyproject.toml', 'Cargo.toml', 'go.mod'].some((m) =>
+    existsSync(join(repoRoot, m)),
+  );
+  if (!hasManifest) return findings;
+
+  if (!hasGitlab && !hasGithub) {
+    findings.push({
+      check: 'ci-config',
+      fixable: false,
+      message: 'no CI pipeline configured (.gitlab-ci.yml / .github/workflows) — nothing verifies commits',
+    });
+    return findings;
+  }
+
+  const ciConfigs = [];
+  if (hasGitlab) ciConfigs.push({ text: safeRead(gitlabCi), platform: 'gitlab' });
+  if (hasGithub) {
+    try {
+      for (const f of readdirSync(ghWorkflows)) {
+        if (f.endsWith('.yml') || f.endsWith('.yaml')) {
+          ciConfigs.push({ text: safeRead(join(ghWorkflows, f)), platform: 'github' });
+        }
+      }
+    } catch {
+      /* unreadable workflows dir — fall through with what we have */
+    }
+  }
+
+  if (ciConfigs.some(({ text }) => text) && !ciConfigs.some((config) => hasAuditStep(config))) {
+    // lead report 2026-11-10: an audit wrapper is evidence to verify, not a missing job to add.
+    let auditHint;
+    ciConfigs.some((config) => hasAuditStep(config, (command, job) => {
+      if (!/\baudit\b/i.test(job) && !/\baudit\b/i.test(command)) return false;
+      auditHint = { command, job };
+      return true;
+    }));
+    if (auditHint) {
+      findings.push({
+        check: 'ci-audit-job',
+        fixable: false,
+        message: `CI audit step not recognised (job ${auditHint.job} runs ${auditHint.command}) — verify it audits dependencies`,
+      });
+      return findings;
+    }
+    // Jobs supplied via include: (component/local/project/remote/template) are
+    // never resolved, so an audit may exist there — report it as unverifiable.
+    let includes = 0;
+    try {
+      const gitlabText = hasGitlab ? ciConfigs[0].text : '';
+      const include = yaml.loadAll(gitlabText, { schema: GITLAB_SCHEMA }).filter(isConfigMap).at(-1)?.include;
+      includes = Array.isArray(include) ? include.length : include ? 1 : 0;
+    } catch {
+      /* unparseable config — keep the plain missing-audit finding */
+    }
+    if (includes > 0) {
+      findings.push({
+        check: 'ci-audit-job',
+        fixable: false,
+        message: `CI dependency-audit step could not be verified: ${includes} include(s) not evaluated (.gitlab-ci.yml include:)`,
+      });
+      return findings;
+    }
+    findings.push({
+      check: 'ci-audit-job',
+      fixable: true,
+      message: 'CI runs no dependency-audit step — known-vulnerable dependencies cannot surface in the pipeline',
+    });
+  }
+
+  return findings;
+}
+
+const GITLAB_COMMAND_FIELDS = ['script', 'before_script', 'after_script'];
+const GITLAB_GLOBAL_FIELDS = new Set([
+  'stages', 'types', 'variables', 'default', 'include', 'workflow',
+  'image', 'services', 'cache', 'before_script', 'after_script', 'spec',
+]);
+const GITLAB_REFERENCE = Symbol('gitlab-reference');
+// js-yaml 5 (#2015): the loader default is CORE_SCHEMA without `<<` merge keys
+// (v4's DEFAULT_SCHEMA had them), and `Type` became `defineSequenceTag`.
+const GITLAB_SCHEMA = yaml.CORE_SCHEMA.withTags(
+  yaml.mergeTag,
+  yaml.defineSequenceTag('!reference', {
+    create: () => [],
+    addItem: (path, item) => { path.push(item); },
+    finalize: (path) => ({ [GITLAB_REFERENCE]: path }),
+    identify: () => false,
+  }),
+);
+const AUDIT_VALUE_FLAGS = new Set([
+  '--filter', '-F', '--dir', '-C', '--prefix', '--cwd', '--registry',
+  '--userconfig', '--globalconfig', '--workspace', '-w', '--cache', '--pm-on-fail',
+]);
+const AUDIT_BOOLEAN_FLAGS = new Set([
+  '-r', '--recursive', '-s', '--silent', '-g', '--global', '--workspaces', '--offline',
+]);
+// Python tool runners (#1538): subcommand words after the verb, and the runner
+// options that consume the next token.
+const RUNNER_SUBCOMMANDS = { uvx: [], pipx: ['run'], uv: ['tool', 'run'] };
+const RUNNER_VALUE_FLAGS = new Set(['--from', '--spec', '--python', '-p', '--with']);
+
+/** Inspect executable job/step locations, never arbitrary keys named run/script. */
+function hasAuditStep({ text, platform }, recognise = hasAuditCommand) {
+  let config;
+  try {
+    if (platform === 'gitlab') {
+      const documents = yaml.loadAll(text, { schema: GITLAB_SCHEMA });
+      if (documents.length === 1) {
+        [config] = documents;
+      } else if (documents.length === 2 && isConfigMap(documents[0])
+        && Object.keys(documents[0]).length === 1 && isConfigMap(documents[0].spec)) {
+        // GitLab permits a spec header followed by --- and the job document.
+        // Header input defaults are data; unrelated multi-document YAML is ambiguous.
+        [, config] = documents;
+      } else {
+        return false;
+      }
+    } else {
+      config = yaml.load(text);
+    }
+  } catch {
+    return false;
+  }
+  if (!isConfigMap(config)) return false;
+  if (platform === 'github') {
+    if (!isConfigMap(config.jobs)) return false;
+    return Object.entries(config.jobs).some(([name, job]) => isConfigMap(job)
+      && job.if !== false && Array.isArray(job.steps)
+      && job.steps.some((step) => isConfigMap(step) && step.if !== false
+        && typeof step.run === 'string' && recognise(step.run, name)));
+  }
+
+  return Object.keys(config).some((name) => {
+    if (name.startsWith('.') || GITLAB_GLOBAL_FIELDS.has(name)) return false;
+    const job = resolveGitlabJob(config, name);
+    if (!job?.script || job.when === 'never') return false;
+    return GITLAB_COMMAND_FIELDS.some((field) => {
+      let commands = job[field];
+      if (!Object.hasOwn(job, field) && field !== 'script') {
+        const inherit = job.inherit?.default;
+        if (inherit === false || (Array.isArray(inherit) && !inherit.includes(field))) return false;
+        commands = Object.hasOwn(config.default ?? {}, field) ? config.default[field] : config[field];
+      }
+      return hasGitlabAuditCommands(commands, config, (command) => recognise(command, name));
+    });
+  });
+}
+
+function isConfigMap(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    && !Object.hasOwn(value, GITLAB_REFERENCE);
+}
+
+/** Local extends uses later-parent/child replacement for command arrays. */
+function resolveGitlabJob(config, name, seen = new Set()) {
+  if (typeof name !== 'string' || !Object.hasOwn(config, name)
+    || !isConfigMap(config[name]) || seen.has(name)) return null;
+  seen.add(name);
+  const job = config[name];
+  let merged = {};
+  const parents = Array.isArray(job.extends) ? job.extends : [job.extends];
+  for (const parent of parents.filter((entry) => entry !== undefined)) {
+    const inherited = resolveGitlabJob(config, parent, seen);
+    // An unresolved later parent may override earlier commands. Only fields
+    // supplied by later local parents or the job itself remain evidence.
+    merged = inherited ? mergeGitlabJob(merged, inherited) : {};
+  }
+  seen.delete(name);
+  return mergeGitlabJob(merged, job);
+}
+
+function mergeGitlabJob(parent, child) {
+  const merged = { ...parent, ...child };
+  // Command fields replace wholesale; inherit is a map, so its default flag
+  // survives a child that overrides only inherit.variables.
+  if (isConfigMap(parent.inherit) && isConfigMap(child.inherit)) {
+    merged.inherit = { ...parent.inherit, ...child.inherit };
+  }
+  return merged;
+}
+
+/** Resolve only command strings/arrays and local !reference paths, with cycle guards. */
+function hasGitlabAuditCommands(commands, config, recognise) {
+  const seen = new WeakSet();
+  function visit(value) {
+    if (typeof value === 'string') return recognise(value);
+    if (!value || typeof value !== 'object' || seen.has(value)) return false;
+    seen.add(value);
+    let found = false;
+    if (Array.isArray(value)) {
+      found = value.some(visit);
+    } else if (Array.isArray(value[GITLAB_REFERENCE])) {
+      let target = config;
+      for (const key of value[GITLAB_REFERENCE]) {
+        target = target && typeof target === 'object' && Object.hasOwn(target, key) ? target[key] : undefined;
+      }
+      found = visit(target);
+    }
+    seen.delete(value);
+    return found;
+  }
+  return visit(commands);
+}
+
+/**
+ * Bounded command recognition: wrappers and options may precede the audit
+ * subcommand, but another verb (install/run/echo) ends the search. Unknown
+ * value-taking flags and commands hidden in external includes are not resolved.
+ */
+function hasAuditCommand(command) {
+  return splitChainSegments(tokenizeCommand(command)).some((segment) => hasAuditSegment(segment));
+}
+
+function hasAuditSegment(segment, depth = 0) {
+  const resolved = resolveSegmentVerb(segment);
+  if (resolved.alt) return false;
+  let { verb, index } = resolved;
+  if (resolved.payloads.length > 0) {
+    if (depth >= 3 || resolved.payloads.length !== 1) return false;
+    const tokens = tokenizeCommand(resolved.payloads[0]);
+    const parts = splitChainSegments(tokens);
+    // env -S splits argv; it does not execute shell operators. Restrict this
+    // reuse of the shared tokenizer to one plain command with no redirects.
+    if (parts.length !== 1 || parts[0].length !== tokens.length
+      || tokens.some((token) => token.redirect)) return false;
+    const trailingArgs = index < 0 ? [] : segment.slice(index);
+    return hasAuditSegment([...tokens, ...trailingArgs], depth + 1);
+  }
+  if (verb === 'uvx' || verb === 'pipx' || verb === 'uv') {
+    let i = index + 1;
+    // `uvx` is an alias of `uv tool run`; `pipx` executes only through `run`.
+    for (const word of RUNNER_SUBCOMMANDS[verb]) {
+      if (segment[i]?.text !== word) return false;
+      i++;
+    }
+    // Runner options before the tool. Unknown flags count as value-less, so an
+    // unlisted value-taking flag makes its value the "tool" and the line is
+    // missed — a false finding, never a false pass. Revisit if a real CI line
+    // with such a flag is reported as missing its audit.
+    // `--from`/`--spec` name the package that provides the tool; another
+    // package exposing a `pip-audit` entry point is not the audit.
+    let sourcePackage = null;
+    while (segment[i]) {
+      const { text, redirect } = segment[i];
+      // A redirect operand is data, even when it names the audit package.
+      if (redirect) return false;
+      if (text === '--') { i++; break; }
+      if (!text.startsWith('-')) break;
+      if (RUNNER_VALUE_FLAGS.has(text)) {
+        if (!segment[i + 1] || segment[i + 1].redirect) return false;
+        if (text === '--from' || text === '--spec') sourcePackage = segment[i + 1].text;
+        i += 2;
+      } else {
+        i++;
+      }
+    }
+    if (!segment[i] || segment[i].redirect) return false;
+    if (segment.slice(index + 1).some((token) => ['-h', '--help', '--version'].includes(token.text))) return false;
+    if (sourcePackage !== null && !/^pip-audit(?:\s*(?:[=<>~!]=?|@)\s*[\w.+*-]+)?$/.test(sourcePackage)) return false;
+    return /^pip-audit(?:@[\w.+-]+)?$/.test(segment[i].text);
+  }
+  if (verb === 'corepack' || verb === 'npx') {
+    index++;
+    while (['-y', '--yes', '--no-install', '--'].includes(segment[index]?.text)) index++;
+    verb = segment[index]?.text;
+  }
+  if (segment.slice(index + 1).some((token) => ['-h', '--help', '--version'].includes(token.text))) return false;
+  if (/^(?:pip-audit|osv-scanner|dependency-check(?:\.sh)?)$/.test(verb ?? '')) return true;
+  if (!/^(?:npm|pnpm|yarn|bun)(?:@[\w.+-]+)?$/.test(verb ?? '') && verb !== 'cargo') return false;
+  let i = index + 1;
+  while (segment[i]?.text.startsWith('-')) {
+    const flag = segment[i].text;
+    if (flag === '--') { i++; break; }
+    if (AUDIT_VALUE_FLAGS.has(flag)) {
+      if (!segment[i + 1] || segment[i + 1].redirect) return false;
+      i += 2;
+    } else if (AUDIT_BOOLEAN_FLAGS.has(flag) || /^--[\w-]+=/.test(flag)) {
+      i++;
+    } else {
+      return false;
+    }
+  }
+  if (/^yarn(?:@|$)/.test(verb) && segment[i]?.text === 'npm') i++;
+  return segment[i]?.text === 'audit';
+}
+
+/** @param {string} p @returns {string} */
+function safeRead(p) {
+  try {
+    return readFileSync(p, 'utf8');
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * H5 — Env documentation presence (deliberately narrow; see module header).
+ *
+ * Reports ONLY the falsifiable case: code reads environment variables and no
+ * `.env.example` exists anywhere. Does NOT attempt to name dead or missing
+ * variables — that requires resolving indirection (central schema modules,
+ * injected config objects) and produced a 100% false-positive rate when
+ * attempted naively during the diagnostic runs.
+ *
+ * @param {string} repoRoot
+ * @returns {object|null}
+ */
+export function checkEnvDocumentation(repoRoot) {
+  const tracked = git(['ls-files'], repoRoot);
+  if (!tracked) return null;
+
+  const files = tracked.split('\n').filter((f) => /\.(mjs|cjs|js|ts|tsx|py|go|rs)$/.test(f));
+  if (files.length === 0) return null;
+
+  const hasExample = ['.env.example', '.env.sample', '.env.template'].some((n) =>
+    existsSync(join(repoRoot, n)),
+  );
+  if (hasExample) return null;
+
+  // Sample rather than read every file — one hit is enough to decide.
+  let readsEnv = false;
+  for (const f of files.slice(0, 400)) {
+    const text = safeRead(join(repoRoot, f));
+    if (/process\.env\.\w|os\.environ|std::env::var|os\.Getenv/.test(text)) {
+      readsEnv = true;
+      break;
+    }
+  }
+  if (!readsEnv) return null;
+
+  return {
+    check: 'env-documentation',
+    fixable: false,
+    message: 'code reads environment variables but no .env.example/.env.sample exists — required configuration is undiscoverable',
+  };
+}
+
+/** The session ledger the orchestrator appends to on every close. */
+const SESSIONS_LEDGER_REL = '.orchestrator/metrics/sessions.jsonl';
+
+/**
+ * The projects-baseline `.gitignore` block that keeps the ledgers tracked on
+ * purpose: a comment line carrying the `baseline:orchestrator` block marker, or
+ * the block's own sentence. Either one documents the consumer decision (#1851).
+ */
+const BASELINE_LEDGER_DECISION_RE = /^\s*#.*\bbaseline:orchestrator\b|Persistent records stay TRACKED/m;
+
+/**
+ * H6 — Tracked session ledger (#1666).
+ *
+ * A repo that TRACKS `.orchestrator/metrics/sessions.jsonl` gets one commit-worthy
+ * diff per session close, and every linked worktree checks out its own copy —
+ * where foreign records landed in #1660. The hint is text only; nothing here
+ * runs it. `fixable: false`: untracking changes what the repo shares with
+ * every clone, an owner decision, not batch work.
+ *
+ * Returns `null` when the repo's `.gitignore` carries the projects-baseline
+ * `baseline:orchestrator` block: that block states the ledgers stay tracked as
+ * session history, so the consumer decision is explicit and the hint must not
+ * recommend an index write that contradicts it (#1851). Only the root
+ * `.gitignore` is read — the block lives there, never in `.git/info/exclude`.
+ *
+ * @param {string} repoRoot
+ * @returns {object|null}
+ */
+export function checkTrackedSessionsLedger(repoRoot) {
+  // `--error-unmatch` exits non-zero (→ null) when the path is not tracked.
+  if (git(['ls-files', '--error-unmatch', '--', SESSIONS_LEDGER_REL], repoRoot) === null) return null;
+  if (BASELINE_LEDGER_DECISION_RE.test(safeRead(join(repoRoot, '.gitignore')))) return null;
+  return {
+    check: 'tracked-sessions-ledger',
+    fixable: false,
+    message: `${SESSIONS_LEDGER_REL} is tracked in git — every session close dirties the tree and each worktree carries its own copy; untrack it: \`git rm --cached ${SESSIONS_LEDGER_REL}\` and add it to .gitignore`,
+  };
+}
+
+/**
+ * Aggregate the project-hygiene family into one banner result.
+ *
+ * Returns a SINGLE result rather than one banner per check: Phase 4 already
+ * renders 13 banners, and the diagnostic runs showed a flat list stops being
+ * read past roughly 25 findings. The caller renders the summary plus the top
+ * findings and can use `mechanical` to route the fixable subset separately.
+ *
+ * @param {{ repoRoot: string, now?: number, thresholds?: object, deadline?: number }} opts
+ *   `deadline` (epoch ms, #84) bounds the ignored-ballast sizing; omitted, the
+ *   sizing keeps its own per-chunk 30 s budget
+ * @returns {{ severity: 'warn', message: string, findings: object[], mechanical: number } | null}
+ */
+export function checkProjectHygiene({ repoRoot, now = Date.now(), thresholds = {}, deadline } = {}) {
+  if (!repoRoot || typeof repoRoot !== 'string') return null;
+  if (!existsSync(join(repoRoot, '.git'))) return null;
+
+  const {
+    releaseDriftCommits = DEFAULT_RELEASE_DRIFT_COMMITS,
+    ballastMb = DEFAULT_BALLAST_MB,
+    artifactAgeDays = DEFAULT_ARTIFACT_AGE_DAYS,
+  } = thresholds;
+
+  const findings = [];
+  try {
+    const release = checkReleaseHygiene(repoRoot, releaseDriftCommits);
+    if (release) findings.push(release);
+
+    findings.push(...checkIgnoredBallast(repoRoot, ballastMb, { deadline }));
+
+    const stale = checkStaleArtifacts(repoRoot, artifactAgeDays, now);
+    if (stale) findings.push(stale);
+
+    findings.push(...checkCiConfig(repoRoot));
+
+    const env = checkEnvDocumentation(repoRoot);
+    if (env) findings.push(env);
+
+    const ledger = checkTrackedSessionsLedger(repoRoot);
+    if (ledger) findings.push(ledger);
+  } catch {
+    // Probe family is advisory — a partial result beats a crashed session-start.
+    if (findings.length === 0) return null;
+  }
+
+  if (findings.length === 0) return null;
+
+  const mechanical = findings.filter((f) => f.fixable).length;
+  const head = findings.slice(0, 3).map((f) => `• ${f.message}`).join('\n');
+  const rest = findings.length > 3 ? `\n  …and ${findings.length - 3} more.` : '';
+
+  return {
+    severity: 'warn',
+    message:
+      `⚠ project-hygiene: ${findings.length} finding(s), ${mechanical} mechanically fixable:\n${head}${rest}`,
+    findings,
+    mechanical,
+  };
+}

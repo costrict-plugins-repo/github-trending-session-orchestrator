@@ -1,0 +1,565 @@
+/**
+ * fleet-protocol.mjs — Fleet protocol v1: file-based navigator lease + session
+ * check-ins under `~/.config/navigator/` (#1462, PRD !53 § 3).
+ *
+ * The protocol state lives in plain files so every platform (Claude Code, Codex,
+ * a headless run) can read and write it without a server:
+ *
+ *   <navigatorDir>/leases/navigator.json        — the navigator lease
+ *   <navigatorDir>/checkin/<session_id>.json    — one check-in per session
+ *   <navigatorDir>/auflagen/<session_id>.json   — conditions issued to a session
+ *
+ * `<navigatorDir>` is `NAVIGATOR_CONFIG_DIR` (trimmed; empty/whitespace counts as
+ * unset) or `<home>/.config/navigator`. Files are 0600, directories 0700.
+ * Check-in and lease timestamps are UTC with `Z`, in a form per file: the
+ * check-in's `zeit` is seconds, `date -u +%FT%TZ` (`YYYY-MM-DDTHH:MM:SSZ`,
+ * stamped by the CLI); the lease's `seit` / `laeuft_ab` are seconds or
+ * milliseconds (`LEASE_TS_RE`); the auflagen content belongs to the navigator.
+ *
+ * "A navigator is active" means exactly one thing: a readable, well-formed lease
+ * whose `laeuft_ab` lies in the future. Everything else is fail-closed — an
+ * expired lease is `none`, a lease that cannot be read or validated is
+ * `unreadable`, and neither is ever `active`.
+ *
+ * An auflagen file is keyed by the semantic session id, which collides across
+ * repos (`main-<date>-session-N`), so it is only accepted when its mandatory
+ * `repo` field resolves to the reader's own git common dir ({@link readAuflagen},
+ * #1520 / navigator#190).
+ *
+ * There is no Rücklauf claim marker (removed in #1611): the owner inbox only lets
+ * a session rest when it reported in the turn of its last answer, so every
+ * waiting turn reports and nothing here suppresses a repeat.
+ *
+ * Session ids become file names, so {@link isSafeSessionId} is the security
+ * boundary between check-in input and the filesystem: every path builder that
+ * takes a session id refuses an unsafe one with a TypeError.
+ */
+
+import fsSync, { promises as fs } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { hookProgram } from './program-lookup.mjs';
+import { execFileSync } from './native-command.mjs';
+
+/** Env var that overrides the navigator directory. */
+export const NAVIGATOR_CONFIG_DIR_ENV = 'NAVIGATOR_CONFIG_DIR';
+
+/** Minutes a session waits for a navigator before it falls back (PRD !53 § 3). */
+export const CHECKIN_FALLBACK_MIN = 10;
+
+// Bound JSON reads on the UUID fallback: a session older than the newest N
+// check-ins is not found. Revisit when active sessions fall outside this window.
+export const CHECKIN_SESSION_SCAN_LIMIT = 256;
+
+const SESSION_ID_RE = /^[A-Za-z0-9._-]+$/;
+const SESSION_ID_MAX = 128;
+const UTC_SECONDS_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/;
+
+/** Lease timestamps: UTC with `Z`, seconds or milliseconds — never a local-time reading. */
+const LEASE_TS_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/;
+
+const PLATTFORMEN = ['claude', 'codex', 'kopflos'];
+const MODI = ['housekeeping', 'feature', 'deep', 'operations'];
+
+/**
+ * Resolve the navigator directory.
+ * @param {{ env?: Record<string, string|undefined>, home?: string }} [opts]
+ * @returns {string} absolute path
+ */
+export function navigatorDir({ env = process.env, home = os.homedir() } = {}) {
+  const raw = env[NAVIGATOR_CONFIG_DIR_ENV];
+  const override = typeof raw === 'string' ? raw.trim() : '';
+  if (override) return path.resolve(override);
+  return path.join(home, '.config', 'navigator');
+}
+
+/**
+ * True when fleet integration is explicitly configured or its default directory exists.
+ * A nonblank override opts in even before the directory is created; stat errors disable it.
+ * @param {{ env?: Record<string, string|undefined>, home?: string }} [opts]
+ * @returns {boolean}
+ */
+export function fleetIntegrationEnabled({ env = process.env, home = os.homedir() } = {}) {
+  const raw = env[NAVIGATOR_CONFIG_DIR_ENV];
+  const override = typeof raw === 'string' ? raw.trim() : '';
+  if (override) return true;
+  try {
+    return fsSync.statSync(path.join(home, '.config', 'navigator')).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Path of the navigator lease file.
+ * @param {{ env?: Record<string, string|undefined>, home?: string }} [opts]
+ * @returns {string}
+ */
+export function leasePath(opts) {
+  return path.join(navigatorDir(opts), 'leases', 'navigator.json');
+}
+
+/**
+ * True when `id` is safe to use as a single file-name component: only
+ * `[A-Za-z0-9._-]`, 1..128 chars, and not `.` / `..`. This excludes `/`, `\`,
+ * NUL and every other separator by construction.
+ * @param {unknown} id
+ * @returns {boolean}
+ */
+export function isSafeSessionId(id) {
+  return (
+    typeof id === 'string' &&
+    id.length > 0 &&
+    id.length <= SESSION_ID_MAX &&
+    id !== '.' &&
+    id !== '..' &&
+    SESSION_ID_RE.test(id)
+  );
+}
+
+/** @param {unknown} sessionId */
+function assertSafeSessionId(sessionId) {
+  if (!isSafeSessionId(sessionId)) {
+    throw new TypeError(`unsafe session id: ${JSON.stringify(String(sessionId)).slice(0, 80)}`);
+  }
+}
+
+/**
+ * Path of a session's check-in file.
+ * @param {string} sessionId
+ * @param {{ env?: Record<string, string|undefined>, home?: string }} [opts]
+ * @returns {string}
+ * @throws {TypeError} when `sessionId` fails {@link isSafeSessionId}
+ */
+export function checkinPath(sessionId, opts) {
+  assertSafeSessionId(sessionId);
+  return path.join(navigatorDir(opts), 'checkin', `${sessionId}.json`);
+}
+
+/**
+ * Recover file and semantic keys for an exact native UUID match. This is a
+ * fallback, not a dispatch hot-path lookup: all candidates need a stat, but
+ * only the newest `limit` files are read. Unreadable/broken files are skipped.
+ * `checkins` shares already-read records (including null for failed reads)
+ * with the caller so neither side reads a key twice.
+ * @param {string} native
+ * @param {{ env?: Record<string, string|undefined>, home?: string, limit?: number,
+ *   checkins?: Map<string, object|null> }} [opts]
+ * @returns {Promise<string[]>}
+ */
+export async function findCheckinSessionKeys(native, {
+  env, home, limit = CHECKIN_SESSION_SCAN_LIMIT, checkins = new Map(),
+} = {}) {
+  if (!isNativeUuid(native) || !Number.isInteger(limit) || limit <= 0) return [];
+  const opts = { env, home };
+  const candidates = [];
+  try {
+    const entries = await fs.readdir(path.dirname(checkinPath(native, opts)), { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.isFile() || !entry.name.endsWith('.json')) continue;
+      const key = entry.name.slice(0, -5);
+      if (!isSafeSessionId(key)) continue;
+      try {
+        const stat = await fs.stat(checkinPath(key, opts));
+        candidates.push({ key, mtime: stat.mtimeMs });
+      } catch { /* a disappearing or unreadable candidate is not a match */ }
+    }
+  } catch {
+    return [];
+  }
+  candidates.sort((a, b) => b.mtime - a.mtime);
+  const keys = new Set();
+  for (const { key } of candidates.slice(0, limit)) {
+    if (!checkins.has(key)) {
+      try {
+        checkins.set(key, JSON.parse(await fs.readFile(checkinPath(key, opts), 'utf8')));
+      } catch {
+        checkins.set(key, null);
+      }
+    }
+    const checkin = checkins.get(key);
+    if (checkin?.session_uuid !== native) continue;
+    keys.add(key);
+    if (isSafeSessionId(checkin.session)) keys.add(checkin.session);
+  }
+  return [...keys];
+}
+
+/**
+ * Path of a session's conditions ("Auflagen") file.
+ * @param {string} sessionId
+ * @param {{ env?: Record<string, string|undefined>, home?: string }} [opts]
+ * @returns {string}
+ * @throws {TypeError} when `sessionId` fails {@link isSafeSessionId}
+ */
+export function auflagenPath(sessionId, opts) {
+  assertSafeSessionId(sessionId);
+  return path.join(navigatorDir(opts), 'auflagen', `${sessionId}.json`);
+}
+
+/**
+ * Format a date as `YYYY-MM-DDTHH:MM:SSZ` (the output of `date -u +%FT%TZ`).
+ * @param {Date} [date]
+ * @returns {string}
+ */
+export function utcSecondsTimestamp(date = new Date()) {
+  return date.toISOString().replace(/\.\d{3}Z$/, 'Z');
+}
+
+/**
+ * When the Standard-Auflagen apply to a check-in written at `zeit` if no
+ * `auflagen/<session_id>.json` has appeared: {@link CHECKIN_FALLBACK_MIN} later
+ * while a navigator is active (it may still write one), and at `zeit` itself
+ * otherwise — with no active navigator nobody will, so the fallback is due at
+ * once (#1501 item 8: this deadline lived only as prose in session-start).
+ * @param {string} zeit the check-in's `zeit`, as {@link utcSecondsTimestamp} writes it
+ * @param {'active'|'none'|'unreadable'} navigatorState from {@link readNavigatorLease}
+ * @returns {string} same form as `zeit`
+ */
+export function fallbackDueAt(zeit, navigatorState) {
+  if (navigatorState !== 'active') return zeit;
+  return utcSecondsTimestamp(new Date(Date.parse(zeit) + CHECKIN_FALLBACK_MIN * 60_000));
+}
+
+/** @param {unknown} v */
+function isPlainObject(v) {
+  return v !== null && typeof v === 'object' && !Array.isArray(v);
+}
+
+/** @param {unknown} v */
+function isNonEmptyString(v) {
+  return typeof v === 'string' && v.length > 0;
+}
+
+/** @param {unknown} v */
+function isIsoTimestamp(v) {
+  return typeof v === 'string' && !Number.isNaN(Date.parse(v));
+}
+
+function isLeaseTimestamp(v) {
+  return typeof v === 'string' && LEASE_TS_RE.test(v) && isIsoTimestamp(v);
+}
+
+const REQUIRED_CHECKIN_FIELDS = [
+  'session', 'plattform', 'repo', 'modus', 'auftrag_ref',
+  'kandidaten', 'schreibbereich', 'rueckfall', 'zeit',
+];
+
+/** Repo name shape accepted in a check-in: `name` or `group/name`, no path parts. */
+const REPO_NAME_RE = /^[A-Za-z0-9._-]{1,100}(?:\/[A-Za-z0-9._-]{1,100})?$/;
+
+/** Lease `adresse` shape (a ListAgents peer name): no whitespace, no control bytes. */
+const ADRESSE_RE = /^[A-Za-z0-9._:@-]{1,128}$/;
+
+/** Native harness session UUID shape (`CLAUDE_CODE_SESSION_ID`). */
+const NATIVE_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * True only for a string shaped like a native harness session UUID (#1839).
+ * @param {unknown} v
+ * @returns {boolean}
+ */
+export function isNativeUuid(v) {
+  return typeof v === 'string' && NATIVE_UUID_RE.test(v);
+}
+
+/** True for an issue reference: a non-negative integer or a `#123` / `123` string. */
+function isIssueRef(v) {
+  if (typeof v === 'number') return Number.isInteger(v) && v >= 0;
+  return typeof v === 'string' && /^#?\d{1,9}$/.test(v);
+}
+
+/**
+ * Per-field type checks. Each returns an error message or null. Applied to every
+ * PRESENT field; presence of the required ones is checked separately.
+ * @type {Record<string, (v: unknown) => string|null>}
+ */
+const CHECKIN_FIELD_CHECKS = {
+  session: (v) =>
+    isSafeSessionId(v) ? null : 'session must be a safe id: [A-Za-z0-9._-], 1..128 chars, not . or ..',
+  // Optional (#1839): the process-local native id, the fallback file key when the
+  // semantic id is occupied by another repo; the navigator matches on it too.
+  session_uuid: (v) => (isNativeUuid(v) ? null : 'session_uuid must be a native UUID'),
+  plattform: (v) => (PLATTFORMEN.includes(/** @type {string} */ (v)) ? null : `plattform must be one of ${PLATTFORMEN.join('|')}`),
+  // A repo NAME (optionally `group/name`), never a filesystem path: the value
+  // travels in `orchestrator.fleet.checkin`, which may leave the host over the
+  // optional events webhook (docs/events-schema.md: "never the absolute root").
+  repo: (v) => (typeof v === 'string' && REPO_NAME_RE.test(v) ? null : 'repo must be a repo name [A-Za-z0-9._-] (optionally group/name), not a path'),
+  repo_id: (v) => (v === null || typeof v === 'string' ? null : 'repo_id must be a string or null'),
+  worktree: (v) => (typeof v === 'boolean' ? null : 'worktree must be a boolean'),
+  modus: (v) => (MODI.includes(/** @type {string} */ (v)) ? null : `modus must be one of ${MODI.join('|')}`),
+  auftrag_ref: (v) => (isNonEmptyString(v) ? null : 'auftrag_ref must be a non-empty string'),
+  konto_slot: (v) =>
+    v === null || typeof v === 'string' || (typeof v === 'number' && Number.isFinite(v))
+      ? null
+      : 'konto_slot must be a number, a string or null',
+  quota: (v) => (typeof v === 'string' ? null : 'quota must be a string'),
+  stand: (v) => (isPlainObject(v) ? null : 'stand must be an object'),
+  // Issue numbers only (42 or "#42"), at most 64 — same webhook reasoning as `repo`.
+  kandidaten: (v) =>
+    Array.isArray(v) && v.length <= 64 && v.every(isIssueRef)
+      ? null
+      : 'kandidaten must be an array of at most 64 issue numbers (42 or "#42")',
+  schreibbereich: (v) =>
+    Array.isArray(v) && v.every((e) => typeof e === 'string') ? null : 'schreibbereich must be an array of strings',
+  bedarf: (v) => (isPlainObject(v) ? null : 'bedarf must be an object'),
+  vorab_geschrieben: (v) => (Array.isArray(v) ? null : 'vorab_geschrieben must be an array'),
+  rueckfall: (v) => (isNonEmptyString(v) ? null : 'rueckfall must be a non-empty string'),
+  // Optional (#1960): the session's context in whole thousands of tokens, or the
+  // literal "nicht messbar" — never a 0 or "unter der Schwelle" for a context
+  // nobody measured (scripts/lib/context-threshold.mjs UNMEASURABLE_LABEL).
+  kontext_k: (v) =>
+    (typeof v === 'number' && Number.isInteger(v) && v >= 0 && v <= 100_000) || v === 'nicht messbar'
+      ? null
+      : 'kontext_k must be a whole number of thousand tokens (0..100000) or "nicht messbar"',
+  zeit: (v) =>
+    typeof v === 'string' && UTC_SECONDS_RE.test(v) && isIsoTimestamp(v)
+      ? null
+      : 'zeit must be a UTC timestamp YYYY-MM-DDTHH:MM:SSZ',
+};
+
+/**
+ * Validate a check-in record (PRD !53 table 3.2).
+ * @param {unknown} obj
+ * @returns {string[]} error messages; empty means valid
+ */
+export function validateCheckin(obj) {
+  if (!isPlainObject(obj)) return ['check-in must be a JSON object'];
+  const rec = /** @type {Record<string, unknown>} */ (obj);
+  const errors = [];
+  for (const field of REQUIRED_CHECKIN_FIELDS) {
+    if (rec[field] === undefined) errors.push(`missing required field: ${field}`);
+  }
+  for (const [field, check] of Object.entries(CHECKIN_FIELD_CHECKS)) {
+    if (rec[field] === undefined) continue;
+    const err = check(rec[field]);
+    if (err) errors.push(err);
+  }
+  return errors;
+}
+
+/**
+ * Validate a parsed lease; returns the first problem or null.
+ * @param {unknown} lease
+ * @returns {string|null}
+ */
+function leaseProblem(lease) {
+  if (!isPlainObject(lease)) return 'lease is not a JSON object';
+  const l = /** @type {Record<string, unknown>} */ (lease);
+  // Shape-checked at the source ("escaped at generation"): both values can reach
+  // the operator's session-start banner, so control bytes are refused here.
+  if (!isSafeSessionId(l.session_id)) return 'lease.session_id missing or not a safe id';
+  if (!PLATTFORMEN.includes(/** @type {string} */ (l.plattform))) return `lease.plattform must be one of ${PLATTFORMEN.join('|')}`;
+  if (l.adresse !== undefined && l.adresse !== null && !(typeof l.adresse === 'string' && ADRESSE_RE.test(l.adresse))) {
+    return 'lease.adresse must be null or a peer name [A-Za-z0-9._:@-] (1..128 chars)';
+  }
+  if (l.uebergabe_an !== undefined && l.uebergabe_an !== null && typeof l.uebergabe_an !== 'string') {
+    return 'lease.uebergabe_an must be a string or null';
+  }
+  // Strict UTC form: a `Z`-less value would be read in the host's local time and
+  // could EXTEND the lease west of UTC — a fail-open reading, hence unreadable.
+  if (!isLeaseTimestamp(l.seit)) return 'lease.seit missing or not a UTC timestamp (…Z)';
+  if (!isLeaseTimestamp(l.laeuft_ab)) return 'lease.laeuft_ab missing or not a UTC timestamp (…Z)';
+  return null;
+}
+
+/**
+ * Read the navigator lease. Never throws; fail-closed.
+ *
+ * @param {{ now?: number, env?: Record<string, string|undefined>, home?: string }} [opts]
+ * @returns {Promise<{ state: 'active', lease: object } | { state: 'none' } | { state: 'unreadable', reason: string }>}
+ */
+export async function readNavigatorLease({ now = Date.now(), env, home } = {}) {
+  let raw;
+  try {
+    raw = await fs.readFile(leasePath({ env, home }), 'utf8');
+  } catch (err) {
+    if (err && /** @type {NodeJS.ErrnoException} */ (err).code === 'ENOENT') return { state: 'none' };
+    const code = err && /** @type {NodeJS.ErrnoException} */ (err).code;
+    return { state: 'unreadable', reason: `read failed: ${code || 'unknown error'}` };
+  }
+  let lease;
+  try {
+    lease = JSON.parse(raw);
+  } catch {
+    return { state: 'unreadable', reason: 'lease is not valid JSON' };
+  }
+  const problem = leaseProblem(lease);
+  if (problem) return { state: 'unreadable', reason: problem };
+  if (Date.parse(lease.laeuft_ab) <= now) return { state: 'none' };
+  return { state: 'active', lease };
+}
+
+/** Timeout for the `git rev-parse` calls in {@link readAuflagen}. */
+const GIT_TIMEOUT_MS = 5_000;
+
+/**
+ * Absolute, realpath'd git common dir of `dir` — the same value for a main tree,
+ * any of its linked worktrees, and the `.git` directory itself — or null when
+ * `dir` is not inside a git repository (or git is unavailable).
+ * @param {string} dir
+ * @returns {string|null}
+ */
+function gitCommonDir(dir) {
+  try {
+    const out = execFileSync(hookProgram('git', dir), ['-C', dir, 'rev-parse', '--path-format=absolute', '--git-common-dir'], {
+      env: gitEnv(),
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: GIT_TIMEOUT_MS,
+    }).trim();
+    if (!out) return null;
+    return realpathSyncSafe(out);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The only environment variables forwarded to `git`. An inherited `GIT_DIR`
+ * outranks `-C`, so both sides of the repo comparison would resolve to the
+ * same directory and a foreign repo's Auflagen would be ACCEPTED. Same
+ * allowlist as `git-config-drift.mjs` / `check-banner-parity.mjs`.
+ */
+const GIT_ENV_ALLOWLIST = Object.freeze(['PATH', 'HOME', 'LANG', 'LC_ALL', 'TMPDIR', 'TZ']);
+
+function gitEnv() {
+  /** @type {Record<string, string>} */
+  const env = {};
+  for (const k of GIT_ENV_ALLOWLIST) if (process.env[k] !== undefined) env[k] = /** @type {string} */ (process.env[k]);
+  return env;
+}
+
+/** @param {string} p */
+function realpathSyncSafe(p) {
+  try {
+    return fsSync.realpathSync(p);
+  } catch {
+    return path.resolve(p);
+  }
+}
+
+/**
+ * Read this session's conditions file and accept it only when it belongs to the
+ * reader's repository. Never throws; fail-closed.
+ *
+ * The file's mandatory `repo` field (an absolute path to the target repo's
+ * toplevel or its git common dir, written by the navigator) and `repoRoot` are
+ * both resolved to their git common dir, so a session in a linked worktree
+ * matches a file naming the main tree. Every `rejected` result means: behave as
+ * if no file existed (Standard-Auflagen apply).
+ *
+ * @param {string} sessionId
+ * @param {{ repoRoot?: string, env?: Record<string, string|undefined>, home?: string }} [opts]
+ * @returns {Promise<
+ *   | { state: 'absent' }
+ *   | { state: 'accepted', auflagen: Record<string, unknown> }
+ *   | { state: 'rejected', reason: 'unsafe-session-id'|'unreadable'|'invalid-json'|'repo-missing'|'repo-unresolved'|'repo-mismatch' }
+ * >}
+ */
+export async function readAuflagen(sessionId, { repoRoot = process.cwd(), env, home } = {}) {
+  if (!isSafeSessionId(sessionId)) return { state: 'rejected', reason: 'unsafe-session-id' };
+  let raw;
+  try {
+    raw = await fs.readFile(auflagenPath(sessionId, { env, home }), 'utf8');
+  } catch (err) {
+    if (err && /** @type {NodeJS.ErrnoException} */ (err).code === 'ENOENT') return { state: 'absent' };
+    return { state: 'rejected', reason: 'unreadable' };
+  }
+  let auflagen;
+  try {
+    auflagen = JSON.parse(raw);
+  } catch {
+    return { state: 'rejected', reason: 'invalid-json' };
+  }
+  if (!isPlainObject(auflagen)) return { state: 'rejected', reason: 'invalid-json' };
+  const fileRepo = auflagen.repo;
+  if (typeof fileRepo !== 'string' || !path.isAbsolute(fileRepo)) return { state: 'rejected', reason: 'repo-missing' };
+  const own = gitCommonDir(repoRoot);
+  if (!own) return { state: 'rejected', reason: 'repo-unresolved' };
+  if (gitCommonDir(fileRepo) !== own) return { state: 'rejected', reason: 'repo-mismatch' };
+  return { state: 'accepted', auflagen };
+}
+
+/**
+ * Characters that must never reach a terminal or transcript from a foreign
+ * file, because they hide or reorder text: C0 except TAB and LF, DEL, C1, the
+ * Arabic letter mark (U+061C), zero-width and directional marks
+ * (U+200B..U+200F), line/paragraph separators (U+2028, U+2029), bidi
+ * embedding/override (U+202A..U+202E), word joiner and invisible operators
+ * (U+2060..U+2064), bidi isolates (U+2066..U+2069), the BOM (U+FEFF) and the
+ * invisible tag characters (U+E0000..U+E007F), which can carry hidden text into
+ * a subagent prompt that adopts `grenze` verbatim. Also (#1844) the soft hyphen
+ * (U+00AD), the combining grapheme joiner (U+034F), the Mongolian vowel
+ * separator (U+180E), the variation selectors (U+FE00..U+FE0F and the
+ * supplement U+E0100..U+E01EF, a known way to smuggle text into a prompt) and
+ * the specials U+FFF0..U+FFFB, including the interlinear annotation marks.
+ * The combining marks among them are listed singly on purpose: under the `u`
+ * flag each code point is its own class member, hence no-misleading-character-class
+ * is off for that line.
+ * Global so `terminalSafeJson()` can replace every match; tests use
+ * `search()`, which ignores `lastIndex`.
+ */
+const UNSAFE_CONTROL_RE = /[\x00-\x08\x0B-\x1F\x7F-\x9F\u061C\u200B-\u200F\u2028\u2029\u202A-\u202E\u2060-\u2064\u2066-\u2069\uFEFF\u{E0000}-\u{E007F}\u00AD\u034F\u180E\uFE00-\uFE0F\uFFF0-\uFFFB\u{E0100}-\u{E01EF}]/gu; // eslint-disable-line no-control-regex, no-misleading-character-class
+
+/**
+ * `JSON.stringify(value)` with every `UNSAFE_CONTROL_RE` character written as a
+ * `\uXXXX` escape (#1809). `JSON.stringify` escapes C0 but leaves DEL, C1, the
+ * bidi characters and U+2028/U+2029 raw, so a line printed to a terminal next
+ * to a withheld `grenze` would carry the very text the notice withholds. The
+ * matched characters only occur inside string literals, so the result is
+ * still valid JSON and `JSON.parse` returns the same value.
+ *
+ * @param {unknown} value
+ * @returns {string}
+ */
+export function terminalSafeJson(value) {
+  // A tag character is a surrogate pair: escape each UTF-16 unit, still valid JSON.
+  return JSON.stringify(value).replace(UNSAFE_CONTROL_RE, (ch) =>
+    ch.split('').map((unit) => `\\u${unit.charCodeAt(0).toString(16).padStart(4, '0')}`).join(''),
+  );
+}
+
+/**
+ * The boundary that binds when the navigator issued none (#1842): fail-closed,
+ * a session never runs without a boundary rule.
+ */
+export const STANDARD_GRENZSATZ =
+  'Vor Lesen oder Arbeit in einem fremden Checkout entscheidet navigator grenze <pfad>, für einen Checkout auf einem anderen Host navigator grenze --host <alias> <pfad> vom Host aus, auf dem navigator läuft. Nur Exit 0 erlaubt es; Exit 7 (Grenztreffer), Exit 6 (nicht messbar) und ein fehlendes navigator (Exit 127) heißen nicht lesen. Keine Dateisystemsuche über ~/Projects oder außerhalb tor-freigegebener Repos. Ein Sperrtreffer wird nur mit dem Repo-Namen gemeldet, nie mit URL oder Host. Jeder Subagent-Prompt mit Dateisystemsuche über Repos trägt diesen Absatz wörtlich.';
+
+const STANDARD_GRENZE_LINES = [
+  'fleet-auflagen: grenze (Standard-Grenzsatz: no navigator boundary accepted, binding):',
+  STANDARD_GRENZSATZ,
+];
+
+/**
+ * Human-readable lines for session-start Phase 7.6 (#1809, #1842): never empty.
+ * An ACCEPTED auflagen file's `grenze` (which repos are off limits and how to
+ * call the boundary gate before reading) is printed byte for byte after one
+ * header line. A `grenze` that is not a string, is blank or carries an
+ * `UNSAFE_CONTROL_RE` character is withheld — a notice line takes its place,
+ * the text is never printed — followed by the {@link STANDARD_GRENZSATZ}. An
+ * accepted file without `grenze`, and `absent`/`rejected`, yield the
+ * {@link STANDARD_GRENZSATZ} under its own header.
+ *
+ * @param {Awaited<ReturnType<typeof readAuflagen>>} result
+ * @returns {string[]} lines to print; `grenze` may itself span several lines
+ */
+export function renderAuflagenNotice(result) {
+  if (result.state !== 'accepted' || !('grenze' in result.auflagen)) return [...STANDARD_GRENZE_LINES];
+  const grenze = result.auflagen.grenze;
+  if (typeof grenze !== 'string') {
+    return ['fleet-auflagen: grenze withheld (not a string) — ask the navigator for the boundary', ...STANDARD_GRENZE_LINES];
+  }
+  if (grenze.search(UNSAFE_CONTROL_RE) !== -1) {
+    return [
+      'fleet-auflagen: grenze withheld (contains control characters) — ask the navigator for the boundary',
+      ...STANDARD_GRENZE_LINES,
+    ];
+  }
+  // An empty or blank grenze names no boundary at all: fail-closed like a missing one.
+  if (grenze.trim() === '') {
+    return ['fleet-auflagen: grenze withheld (empty) — ask the navigator for the boundary', ...STANDARD_GRENZE_LINES];
+  }
+  return ['fleet-auflagen: grenze (verbatim from the navigator, binding):', grenze];
+}

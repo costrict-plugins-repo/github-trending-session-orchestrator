@@ -1,0 +1,380 @@
+# Mode: `/plan new` — Project Kickoff
+
+> Reference file for the plan skill. Read by SKILL.md when mode is `new`.
+> Covers: requirement gathering (3 waves) → PRD generation → repo setup → issue creation.
+> Project-instruction file resolution: `CLAUDE.md` and `AGENTS.md` (Codex CLI) are transparent aliases — see [skills/_shared/instruction-file-resolution.md](../_shared/instruction-file-resolution.md). New repos pick the file appropriate to the platform that will operate them.
+
+---
+
+## Phase 0: Template Source Switch
+
+`/plan new` uses `plan-baseline-path` when one is configured, else the plugin's bundled templates. Decide the source with the same offline reader `/bootstrap` uses ([`public-fallback.md`](../bootstrap/public-fallback.md) § Step 1), so both skills reach the same verdict on the same host:
+
+```bash
+PLAN_SOURCE=$(node "$PLUGIN_ROOT/scripts/baseline-archetypes.mjs" --repo "$REPO_ROOT") || exit 2
+PATH_TYPE=$(printf '%s' "$PLAN_SOURCE" | node --input-type=module -e '
+let input = ""; for await (const chunk of process.stdin) input += chunk;
+process.stdout.write(JSON.parse(input).status);
+')
+```
+
+| Reader outcome | `/plan new` behavior |
+|----------------|----------------------|
+| `status: private` | **Private path.** Use the expanded value from SKILL.md Phase 1 as `$BASELINE_PATH` in every step marked *private path* below. Everything runs as before. |
+| `status: public` (no baseline configured, empty value, or missing directory) | **Public path.** Print once: "No baseline configured — using the plugin's bundled archetypes." and continue. Every step marked *public path* below applies; no step reads `$BASELINE_PATH`. |
+| Exit 2 (`producer-missing`, invalid export, unsafe source, producer failure) | Abort with the sanitized `reason` (and `message` when present), exactly as `/bootstrap` does. Never silently downgrade a broken configured baseline to the public path — the user decides whether to repair the baseline or unset it. |
+
+Public archetype catalog: the IDs of [`public-fallback.md`](../bootstrap/public-fallback.md) § Public Path — Standard Tier table, described as in the `/bootstrap` archetype question ([`bootstrap/SKILL.md`](../bootstrap/SKILL.md) § Optional Second Question). Read both from there; never keep a second list here.
+
+---
+
+## Phase 1: Requirement Gathering (3 waves, 16 questions)
+
+Wave 1 has 6 questions (incl. the User-Story toggle); Waves 2-3 have 5 each. Before each wave, dispatch 2-3 Explore agents in parallel to pre-research options. Every agent prompt below includes the limits and reporting requirements from [Research budget for `/plan new`](#research-budget-for-plan-new) below. Synthesize agent results into AskUserQuestion calls (max 4 questions per call, so split 4+1 or 3+2 per wave). Wave 1 carries the 6th User-Story toggle question, so split it 3+3.
+
+### Research budget for `/plan new`
+
+Apply SKILL.md § 3.1 with a **self-checked time limit of 4 wall-clock minutes per research agent**, replacing its approximate time allowance for this mode. Keep its call limits: web agents get at most **6 WebSearch + 6 WebFetch calls and 15 Read/Glob/Grep calls**; local-only agents get **15 Read/Glob/Grep calls and no web calls**. Equivalent browser/CLI research consumes the same allowances; all other research tool calls count against the local-call limit (at most 27 research calls for a web agent, 15 for a local-only agent). Count failed calls and retries too; batched searches/fetches count each requested query or page against the corresponding limit. Each research agent runs `date` at the start and before every further research call to check elapsed wall-clock time, including tool waits. These `date` calls do not count against any call budget. If the time limit is reached or exceeded, the agent ends its research and returns the available findings. Use per-call timeouts where supported to bound calls by the remaining time; if a call cannot be bounded, continue with existing evidence. The call limits remain hard ceilings: stop at the first call limit reached and never start a call that would exceed a call budget.
+
+In headless/autonomous runs these limits are fixed and cannot be raised. In interactive runs announce them before Wave 1: "Research defaults per agent: 6 searches + 6 fetches, 15 local calls, 4 minutes; you may change these before a wave." Use the defaults unless the operator explicitly changes them, and record any change before dispatch. These are skill instructions, not new Session Config keys.
+
+Append the actual numeric limits and reporting requirements to **every** research-agent prompt, including optional style/capability research and any research requested during review. Include the `date` self-check instructions and their budget exemption in every prompt; the research agent enforces its own time limit during foreground dispatch. At a limit, return the available findings immediately with `Not checked: <topics>` and continue synthesis and PRD generation; do not re-dispatch, add replacement research, or continue the exhausted agent's research in the coordinator. Apply SKILL.md § 3.1's evidence contract to the gaps. In headless/autonomous mode use the supported recommended answers per SKILL.md § Critical Rules rather than waiting for interactive answers. Complete the three waves, then save the initial PRD in Phase 2 before panel/reviewer refinement; research gaps do not trigger extra waves or block that save.
+
+For each agent, record in the wave recap and in a **Research Budget** subsection of PRD Section 2: wave/agent, allowed and used WebSearch/WebFetch/Read-Glob-Grep calls, allowed and elapsed minutes, stop reason (`complete`, `call-limit`, or `time-limit`), and unchecked topics. Also record total research wall-clock minutes for the run (overlapping agents count once). Persist this log with the initial PRD in Phase 2 step 3 and update it if later research runs, so the audit trail exists even when no Epic is created. Missing usage data is `not reported`, never an invented zero.
+
+### Cross-repo resolution
+
+**Resolving a `cross-repos` entry.** An entry that starts with `/` or `~/`, or is an absolute Windows path such as `C:\…`, is a path and is used as written (a leading `~` expands to the home directory). Any other entry is a bare repository name and resolves to `~/Projects/<name>`. A resolved folder that does not exist is a hint, never an error: print `cross-repos: <entry> — no folder at <resolved path>, skipped` and continue with the remaining entries, never abort and never search a parent directory.
+
+Use `resolveCrossRepoEntry()` in `$PLUGIN_ROOT/scripts/lib/config/cross-repo.mjs` for entries from `cross-repos` / `cross-repo.projects`; pass only resolved existing paths to the agents below. Do not discover additional repositories by scanning parent directories.
+
+### Wave 1 — Core Decisions (6 questions)
+
+**Pre-wave agents (dispatch in a single message):**
+
+```
+Agent({ subagent_type: "Explore", description: "List available project archetypes",
+  prompt: "Private path: run ls $BASELINE_PATH/templates/.
+  Public path: list the archetype IDs of the Standard Tier table in
+  $PLUGIN_ROOT/skills/bootstrap/public-fallback.md; each lives in $PLUGIN_ROOT/templates/<id>/.
+  For each archetype, read any README or config file to get a one-line description.
+  Report as a numbered list: directory name — description." })
+
+Agent({ subagent_type: "Explore", description: "Research market context",
+  prompt: "Search online for market context related to the user's project idea.
+  Report: target audiences, competitor landscape, positioning opportunities.
+  Keep it to 5-10 bullet points with sources." })
+
+Agent({ subagent_type: "Explore", description: "Check ecosystem for conflicts",
+  prompt: "Cross-repo scope only: the repositories named by Session Config `cross-repos` /
+  `cross-repo.projects` (each entry resolved by the `cross-repos` rule in docs/session-config-reference.md § cross-repos; pass the resolved absolute path in the prompt).
+  Identify any that overlap with or could serve as dependencies
+  for the proposed project. Report potential conflicts and reuse opportunities." })
+// Skip this agent when no entry resolves to an existing folder; print one hint per missing folder.
+// With no entries configured at all, print:
+// "No cross-repos configured — ecosystem conflict check skipped."
+```
+
+**Questions:**
+
+1. **Project archetype** — Present agent findings via AskUserQuestion. *Private path:* dynamically list the directories in `$BASELINE_PATH/templates/`, one option each. *Public path:* the IDs of the public archetype catalog (Phase 0), with the one-line descriptions of the `/bootstrap` archetype question; `node-minimal` is the default and goes first as `(Recommended)` unless research points elsewhere.
+2. **Visibility** — internal (GitLab private), private (+ optional GitHub mirror), public/OSS (+ GitHub public + license).
+3. **Target audience** — Options informed by market research agent. User selects or provides custom.
+4. **User-Story-Schicht** — "User-Story-Schicht für dieses Feature erzeugen?" Immer fragen (kein Audience-Heuristik-Gate). Drei Antwortoptionen: **Ja (Als/möchte/damit)** — klassische Persona-Story-Form; **Ja (job-story)** — job-story-Form ("When [situation], I want [motivation], so I can [outcome]"); **Nein** — byte-identisches Status-quo-Verhalten. Bei einer der beiden "Ja"-Optionen emittiert die PRD eine optionale ## User Stories Sektion (je Story ein ↳ AC-Pointer) in der gewählten Form; bei "Nein" wird die Sektion vollständig weggelassen.
+5. **Core problem being solved** — Open-ended. Claude suggests structure if answer is vague.
+6. **GitLab group** — Select the GitLab host explicitly, then discover available groups dynamically. *Private path:* run `ls $BASELINE_PATH/templates/` for project types, and check for a groups config in `$BASELINE_PATH/config/` or run `glab api --hostname "$GITLAB_HOST" "groups?per_page=100&min_access_level=10"` to discover GitLab groups — read each entry's `full_path` field. (`glab` has no `group` subcommand at all — invoking one exits 1 with `Unknown command "group"`.) *Public path:* skip the `$BASELINE_PATH` lookups and ask the host first (AskUserQuestion; the options come from the configured `vcs` and the remotes already known to the user, never from a filesystem search). With `vcs: gitlab` (or a GitLab host chosen), set `GITLAB_HOST` to it and run only the `glab api --hostname "$GITLAB_HOST" "groups?per_page=100&min_access_level=10"` discovery above, reading each `full_path`. With GitHub, offer the owners from `gh api --hostname "${GITHUB_HOST:-github.com}" user/orgs --jq '.[].login'` plus the user's own login (`gh api user --jq .login`); host-pinning and syntax per [`gitlab-ops`](../gitlab-ops/SKILL.md) § Canonical Project Identity and § Common CLI Commands. If discovery fails or returns nothing (no CLI, not logged in), say so in one line and offer the remaining options. Always include **No remote yet** (the plan finishes locally; Phase 4 prints the issue table instead of creating issues). Present findings via AskUserQuestion.
+
+### Optional private capability context — after Wave 1
+
+Before Wave 2 research, apply [Private capability context](../_shared/private-capability-context.md)
+only when the owner has explicitly supplied or authorized a local catalog lookup
+for an explicitly private/internal planning audience. Use eligible findings to
+inform the existing shared-patterns research and reuse alternatives; keep the
+archetype research and questions below. With no authorized context, or with a
+public/unknown audience, skip this optional step without a prompt or a lookup.
+
+### Wave 2 — Technical Details (5 questions, dynamic per archetype)
+
+**Pre-wave agents:**
+
+```
+Agent({ subagent_type: "Explore", description: "Read archetype config",
+  prompt: "Read $BASELINE_PATH/templates/{archetype}/ (private path) or
+  $PLUGIN_ROOT/templates/{archetype}/ (public path) — list all files, read key configs.
+  Report: default tech stack, available options, required decisions." })
+
+Agent({ subagent_type: "Explore", description: "Research tech stack best practices",
+  prompt: "Search online for best practices with the chosen tech stack ({archetype} + {key techs}).
+  Report: recommended patterns, common pitfalls, performance tips. 5-10 bullet points." })
+
+Agent({ subagent_type: "Explore", description: "Check ecosystem for shared patterns",
+  prompt: "Explore only the repositories named by Session Config `cross-repos` /
+  `cross-repo.projects` (each entry resolved by the `cross-repos` rule in docs/session-config-reference.md § cross-repos; pass the resolved absolute path in the prompt) for similar tech stacks.
+  Report: shared libraries, common patterns, reusable modules." })
+// Skip this agent when no entry resolves to an existing folder; print one hint per missing folder.
+// With no entries configured at all, print "No cross-repos configured — shared-pattern exploration skipped."
+```
+
+**Questions:**
+
+1. **Tech stack decisions** — e.g., Supabase vs alternative DB for nextjs-minimal. Options informed by archetype config agent.
+2. **Design style** — For frontend archetypes: read `$BASELINE_PATH/templates/{archetype}/styles/` to discover available design variants. Dispatch agent to read baseline style configs. Skip for non-frontend archetypes (those without a `styles/` directory) and on the public path (bundled templates carry no `styles/`).
+3. **External integrations** — APIs, services, payment providers. Agent research informs common choices.
+4. **Performance requirements** — Latency targets, concurrent users, throughput expectations.
+5. **Security requirements** — Beyond baseline. Auth strategy, encryption, compliance needs (GDPR, SOC2).
+
+### Wave 3 — Business & Scope (5 questions)
+
+**Pre-wave agents:**
+
+```
+Agent({ subagent_type: "Explore", description: "Analyze archetype failure modes",
+  prompt: "Search online for common failure modes and risks for {archetype} projects.
+  Report: top 5 risks with probability/impact and standard mitigations." })
+
+Agent({ subagent_type: "Explore", description: "Check ecosystem dependency compatibility",
+  prompt: "For each ecosystem repo mentioned by the user as a dependency,
+  read its package.json/go.mod/pyproject.toml and CLAUDE.md (or AGENTS.md on Codex CLI).
+  Report: version constraints, API contracts, integration patterns." })
+
+Agent({ subagent_type: "Explore", description: "Research success benchmarks",
+  prompt: "Search online for comparable products/features to the user's project idea.
+  Report: typical KPIs, adoption curves, success metrics used by similar products." })
+```
+
+**Questions:**
+
+1. **MVP scope** — Shape Up appetite: 1 week / 2 weeks / 6 weeks. Frame trade-offs for each.
+2. **Success criteria** — SMART format (Specific, Measurable, Achievable, Relevant, Time-bound), each with a measured baseline (or "none yet") and an oracle other than the author. Claude proposes the draft from research, the user refines it.
+3. **Known risks and mitigations** — Present common risks from agent research. User confirms, removes, or adds.
+4. **Post-launch plan** — Monitoring strategy, rollback plan, feedback channels.
+5. **Ecosystem dependencies** — Other repos in the ecosystem (count them, never assume a number) this project depends on or integrates with. Agent verifies compatibility.
+
+---
+
+## Phase 2: PRD Generation
+
+1. Read `prd-full-template.md` from this skill directory.
+2. Fill all 8 sections with gathered answers:
+   - **Section 1 (Executive Summary):** Synthesize core problem + audience + archetype into a concise project pitch.
+   - **Section 2 (Problem & Context):** From Wave 1 Q3 + Q5 (core problem) answers. Include market research findings.
+   - **Section 3 (Target Audience):** From Wave 1 Q3 + research agent output. Define 1-3 personas.
+   - **Section 4 (Solution & Scope):** From Wave 3 Q1 (appetite) + Wave 2 tech decisions. Explicit **In-Scope MVP** and **Out-of-Scope** lists. This section drives issue creation in Phase 4.
+   - **## User Stories (conditional):** Emit only when the User-Story-Schicht toggle ≠ "Nein"; one story per persona-goal (from Section 3 personas), each linking ≥1 acceptance criterion. Toggle = "Ja (Als/möchte/damit)" → classic Als/möchte/damit form. Toggle = "Ja (job-story)" → job-story form ("When [situation], I want [motivation], so I can [outcome]"). Omit the section entirely when toggle = "Nein" (byte-for-byte status quo).
+   - **Section 5 (Success Criteria):** From Wave 3 Q2. SMART table format: Metric | Target | Method | Deadline.
+   - **Section 6 (Technical Architecture):** From Wave 1 Q1 (archetype) + Wave 2 (tech stack, integrations). Include schema sketch if DB is involved.
+   - **Section 7 (Risks & Dependencies):** From Wave 3 Q3 + Q5. Table format: Risk | Probability | Impact | Mitigation.
+   - **Section 8 (Post-Launch Plan):** From Wave 3 Q4. Monitoring, rollback, feedback channels.
+3. Save PRD to `{plan-prd-location}/YYYY-MM-DD-{project-name}.md`.
+4. **Pre-Mortem Panel:** dispatch the Refute and Deepen briefs per `SKILL.md` § Phase 4.5 and `prd-premortem-panel.md`, then merge into Sections 5, 5.A (Oracle lines), External Acceptance and 7.
+5. Dispatch reviewer per `prd-reviewer-prompt.md`. Max 3 iterations. Surface unresolved issues to user.
+
+---
+
+## Phase 3: Repo Setup
+
+After PRD is approved by user:
+
+**Public path — Steps 1-4 replaced.** Print "No baseline configured — skipping baseline project setup; scaffolding from the bundled `<archetype>` template." Then create the project directory, `git init` it, and scaffold it with the `/bootstrap` public fallback: run [`public-fallback.md`](../bootstrap/public-fallback.md) § Public Path — Standard Tier with `CONFIRMED_ARCHETYPE` = the Wave 1 archetype and `REPO_ROOT` = the new directory. That copies `$PLUGIN_ROOT/templates/<archetype>/` and writes the project-instruction file; nothing reads a path outside the plugin. If Wave 1 Q6 chose a remote, create it with the matching CLI (`glab repo create` / `gh repo create`) at the chosen visibility, then continue with Step 5. With **No remote yet**, skip remote creation, visibility and branch protection with the notice "No remote chosen — remote creation, visibility and branch protection skipped." and continue with Step 5.
+
+### Step 1: Invoke setup-project.sh (private path)
+
+Map gathered answers to script input choices:
+
+```bash
+# Resolve input choices dynamically from setup-project.sh:
+# 1. Read $BASELINE_PATH/scripts/setup-project.sh
+# 2. Parse menu/select/case statements to find choice→name mappings
+# 3. Map user's selected archetype name → numeric choice for TYPE_CHOICE
+# 4. Map user's selected style name → numeric choice for STYLE_CHOICE (if applicable)
+# 5. Map user's selected group name → numeric choice for GROUP_CHOICE
+# Do NOT hardcode numeric mappings — they must be derived from the script.
+#
+# GROUP_CHOICE is a MENU INDEX, never a namespace. Keep the group's real
+# namespace in a separate variable — every later step addresses the project as
+# "<group-path>/<project>", and a numeric index there silently targets nothing.
+GROUP_PATH="$(...)"    # e.g., "products" — the full_path of the chosen group
+
+# These values identify the NEW project, not the directory in which this plan runs.
+# Select the host with the group; do not let glab infer it from an ambient remote.
+GITLAB_HOST="<selected GitLab hostname>"
+PROJECT_PATH="$GROUP_PATH/$PROJECT_NAME"
+ENCODED_PROJECT_PATH="$(node -e 'process.stdout.write(encodeURIComponent(process.argv[1]))' "$PROJECT_PATH")"
+(
+  echo "$TYPE_CHOICE"    # e.g., "1" for nextjs-minimal
+  echo "$STYLE_CHOICE"   # e.g., "1" for vega (private path only; bundled templates carry no styles)
+  echo "$PROJECT_NAME"   # e.g., "my-cool-app"
+  echo "$GROUP_CHOICE"   # e.g., "1" for products
+  echo "y"               # confirm
+) | bash "$BASELINE_PATH/scripts/setup-project.sh"
+```
+
+### Step 2: Verify success (private path)
+
+Check the setup script exit code. Confirm the selected path exists without fetching a full REST project object:
+
+```bash
+glab api --hostname "$GITLAB_HOST" graphql \
+  -f query='query($fullPath: ID!) { project(fullPath: $fullPath) { fullPath } }' \
+  -f fullPath="$PROJECT_PATH" | jq -er '.data.project.fullPath'
+```
+
+### Step 3: Adjust visibility (private path)
+
+If visibility is not `internal` (the default):
+
+```bash
+# There is no `glab repo edit`, and `glab repo update` carries no --visibility
+# flag (its FLAGS are --archive/--defaultBranch/-d/--description). The encoded
+# endpoint and explicit host target the new project independently of the CWD.
+glab api --silent --hostname "$GITLAB_HOST" -X PUT \
+  "projects/${ENCODED_PROJECT_PATH}" \
+  -f visibility=private   # or visibility=public
+
+# Fetch only the scalar needed to verify the mutation, never a full REST object.
+glab api --hostname "$GITLAB_HOST" graphql \
+  -f query='query($fullPath: ID!) { project(fullPath: $fullPath) { visibility } }' \
+  -f fullPath="$PROJECT_PATH" | jq -er '.data.project.visibility'
+```
+
+> The GraphQL verification query is read-only and requests only `visibility`; the
+> PUT's unused response is intentionally suppressed. Confirm the selected host and
+> path before running the mutation.
+
+For public/OSS, also configure GitHub mirror if applicable.
+
+### Step 4: Set branch protection (private path)
+
+```bash
+glab api --silent --hostname "$GITLAB_HOST" -X POST \
+  "projects/${ENCODED_PROJECT_PATH}/protected_branches" \
+  -f name=main \
+  -f push_access_level=30 \
+  -f merge_access_level=30
+```
+
+### Step 5: Populate CLAUDE.md (or AGENTS.md on Codex CLI)
+
+Choose the project-instruction file appropriate to the platform that will operate the repo: `CLAUDE.md` for Claude Code / Cursor IDE, `AGENTS.md` for Codex CLI. Pick exactly one — never both. Add `## Session Config` section with fields derived from the planning session. Include at minimum:
+
+- `plan-baseline-path` (private path only — omit it on the public path, as `/bootstrap` does)
+- `plan-default-visibility`
+- `plan-prd-location`
+- Any project-specific config from gathered requirements
+
+### Step 6: Commit PRD
+
+Copy the approved PRD from the path saved in Phase 2 into the new repo's `docs/prd/`, then commit it there. This step meets the PRD Commit Gate for `/plan new` (`SKILL.md` § Phase 5.5); run its § 5.5.2 checks in the new repo before Phase 4. Use a descriptive commit message:
+
+```bash
+git add docs/prd/YYYY-MM-DD-{project-name}.md
+git commit -m "docs: add project PRD from /plan new session"
+```
+
+### Step 7: Scaffold Steering Docs
+
+Create `.orchestrator/steering/` with three stub documents populated from planning answers.
+Steering docs give every future session stable product/tech/structure context without re-reading
+CLAUDE.md from scratch (consumed by session-start Phase 2.6).
+
+```bash
+mkdir -p .orchestrator/steering
+```
+
+**`product.md`** — mission + scope derived from Wave 1 (core decisions) and Wave 3 (MVP scope):
+- Mission: one sentence from the project pitch in PRD Section 1
+- Target users: from PRD Section 3 (personas)
+- In-scope features: from PRD Section 4 In-Scope MVP list
+- Out of scope: from PRD Section 4 Out-of-Scope list
+
+**`tech.md`** — stack + commands + constraints derived from Wave 2 (tech decisions):
+- Runtime stack: archetype + chosen tech stack + language/framework
+- Key commands: test, lint, typecheck, install (from archetype defaults)
+- Coverage thresholds: from archetype template if present, else leave as placeholder
+- Constraints: archetype-specific pitfalls (fill in or leave `_TODO_` for follow-up)
+
+**`structure.md`** — directory map + inventory from the scaffolded repo:
+- Top-level directory map: run `ls -1` and annotate each directory with its purpose
+- Inventory counts: fill in after scaffolding completes (skills/commands/agents as applicable)
+- Key files: entry points, SSOT files, main config files
+
+Write each file with real content from planning answers — never leave all three as pure stubs.
+At minimum, `product.md` must contain the mission sentence and the In-Scope list from the PRD.
+
+```bash
+git add .orchestrator/steering/
+git commit -m "chore: scaffold steering docs from /plan new session"
+```
+
+---
+
+## Phase 4: Issue Creation
+
+### Step 1: Derive Epic + sub-issues
+
+Source: PRD Section 4 (Solution & Scope).
+
+- **Epic title:** project name + brief description.
+- **Sub-issues:** One per MVP feature/scope item from the In-Scope list. Each issue gets a clear title, description referencing the PRD, and acceptance criteria.
+
+### Step 2: Auto-prioritize
+
+Score each issue per `SKILL.md` § 6.2 Auto-Prioritize (technical dependencies, business value, and the Impact × Risk 2×2 triage), with risks taken from PRD Section 7. Add one `[Abnahme]` issue per External Acceptance row (`SKILL.md` § 6.1).
+
+### Step 3: Apply labels
+
+Use the label taxonomy from the gitlab-ops skill (`skills/gitlab-ops/SKILL.md` § Label Taxonomy):
+
+**Priority mapping for VCS labels:**
+| Categorization | VCS Label |
+|---|---|
+| P0 (critical path, blocking) | `priority::critical` |
+| P1 (high impact, needed soon) | `priority::high` |
+| P2 (medium, can wait) | `priority::medium` |
+| P3 (nice-to-have) | `priority::low` |
+
+Always use the `priority::<level>` format in VCS CLI commands, not P0/P1/P2/P3.
+
+- **type:** feature, enhancement, bug, chore, docs
+- **status:** `status:ready`
+- **area:** relevant domain label
+- **appetite:** 1w, 2w, 6w (matching MVP appetite)
+- **mvp-phase:** phase number if phased delivery
+
+### Step 4: Present for user confirmation
+
+Use the AskUserQuestion payload in `SKILL.md` § 6.3 verbatim — the issue table belongs in the option's `preview` field, not in the question text:
+
+- Epic title and description
+- Sub-issues with: title, priority, labels, dependency links
+- User confirms, adjusts priority, removes issues, or adds missing ones
+
+### Step 5: Create via glab
+
+Public path: with a GitHub remote, create the same issues with `gh issue create` (syntax per the gitlab-ops skill). With **No remote yet**, print the confirmed issue table, skip Steps 5-6 with the notice "No remote chosen — issues not created; the table above is the backlog.", and finish.
+
+```bash
+# Create epic
+glab issue create -R "https://${GITLAB_HOST}/${PROJECT_PATH}" --title "$EPIC_TITLE" --description "$EPIC_DESC" \
+  --label "type:epic,priority::$PRIORITY" --milestone "$MILESTONE"
+
+# Create sub-issues
+glab issue create -R "https://${GITLAB_HOST}/${PROJECT_PATH}" --title "$ISSUE_TITLE" --description "$ISSUE_DESC" \
+  --label "type:feature,priority::$PRIORITY,status:ready,area:$AREA,appetite:$APPETITE"
+```
+
+### Step 6: Set dependency links
+
+For issues with technical dependencies, set `blocks`/`is-blocked-by` relationships:
+
+```bash
+# Issue #2 is blocked by Issue #1 in this project. An encoded project path is
+# valid for target_project_id, so no numeric project ID is needed.
+glab api --silent --hostname "$GITLAB_HOST" -X POST \
+  "projects/${ENCODED_PROJECT_PATH}/issues/${ISSUE_2_IID}/links" \
+  -f target_project_id="$ENCODED_PROJECT_PATH" \
+  -f target_issue_iid="$ISSUE_1_IID" \
+  -f link_type=is_blocked_by
+```
+
+On HTTP 403 (non-Premium/Ultimate GitLab tier): fall back to `link_type=relates_to` + a body-ordering note — see gitlab-ops SKILL.md § "Issue Linking (`blocks` / `is_blocked_by`)".

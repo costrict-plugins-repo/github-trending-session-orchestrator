@@ -1,0 +1,159 @@
+# Phase 5: Issue Cleanup
+
+> Sub-file of the session-end skill (#1157 — agentskills.io: SKILL.md core < 500 lines, procedure in `references/`). Extracted VERBATIM from `skills/session-end/SKILL.md`; `SKILL.md` keeps a one-line stub naming this phase and its gate condition.
+
+## Phase 5: Issue Cleanup
+
+> **VCS Reference:** Use CLI commands per the "Common CLI Commands" section of the gitlab-ops skill.
+
+1. **Close resolved issues — one command strips, closes and verifies (#308):** run the CLI ONCE with every resolved issue ID, `--vcs` taken from Session Config. An `[Abnahme]` issue is never in that list: it closes only on oracle evidence (`plan-verification.md` § 1.1b, #1678).
+
+   ```bash
+   mkdir -p .orchestrator/tmp
+   node "$PLUGIN_ROOT/scripts/lib/issue-close-strip-labels.mjs" --close --vcs <gitlab|github> <iid> [<iid> ...] \
+     > .orchestrator/tmp/<sid>-close.jsonl; close_rc=$?
+   cat .orchestrator/tmp/<sid>-close.jsonl; echo "close exit=$close_rc"
+   ```
+
+   The stdout goes to `.orchestrator/tmp/<sid>-close.jsonl` (same `<sid>` as step 3b.3, which reads it for the issue balance); stderr stays on the terminal. Redirect, never pipe: `| tee` would make `$?` the exit of `tee`, and `${PIPESTATUS[0]}` is empty in zsh (`.claude/rules/bash-harness-pitfalls.md` § 6). `close_rc` is the close CLI's own exit code — non-zero still means an ID did not verify as closed. If no issue was resolved, the CLI is not run; step 3b.3 must omit `--close-results` even if a file from an earlier close with the same `<sid>` exists, so it falls back to `issues_closed` of the session record.
+
+   For each ID, in this order, it strips every `status:*` label (a closed issue carrying `status:in-progress` or `status:ready` skews dashboard filters and discovery heuristics), closes the issue, then re-reads it. It prints one JSON line per ID — `{"id","stripped","closed","state"}`, plus `stripError` / `error` when a step failed — and exits 1 when any ID did not verify as closed. Pass `-R <spec>` only to override the repo; without it the repo resolves from the git remotes (#839). Do not hand-roll `stripStatusLabels` + `glab issue close` instead: that two-step prose path was skipped often enough that 339 closed issues still carried `status:in-progress` (measured 2026-09-19).
+
+   **Read the JSON, not just the exit code.** `closed: true` means the platform itself reported `state: closed` on the re-read. Every line with `closed: false` is a finding for the Phase 6 Final Report, quoting its `error`. Never report that issue as done. Stripping is non-fatal: a failed strip is printed to stderr, recorded as `stripError`, and the close still runs. List those IDs in the Final Report so the label can be removed by hand. Stripping is idempotent: an issue without `status:*` labels gets no update call.
+
+   Then add the closing note per issue with the note command from the "Common CLI Commands" section of the gitlab-ops skill (the CLI posts no notes).
+
+2. **Update in-progress issues**: ensure labels reflect actual state using the issue update command
+3. **Create carryover issues — from the Phase 1.65 gate's carry-list ONLY (#769):** file an issue for each item on the carry-list produced by the Handover Alignment Gate — i.e. the non-deselectable **auto-carry** class (`priority::critical|high`, SPIRAL/FAILED, or no-origin-issue candidates) PLUS the middle-band items the operator LEFT SELECTED in triage. Do NOT file anything the gate dropped, and do NOT file directly from Phase 1.2/1.3/1.4/1.6 — those phases only collected candidates.
+   - **Template stays source-specific:** 1.2 Partially-Done → `[Carryover] <task>` (labels `priority::<original>`, `status:ready`); 1.4 unfinished Emergent → a **normal** issue (NOT the `[Carryover]` template); 1.6 SPIRAL/FAILED → fire the deferred `createSpiralCarryoverIssue({ taskDescription, kind, context, priority: 'high', vcs })` (idempotent task-hash dedup — payload comes from the candidate's `_spiral` annotation set in Phase 1.6 step 5). 1.3 files no NEW issue: a carried 1.3 candidate simply keeps its ORIGINAL issue `status:ready`.
+   - **Dropped middle-band items:** file NO `[Carryover]` duplicate; the origin issue stays open and unchanged. Record each drop in the Phase 6 Final Report under `### Dropped at Handover Gate` with its origin-issue reference and a reason slot.
+   - **Fail-open / gate skipped:** when Phase 1.65 skipped fail-open, the carry-list is ALL candidates (status quo) and there is no drop-list.
+   - **Mark answered open questions `[x]` durably — atomic with the filing above (#769):** now, on the completed side of the Quality Gate, persist each answered open question captured in-memory at Phase 1.65 Step 4 to STATE.md via the lock-guarded sibling helper (PSA-005). Co-locating this write with the carryover-issue filing is the load-bearing correctness invariant: an earlier Quality-Gate abort leaves every question `- [ ]` on disk, so it correctly re-surfaces via `readOpenQuestions().filter(!answered)` on re-close — the `[x]` mark now reflects a COMPLETED handover, never a mid-close state a later abort would invalidate. Any implied-work candidate an answered question enqueued in Phase 1.65 is filed by the carry-list step above, so the mark and its issue land together:
+
+     ```js
+     import { markOpenQuestionAnsweredOnDisk } from '${PLUGIN_ROOT}/scripts/lib/state-md.mjs';
+     // answeredQuestions captured in Phase 1.65 Step 4 (in-memory, un-persisted until now)
+     for (const { question, answer } of answeredQuestions) {
+       await markOpenQuestionAnsweredOnDisk(repoRoot, question, answer); // "- [ ] Q" → "- [x] Q → Antwort: <answer>"
+     }
+     ```
+
+     Fail-open: a `markOpenQuestionAnsweredOnDisk` failure is non-fatal — log a WARN and proceed with the close; the question simply stays `- [ ]` and roundtrips to the next session.
+
+3b. **Drain the issue-budget overflow — exactly ONE collector artefact (issue-budget):** when this session's budget file (`budgetStatePath(repoRoot, accountingSessionId)` → `.orchestrator/runtime/issue-budget/<hash>.json`, #1141) has a non-empty `overflow[]`, the session hit its `issue-budget.max-per-session` cap and every over-cap creation was PARKED rather than filed. Fold the whole list into a single artefact so nothing is silently dropped. The same single collector also carries this session's LOW findings (#1947, below), so the step runs when EITHER `overflow[]` is non-empty OR a LOW finding is to be filed.
+
+    **Ordering (load-bearing):** run this as the LAST issue-creating action of Phase 5 — after step 3, after "Discovery Issue Creation", after step 4 — and re-read the counter file at that moment. Those steps can themselves push new entries into `overflow[]`; draining early would leave them unfiled.
+
+    ```js
+    import { readFileSync } from 'node:fs';
+    import {
+      readBudgetState,
+      budgetStatePath,
+      resolveIssueBudgetSessionId,
+    } from '${PLUGIN_ROOT}/scripts/lib/issue-budget.mjs';
+
+    // `sessionId` is the physical raw lock/registry identity from session-start.
+    const rawSessionId = sessionId;
+    let currentSession = null;
+    try {
+      currentSession = JSON.parse(
+        readFileSync(`${repoRoot}/.orchestrator/current-session.json`, 'utf8'),
+      );
+    } catch { /* no verified semantic accounting bridge */ }
+    const accountingSessionId = resolveIssueBudgetSessionId(rawSessionId, currentSession);
+    const state = readBudgetState(repoRoot, accountingSessionId);
+    // { sessionId, count, exempt, overflow: [...] }
+    ```
+
+    `accountingSessionId` may be semantic only after
+    `currentSession.session_id === rawSessionId`; this is budget accounting, not
+    lock/registry ownership. When that proof is absent it remains the raw id.
+    A host rotation that changes both raw and semantic values has no guaranteed
+    budget continuity.
+
+    - **LOW findings share this collector (#1947, default).** Every review (Phase 1.8 / W4 panel) or discovery (Phase 1.5) finding at `priority::low` that this close would FILE — a `follow-up` disposition under RCR-007, or an operator choice — becomes one checklist line in this same collector instead of its own issue. MEDIUM and above stay single issues (still gated by step 4 and the Phase 1.8 table; #617 is unchanged: unfiled MED/LOW findings stay in the Final Report under "Unresolved Review Findings"). The RCR-007 class `follow-up` is kept; only the filing shape changes. Plan the split and the body with the pure function, then file `plan.single` one by one and `plan.collector` once:
+
+      ```js
+      import { planBacklogCollector } from '${PLUGIN_ROOT}/scripts/lib/issue-balance.mjs';
+      const plan = planBacklogCollector({
+        sessionId: accountingSessionId,
+        findings: toFile,            // [{ title, priority|severity, source: 'review'|'discovery', file?, line? }]
+        overflow: state.overflow,    // issue-budget overflow[] — same collector
+        thisRepo,                    // repo spec; foreign-repo overflow entries keep their description out
+      });
+      // plan.collector === null → nothing LOW and no overflow: file no collector
+      ```
+
+      `planBacklogCollector` renders the overflow entries by exactly the rules below, so the collector body is code, not hand-assembled. An unknown priority stays a single issue (never bundle what cannot be classified). Old issues are never closed automatically (explicitly rejected in #1947).
+    - **`issue-budget.overflow: collect-issue` (default)** — create exactly ONE issue:
+      - Title: `[Backlog-Sammel] <accountingSessionId>, <N> zurückgestellte Punkte` (`N` = LOW findings + overflow entries; `plan.collector.title`)
+      - Labels: `type::backlog`, `priority::low`
+      - Body (`plan.collector.body`): a `## LOW-Folgepunkte` checklist when LOW findings were bundled, then a Markdown checklist with one `- [ ]` line per `overflow[]` entry (`title` when present, otherwise the truncated `command`, plus its `at` timestamp). Since #1314 an entry may also carry `description`, `repo` and `truncated`; older entries have only `title`/`command`/`at` and render exactly as before.
+        - `description` present → put it under the line as a collapsed `<details><summary>Beschreibung</summary>` block, verbatim. If `truncated: true`, append `(gekürzt)` to the summary.
+        - `truncated: true` and NO `description` (the body file was over 1 MiB and was not read) → add an indented line `Beschreibung zu groß, nicht übernommen`.
+        - `descriptionUnresolved: 'cwd-changed'` → add an indented line `Beschreibung nicht aufgelöst (cd in der Kette)`; the raw `command` still names the file.
+        - `repo` present and NOT this repo → render ONLY the title line, `Ziel: <repo>`, and `Beschreibung zurückgehalten (Ziel-Repo abweichend) — liegt im Budget-Zustand`. Never put that entry's `description` into this repo's collector: it would silently change the content's visibility. The counter file keeps it until the overflow reset.
+        - `repo` present → add an indented line `Ziel: <repo>` under the entry. All entries stay in the ONE collector in this repo (no second collector per foreign repo): the cap is per session, and a second create would itself need an exemption; the `Ziel:` line is what the operator re-files against.
+      - This collector issue is itself EXEMPT from the cap (`[Backlog-Sammel]` is in the exemption list in `scripts/lib/issue-budget.mjs`), so it always lands even at count == max.
+    - **`issue-budget.overflow: vault-note`** — create NO issue. Write one Markdown file `vault/00-inbox/<accountingSessionId>-backlog-sammel.md` (path relative to `vault-integration.vault-dir`) with valid vault frontmatter and the same checklist body.
+    - After the artefact exists, reset `overflow` to `[]` in the counter file and record the collector issue ID / note path in the Phase 6 Final Report under `### Zurückgestellt (issue-budget)`.
+    - **Never exempt-by-accident:** the cap never applied to `priority::critical`, the carryover class (`[Carryover]`, SPIRAL/FAILED, `type::carryover`), or `broken-window` closure issues, so nothing on the Phase 1.65 carry-list can ever appear in `overflow[]`. The promises at Phase 1.8 ("SPIRAL / FAILED agent carryover … non-deselectable") and the Critical Rule "ALWAYS create issues for unfinished PLANNED work" stay intact by construction.
+    - Fail-open: a missing or malformed counter file means "no overflow" — log a WARN and continue the close.
+    - **3b.2 — Reconcile the record against the ledger (#1163 follow-up):** the drain answers "what did the cap park?"; this answers the prior question "did the cap ever run?". Call `reconcileIssueBudget` from `scripts/lib/issue-budget-reconcile.mjs` on the **in-memory session record** — the one Phase 3.7 is about to append to `.orchestrator/metrics/sessions.jsonl`, not a record read back from it. `issues_created` has NO code producer anywhere in this repo: it is the coordinator's own hand-assembled count, which is exactly why cross-checking it against a mechanically-written ledger is meaningful — the two halves have independent producers.
+
+      ```js
+      import {
+        reconcileIssueBudget,
+        emitIssueBudgetReconciled,
+        formatIssueBudgetReconcileWarn,
+      } from '${PLUGIN_ROOT}/scripts/lib/issue-budget-reconcile.mjs';
+
+      const reconcile = reconcileIssueBudget({
+        repoRoot,
+        record: sessionRecord,          // in-memory, pre-write (Phase 3.7 appends it later)
+        sessionId: accountingSessionId, // semantic key
+        rawSessionId,                   // raw lock/registry key — BOTH are summed, never preferred
+        config: config['issue-budget'],
+      });
+      await emitIssueBudgetReconciled(repoRoot, reconcile);
+      console.log(formatIssueBudgetReconcileWarn(reconcile));
+      ```
+
+      `reconcile.verdict` is one of `match` (everything the record claims is accounted for), `no-ledger` (`recorded > 0` and no counter file existed under EITHER key — the hook never charged a single create, so the cap was silently OFF; measured once at 26 recorded creations with no counter file), `escaped` (a ledger exists but `recorded > charged + exempt`), or `stale-record` (the ledger has spend and the record claims none — there the RECORD is the suspect half). `emitIssueBudgetReconciled` writes `orchestrator.issue_budget.reconciled` to `.orchestrator/metrics/events.jsonl`; `formatIssueBudgetReconcileWarn(result)` renders one info line on `match` and a path-quoting warning otherwise — print it in the Phase 6 Final Report under `### Zurückgestellt (issue-budget)`. Never throws, never blocks the close.
+
+      **Two ordering constraints, both load-bearing:**
+      1. **After the drain.** The drain resets `overflow[]` to `[]` and files the collector issue (itself exempt) — reconciling before it would read an overflow count that is about to change and miss the collector's own exempt charge.
+      2. **Before `reapStaleBudgetFiles`.** The reap deletes counter files; THIS session's file is exempt by age, but a session whose accounting key flipped mid-session has spend under a second key that is NOT exempt. Reaping first can therefore remove the very file this check reads, turning a real `escaped` into a false `no-ledger`.
+
+    - **Then reap stale counter files (#1151):** the per-session split (#1141) writes one file per accounting session and nothing ever deleted them, so `.orchestrator/runtime/issue-budget/` grew without bound in every working copy. After the drain, sweep files older than 14 days; THIS session's file is exempt regardless of age, and the call is best-effort (it never throws, so it can never abort the close).
+
+      ```js
+      import { reapStaleBudgetFiles } from '${PLUGIN_ROOT}/scripts/lib/issue-budget.mjs';
+
+      const { removed } = reapStaleBudgetFiles({ repoRoot, sessionId: accountingSessionId });
+      if (removed.length) console.log(`issue-budget: reaped ${removed.length} stale counter file(s) (> 14 d)`);
+      ```
+
+    - **3b.3 — Issue balance of this session (#1947):** after the reconcile, measure what this session added to and removed from the backlog. Write the in-memory session record to `.orchestrator/tmp/`, then run the command below. Add `--close-results .orchestrator/tmp/<sid>-close.jsonl` only if the step-1 close CLI ran during THIS `/close` invocation. File existence alone is not evidence of a current result: a repeated close with the same `<sid>` can leave an old file. Without the option, the script falls back to `issues_closed` of the session record.
+
+      ```bash
+      node "$PLUGIN_ROOT/scripts/issue-balance.mjs" --record .orchestrator/tmp/<sid>-record.json \
+        --session-id <accountingSessionId> \
+        --raw-session-id <rawSessionId> --vcs <gitlab|github>
+      ```
+
+      It prints one line, e.g. `Issues dieser Session: +7 angelegt, −3 geschlossen, Saldo +4 (Repo heute: +11) — Grundgesamtheit: …; gemessen <ISO>`. Sources, in order: created = `issues_created` of the record, else the issue-budget ledger (`count + exempt`, both keys); closed = the close CLI's `closed: true` lines (platform re-read), else — when `--close-results` is omitted or that file does not exist — `issues_closed`; a file that exists but is unreadable or malformed is `nicht messbar`, never a fallback; "Repo heute" = ONE `glab api`/`gh api` read of issues updated since local midnight, 10 s timeout (`--no-repo` skips it). Each value is measured, `kein Wert (…)` or `nicht messbar (…)` — never print an unmeasured value as `0`. Copy the line verbatim into the Phase 6 Final Report under `### New Issues Created`. Never blocks the close; exit is 0 in every measurement state.
+
+#### Discovery Issue Creation (if discovery ran in Phase 1.5)
+
+For each finding with severity `critical` or `high` from Phase 1.5:
+1. Create a VCS issue using the detected platform CLI:
+   - Title: `[Discovery] <description>` (truncated to 70 chars)
+   - Body: `**Probe:** <probe>\n**File:** <file>:<line>\n**Severity:** <severity>\n**Confidence:** <confidence>%\n**Recommendation:** <recommendation>`
+   - Labels: `type:discovery`, `priority::<severity>` (critical→critical, high→high)
+2. Log each created issue ID for the Final Report
+3. Update `discovery_stats.issues_created` count
+
+4. **Create gap issues for HIGH+/blocking newly-discovered problems only** — MED/LOW review findings are recorded in the Final Report, not filed as issues (#617; see the Phase 1.8 severity-disposition table). This mirrors the Phase 5 "Discovery Issue Creation" gate (critical/high only). A LOW finding that is filed anyway (follow-up disposition, operator choice) goes to the step-3b collector, never to its own issue (#1947).
+5. **Update milestones**: if milestone progress changed
+

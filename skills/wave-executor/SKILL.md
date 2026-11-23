@@ -1,0 +1,425 @@
+---
+name: wave-executor
+user-invocable: false
+tags: [orchestration, execution, agents, waves]
+model: inherit
+model-preference: opus
+model-preference-codex: gpt-6.2-sol
+model-preference-cursor: claude-sonnet-4-6
+description: >
+  Use this skill when executing the agreed session plan in waves with role-based execution and parallel subagents. Handles inter-wave
+  quality checks, plan adaptation, and progress tracking. Core orchestration engine for
+  feature and deep sessions. Triggered by /go command.
+---
+
+# Wave Executor Skill
+
+## Execution Model
+
+You are the **coordinator**. You do NOT implement — you orchestrate. Your job:
+1. Dispatch subagents for each wave
+2. Wait for ALL agents in a wave to complete
+3. Review their outputs
+4. Adapt the plan if needed
+5. Dispatch the next wave
+6. Repeat until all waves complete
+
+## Design Philosophy
+
+This harness exists to enable multi-agent coordination at scale — not by removing friction, but by making it visible, classifiable, and recoverable.
+
+The wave-executor is process scaffolding around LLM agents. It handles task breakdown, scope enforcement, circuit breaker guards, and recovery patterns. Unlike direct chat with an agent, it trades flexibility for safety and repeatability across a bounded execution envelope.
+
+Every harness creates friction. The goal is not minimum friction — it is useful friction that prevents higher-cost problems downstream.
+
+**Friction we accept:**
+- Wave planning overhead and `wave-scope.json` pre-dispatch setup
+- Per-wave quality gates before proceeding
+- Worktree isolation costs for parallel agents
+- Turn-limit constraints that stop runaway agents early
+
+**Friction we prevent:**
+- Agent scope violations (PreToolUse hooks block out-of-scope file edits)
+- Cascading failures (circuit breaker + spiral detection halt broken agents before they propagate damage)
+- Silent partial completion (STATUS line requirement forces explicit reporting)
+- Untracked carryover work (session-end plan verification catches unresolved tasks)
+
+The harness does not hope agents self-correct. It detects stagnation patterns — pagination-spiral, turn-key-repetition, error-echo (read by the coordinator during post-wave review), plus psa007-git-write and status-partial (detected live by the transcript tailer, recorded with `source: "tail"`) — classifies error-echo into the Error-Class Taxonomy defined in `circuit-breaker.md`, and re-scopes mechanically. Review logic lives in `wave-loop.md` § "Review Agent Outputs"; the tailer's start and its silence-is-not-success caveat live in the same file, step 2.0-bis.
+
+## Platform Note
+
+> State files live in the platform's native directory: `.claude/` for Claude Code, `.codex/` for Codex CLI, `.cursor/` for Cursor IDE. All references to `.claude/` below should use the platform's state directory. Shared metrics (sessions.jsonl, learnings.jsonl) live in `.orchestrator/metrics/` — both platforms read and write there. See `skills/_shared/platform-tools.md` for tool mappings.
+
+## Phase 0: Bootstrap Gate
+
+Read `skills/_shared/bootstrap-gate.md` and execute the gate check. If the gate is CLOSED, invoke `skills/bootstrap/SKILL.md` and wait for completion before proceeding. If the gate is OPEN, continue to the Pre-Execution Check.
+
+> **Session-start only:** This gate check runs ONCE at the start of `/go` execution — before the first wave. It does NOT run before each wave step. Repeating the check per wave would add latency with no safety benefit, since `bootstrap.lock` is immutable within a session.
+
+<HARD-GATE>
+Do NOT proceed past Phase 0 if GATE_CLOSED. There is no bypass. Refer to `skills/_shared/bootstrap-gate.md` for the full HARD-GATE constraints.
+</HARD-GATE>
+
+## Phase 0.5: Parallel-Aware Preamble
+
+> Skip silently when `persistence: false` in Session Config.
+
+Before Phase 1, run the parallel-aware preamble per `skills/_shared/parallel-aware-preamble.md`. The preamble detects other active sessions in the worktree-family via `findPeers(repoRoot, { mySessionId })`, classifies the caller's mode via `classifyMode(callerMode)` against the exclusivity-matrix, and fires the appropriate AUQ on conflict.
+
+**Outcome handling:**
+- `PASS_THROUGH` → continue to Phase 1
+- `EXCLUSIVE_BLOCKED` → exit Phase 0 cleanly per the AUQ outcome
+- `PROMOTION_OFFER` → user picks Worktree-Promotion (see `parallel-aware-auq.md` outcome-handling — calls `enterWorktree()`), in-place + Deviation, or Abbrechen
+
+For session-end specifically: the preamble is DETECTION-ONLY. The lock-release path in later phases keeps its current behavior — releasing the OWN session's lock requires no matrix consultation.
+
+**Implementation reference:** `skills/_shared/parallel-aware-preamble.md § Implementation`.
+**AUQ reference:** `skills/_shared/parallel-aware-auq.md`.
+
+## Pre-Execution Check
+
+Before any express-path or housekeeping shortcut, check [User-authorized housekeeping execution deviation](../session-plan/SKILL.md#user-authorized-housekeeping-execution-deviation). If active, use the actual agreed plan's counts and execution fields, retain `session-type: housekeeping`, and follow the normal scope, dispatch, verification and review flow. Do not apply the coordinator-only default's zero agent cap or serial shortcut. Confirm that the plan records the original user request; reuse that authorization rather than asking again about the same shape.
+
+Before starting the first wave (Discovery role):
+1. `git status --short` — ensure clean working directory (commit or stash if needed)
+2. Verify no parallel session conflicts (unexpected modified files)
+3. Confirm the agreed plan is still valid (no new critical issues since planning)
+4. **Check `jq` for shell snippets that call it** — run `command -v jq` before using those snippets. The scope and command enforcement hooks run without `jq`. In Scope Manifest step 4, keep the configured `enforcement` value in `wave-scope.json` regardless of `jq` availability.
+5. **Read Session Config**: Parse Session Config per `skills/_shared/config-reading.md`. Store result as `$CONFIG`. Extract these fields:
+   - `persistence` (default: true), `enforcement` (default: warn), `isolation` (default: auto)
+   - `agents-per-wave` (default: 6), `max-turns` (default: auto), `pencil` (default: null)
+   
+   **Neither `agents-per-wave` nor `max-turns` carries its own default here.** Ordinarily the per-wave `agentCap` and `maxTurns` come from the RESOLVED SHAPE (`node scripts/session-shape.mjs --repo-root "$PWD" --session-type <session-type> [--profile <session-profile>] [--known-scope true|false]`, module `scripts/lib/session-shape.mjs`). Session Config's `agents-per-wave` (with its per-type override, e.g. `6 (deep: 18)`) CLAMPS the shape's `agentCap`; `max-turns: auto` is expanded per type inside the shape. For the user-authorized housekeeping deviation, use the actual plan's bounded execution fields resolved by the linked planning procedure instead.
+   
+   **Execution Config shortcut:** If the session-plan output contains an `### Execution Config` section, its execution-level fields (waves, agents-per-wave, isolation, enforcement, max-turns) take precedence over `$CONFIG`. Session-level fields (persistence, pencil) always come from `$CONFIG`. If the Execution Config section is missing, use `$CONFIG` alone.
+6. **Initialize session metrics** (if `persistence` enabled): Prepare a metrics tracking object for this session:
+   - `session_id`: the STATE.md frontmatter `session` value, verbatim (the semantic label, = `semantic_session_id` in `.orchestrator/current-session.json`) — never a constructed `<branch>-<YYYY-MM-DD>-<HHmm>`; `scripts/emit-session.mjs` attaches the raw UUID and token rollup only when the labels match
+   - `session_type`: from Session Config
+   - `started_at`: ISO 8601 timestamp
+   - `waves`: empty array (populated after each wave)
+   This object lives in memory during execution — it is written to disk by session-end.
+
+## Pre-Execution: User Instructions
+
+If the user provided additional instructions with `/go` (e.g., `/go focus on API endpoints`), apply them as a priority modifier:
+
+1. **Incorporate into agent prompts**: Add a "**Priority Focus:**" section to each agent's prompt that includes the user's instructions verbatim
+2. **Do NOT override the plan**: User instructions adjust emphasis within the existing plan, they do not replace it. If the instructions conflict with the plan, note the conflict and follow the plan.
+
+Example: If user said `/go focus on API endpoints`, each agent prompt includes:
+```
+**Priority Focus (from user):** focus on API endpoints
+```
+
+## Pre-Wave 1a: Capture Session Start Ref
+
+Before dispatching Wave 1, capture the current commit of the session's own checkout as the session baseline — the tree this session's STATE.md lives in and its consumers diff (repoRoot); in a promoted or EnterWorktree session that is the worktree (#1652). Same value as STATE.md's `session-start-ref`:
+
+```bash
+SESSION_START_REF=$(git -C "<session checkout (repoRoot)>" rev-parse HEAD)
+```
+
+Store this value for use throughout the session — it is needed by the simplification pass (Quality wave) and session-reviewer dispatch to determine which files changed during this session. Include it in the coordinator's context, NOT in individual agent prompts. This single ref covers the session's own checkout only: commits made in additional worktrees of the session are recorded by the staging fence as `orchestrator.session.work_tree` events and listed by `node scripts/session-commit-files.mjs` (#1659; remaining limits: `references/wave-executor-state-init.md`).
+
+## Pre-Wave 1b: Initialize STATE.md
+
+> Skip entirely if `persistence: false`. Otherwise, before dispatching Wave 1, write `<state-dir>/STATE.md` (YAML frontmatter + Markdown body), then VALIDATE `total-waves` against the resolved shape — do not skip this step, a plan whose wave count the shape does not produce must never be dispatched silently. Full template, the shape-mismatch AUQ procedure, and the Docs Tasks Persistence extension (A3 / #230): [references/wave-executor-state-init.md](references/wave-executor-state-init.md).
+
+**Read WHEN:** before the first wave dispatches, every session with `persistence: true`; the VALIDATE step must not be skipped.
+
+## Wave Execution Loop
+
+Read and follow `wave-loop.md` in this skill directory for the complete wave execution loop, including agent dispatch, output review, plan adaptation, progress updates, and scope manifest creation.
+
+Since #1157 that file is a 39-line INDEX and the loop body lives in three files under `references/`. **Its own table is the routing table** — read it there, not here: it carries a `Read WHEN` column stating at which moment each file is due, which is the half a copy loses. Two of the three steps are marked **MANDATORY-BEFORE-DISPATCH**; skipping either dispatches the wave unguarded and the failure is SILENT — no error, no ledger entry, indistinguishable from a clean run.
+
+Turn budget, `maxTurns`, and stagnation recovery are unmoved: `circuit-breaker.md`. Every `wave-loop.md § …` citation elsewhere in this file resolves into one of the three sub-files.
+
+### Mission-Status Updates (#340)
+
+The coordinator (you) is responsible for updating per-task mission status in STATE.md as tasks progress through the wave. Use `setMissionStatus(stateContent, taskId, status)` from `scripts/lib/state-md.mjs` and write the result back to STATE.md immediately.
+
+**`taskId` grammar (enforced).** `setMissionStatus` refuses any `taskId` outside `[a-z][a-z0-9]*(?:-[a-z0-9]+)*-\d+` — lowercase segments joined by single hyphens, ending in a bare digit run. Accepted: `m-1`, `docs-2`, `w2-1`, `w2-a-10`. Refused (`refused: 'id-grammar'`): `w2-a10` (digits fused onto a letter segment), `w3-p2` (no trailing bare-digit segment), `W3-I1` (uppercase), `Docs_2` (underscore). A refused write returns `{ written: false, reason: 'id-grammar' }` from `setMissionStatusOnDisk` and logs a stderr WARN naming the rejected id — nothing is written to STATE.md on refusal, so mint ids matching this grammar from the start rather than relying on the refusal to catch a typo.
+
+**Per-task transition rules (coordinator fires these, NOT wave-loop.md):**
+
+| Transition | When to fire |
+|---|---|
+| `brainstormed` → `validated` | User runs `/go` to approve the wave plan (all items simultaneously) |
+| `validated` → `in-dev` | Agent for that wave-plan item is dispatched via `Agent()` tool |
+| `in-dev` → `testing` | Quality wave begins and this item's implementation wave completed without failure |
+| `testing` → `completed` | Quality-Lite gate passes (green) for this task's wave — coordinator confirms item done |
+| Any → `brainstormed` | Item is discarded, re-planned, or rolled back |
+
+**Important scoping notes:**
+- These transitions are **coordinator-level orchestration** decisions, not part of `wave-loop.md` dispatch/review logic. Do NOT modify `wave-loop.md` to add mission-status calls.
+- `wave-loop.md` is NOT modified by #340 — the transitions listed above are called by the coordinator after observing the wave-loop outcomes.
+- Only update items whose `id` appears in the `### Wave-Plan Mission Status (machine-readable)` block emitted by session-plan. Invent no new IDs.
+- When STATE.md does not yet have a `## Mission Status` body section, `setMissionStatus` creates it automatically (see `scripts/lib/state-md.mjs`).
+- `readMissionStatus(stateContent, taskId)` from the same module returns the current status string for a task (or `null` if not found), useful for guard-checking before transitions.
+
+**Backward compat:** STATE.md files without a `## Mission Status` section are valid — absence means no status tracking was started. The helpers are no-throw on bad input.
+
+## Circuit Breaker & Worktree Isolation
+
+> **Reference:** See `circuit-breaker.md` in this skill directory for MaxTurns enforcement, spiral detection, recovery protocol, and worktree isolation configuration. Apply those rules during every wave dispatch and post-wave review.
+
+## Coordinator CWD Discipline (#219)
+
+Claude Code's `Agent` tool with `isolation: "worktree"` changes `process.cwd()` into the agent's worktree and does not restore it on agent return. Without discipline, the coordinator's subsequent Edit/Write/Bash calls silently route to a worktree branch — producing data loss when the worktree is later pruned.
+
+**Rules for the coordinator (this is YOU during wave execution):**
+
+1. **After every Agent() dispatch** (before reading its output), call `restoreCoordinatorCwd()` from `scripts/lib/workspace.mjs`. `wave-loop.md § 2` makes this explicit.
+2. **Prefer absolute file paths** for Read/Edit/Write tool calls. A drifted CWD turns relative paths into silent cross-tree writes.
+3. **Before any Bash git command**, either `cd` inside a subshell (`cd /path && cmd`) or rely on `git -C /path <cmd>`. Do not assume CWD.
+4. **Verify at checkpoints** — when in doubt, run `git rev-parse --show-toplevel` to confirm which tree is currently active.
+5. **Never `cd` into a worktree in the coordinator's top-level shell.** If you need to inspect a worktree, use `git -C <wt-path> ...` or spawn a subshell.
+
+## Coordinator User Interaction
+
+Every mid-wave user decision — pause/continue, scope changes, plan revisions, routing between alternate tracks, confirming a risky recovery step, picking between recommendations — MUST go through the `AskUserQuestion` tool. Inline markdown-list "choose 1/2/3" questions in chat prose are forbidden: the user reliably misses them in the dense wave-execution stream. See `.claude/rules/ask-via-tool.md` for the full rule (AUQ-001 through AUQ-005).
+
+Mechanics:
+- `AskUserQuestion` is a deferred tool in Claude Code. On the first coordinator decision point in a session, call `ToolSearch` with `"select:AskUserQuestion"` once to load its schema, then call the tool. Do not skip the question to avoid the load.
+- Option 1 always carries `(Recommended)` in the label. Each option carries a one-line `description` stating the trade-off.
+- `AskUserQuestion` is **not available inside dispatched subagents**. If an agent surfaces a decision back to you, ask the user via `AskUserQuestion` from the coordinator turn — do not let the agent emit a prose question.
+
+Applies to every interaction point in `wave-loop.md` that currently says "inform the user", "propose revised plan", "ask the user whether to…", or "report specific mismatches to user" when a choice is implied.
+
+## Agent Prompt Best Practices
+
+Each agent prompt MUST include:
+
+1. **Clear scope boundary**: "You are working on [X]. Do NOT modify files outside [paths]."
+2. **Full context**: file paths, current code structure, issue description. If a bite-sized executable plan exists at `docs/plans/<feature>.md` for the wave's tasks (see `skills/write-executable-plan/SKILL.md`), include the path in each agent's prompt and instruct the agent to follow the plan's 5-step structure verbatim.
+3. **Acceptance criteria**: measurable definition of done
+4. **Rule references**: the wave's applicable rules are injected automatically as the `<APPLICABLE-RULES>` block produced by `scripts/print-applicable-rules.mjs` (see `wave-loop.md` § "Pre-Dispatch: Glob-Scoped Rule Injection (#336/#694)"). The block is computed once per wave from the wave's `allowedPaths` and prepended to every agent prompt — do not hand-copy rule paths into the prompt. Past **learnings** arrive separately as the `<LEARNINGS-INDEX>` block from `scripts/print-learnings-index.mjs` (see `wave-loop.md` § "Pre-Dispatch: Learnings-Index Injection (#1014)"), computed **per agent** from its own file scope rather than once per wave.
+5. **Testing expectation** (need-gated): "Before writing any test, name the concrete bug a NEW test would catch that the existing suite does not. No nameable bug → write NO test and report `no-tests-needed: <reason>` — that is a SUCCESS outcome, not a gap. With a nameable bug: exactly one test for it. Running existing tests is always mandatory."
+6. **Commit instruction**: "Do NOT commit. The coordinator handles commits. Never `git stash`, `git add`, `git checkout --` or `git reset` either (PSA-007) — to compare against the pre-change state, read `git show HEAD:<path>` (or `git show <sha>:<path>`); it never touches the shared index." Measured 2026-09-02: two agents in one wave reached for `git stash` to build a baseline; both recovered, both were the same shape.
+7. **Turn limit**: Include the maxTurns instruction from `circuit-breaker.md`
+8. **Verification before completion**: Before claiming any task done, run the verification command and quote the evidence inline. See `.claude/rules/verification-before-completion.md`.
+
+Each agent prompt MUST NOT include:
+- References to other agents' tasks (isolation)
+- Vague instructions like "improve" or "optimize" without specifics
+- Assumptions about code state — provide the actual state
+
+## Agent Memory-Proposal Capability (#501)
+
+Wave-executor agents may propose memory entries (learnings) mid-session via the `memory.propose` CLI. The coordinator surfaces proposals at session-end Phase 3.6.3 (`skills/session-end/SKILL.md`) for AUQ-confirm before promoting them to `learnings.jsonl` with `_provenance: agent-proposed@<wave-id>`. Conservative safety model: max `memory.proposals.quota-per-wave` (default 5) per wave, `memory.proposals.confidence-floor` (default 0.5).
+
+**Agent prompt boilerplate** — when dispatching an Impl-Core / Impl-Polish / Quality agent in a session where `memory.proposals.enabled: true` (default), include this block in the agent's prompt so the capability is discoverable:
+
+```
+## Memory Proposal Capability (optional)
+
+During this wave, you may propose a learning to the session's memory via the CLI:
+
+  SO_WAVE_AGENT=1 node scripts/memory-propose.mjs \
+      --type <one of: workflow-pattern|anti-pattern|recurring-issue|fragile-file|effective-sizing|proven-pattern|mode-selector-accuracy|hardware-pattern|autopilot-effectiveness|domain-regression|convention|architecture-pattern|design-pattern> \
+      --subject "one-line title (max 100 chars, no newlines)" \
+      --insight "your discovery paragraph (max 2000 chars)" \
+      --evidence "concrete proof: code citation / log excerpt / commit ref (max 5000 chars)" \
+      --confidence <0.5 to 1.0> \
+      --file-paths "scripts/lib/a.mjs,scripts/lib/b.mjs"
+
+MUST prefix with `SO_WAVE_AGENT=1` — without it the CLI returns exit 3 `rejected-wrong-context`. The env-var is the per-process guard that distinguishes wave-executor agents from coordinator-context invocations.
+
+`--file-paths` is optional but strongly encouraged: repo-relative path(s) this learning applies to (repeatable and/or comma-separated, deduped; rejects absolute paths, `..` segments, embedded newlines, entries over 256 chars, and more than 20 entries). Without `--file-paths` this learning can never become `/reconcile`-eligible — the reconciliation engine can only convert a learning into a conditional `.claude/rules/*.md` rule when it carries a non-empty scope (issue #900).
+
+Exit code 0 = queued (the coordinator will present at session-end via AskUserQuestion); 1 = quota-exceeded; 2 = rejected-low-confidence (below floor 0.5); 3 = rejected-wrong-context (STATE.md not active OR SO_WAVE_AGENT != "1"); 4 = error (arg validation or internal).
+
+Use ONLY when you find a recurring pattern, anti-pattern, or constraint worth carrying into future sessions. The coordinator confirms each proposal before it lands in learnings.jsonl. Do NOT over-propose — the quota is shared by every agent of the wave: once the wave holds `quota-per-wave` proposals (default 5), the next one exits 1 whichever agent sends it.
+
+Analyzer-only learning types, including `autonomy-verdict`, are intentionally not valid here; those are emitted by `/evolve` after their analyzer-specific evidence gates pass.
+```
+
+**Skip injection** when:
+- `memory.proposals.enabled: false` in Session Config, OR
+- Discovery / Finalization waves (Discovery is read-only; Finalization is coordinator-direct)
+
+**Audit trail:** the `hooks/pre-bash-memory-propose-audit.mjs` hook logs every CLI invocation to `.orchestrator/metrics/events.jsonl` with the value of `--insight` / `--subject` / `--evidence` redacted (privacy-by-default).
+
+Cross-reference: PRD F2.1 / issue #501 / `docs/memory-proposal-flow.md` (coordinator-side AUQ rendering reference doc) / `scripts/lib/memory-proposals/{schema,store,collector,sink}.mjs` (the modules).
+
+## Session Type Behavior
+
+### Housekeeping Sessions — the Maintenance Loop
+
+**Check the user-authorized execution deviation before entering this shortcut.** When active, initialize STATE.md with the actual plan's `total-waves`, record the deviation per [STATE initialization](references/wave-executor-state-init.md), materialize the normal per-agent and aggregate wave scopes (including the coordinator), and run the normal dispatch, inter-wave checks and review process. Keep the maintenance order and its coordinator-owned decisions below; skip the serial-only mechanics list. Do not skip reviews merely because `session-type` remains `housekeeping`.
+
+Ordinary housekeeping is **ONE coordinator-direct wave**: `node scripts/session-shape.mjs --repo-root "$PWD" --session-type housekeeping --no-event` resolves to `totalWaves: 1` with that wave's `coordinatorDirect: true` and `writes: true`. "Coordinator-direct" means **no wave-executor dispatch loop** — it does not mean zero subagents (`/evolve dialectic` dispatches the read-only `dialectic-deriver`).
+
+**Ordered default scope — the maintenance loop.** Run it in this order, before the session's selected issues:
+
+| # | Run | Gate | Artefact that proves it ran |
+|---|---|---|---|
+| 1 | `claude-md-drift-check` | unconditional | checker JSON (`errors`/`warnings` counts) |
+| 2 | expired-learnings sweep | unconditional | `orchestrator.learnings.sweep_applied` |
+| 3 | expired-generated-**rules** sweep — `node scripts/sweep-expired-rules.mjs --horizon-days 7` (`--dry-run` first, then `--apply`; the horizon covers the gap to the next sweep, since Claude Code ignores `expires-at`, #1779) | AUQ-gated (it rewrites and can DELETE tracked `.claude/rules/*.md` files) | `orchestrator.rules.expiry_sweep_applied` |
+| 4 | `/evolve analyze` | AUQ-gated (the operator approves the proposed learnings) | `orchestrator.evolve.completed` |
+| 5 | `/reconcile` | AUQ-gated (rule proposals are never applied unasked) | `orchestrator.reconcile.completed` with `dry_run: false` |
+| 6 | `/evolve dialectic` | AUQ-gated (the derived thesis is presented, not committed) | `orchestrator.dialectic.completed` |
+| 7 | `/memory-cleanup` | AUQ-gated (deletions are operator-approved) | `orchestrator.memory.cleanup_completed` |
+| 8 | `/backlog` (`node scripts/backlog-refine.mjs`) | report unconditional; tracker writes AUQ-gated per `skills/backlog/SKILL.md` | `orchestrator.backlog.refine_completed` |
+
+Row 3 runs directly after row 2 because its evidence comes from row 2's corpus: an entry's date is recoverable only via its `learning-id` → `learnings.jsonl` `expires_at`, so the rule sweep must see the store the learnings sweep left behind. Show the operator the dry-run plan — it names every rewrite, every delete, every skip (`no-1to1-mapping`, `no-provenance-block`, `unreadable`, `no-counter-sentence`) and every unresolvable pair — before asking. A `no-counter-sentence` skip (GH#70) is the sweep refusing to touch a file whose counter sentence it cannot read, deletion included — report it as a skip, never as a defect. Contract: `docs/rule-authoring.md` § Consolidated rules → "The expiry sweep".
+
+The session-start probe `maintenance-due` (`scripts/lib/maintenance-due-banner.mjs`) says which of these are DUE for this repo; a run that is not due may be skipped, and the skip is reported. An AUQ-gated run the operator declines is reported as declined — never as done. **Absence of the artefact event is the only evidence that counts**: a run claimed in prose without its event is not a run (`.claude/rules/verification-before-completion.md`).
+
+Then the mechanics **for ordinary housekeeping without the user-authorized deviation**:
+
+1. Initialize STATE.md as normal (`session-type: housekeeping`, `total-waves: 1`)
+2. Do NOT create `wave-scope.json` — there is no agent fan-out to constrain; the coordinator's own edits stay governed by its `coordinator.json` record
+3. Execute the maintenance loop above, then the session's selected issues, serially as coordinator actions
+4. Run Baseline quality checks after all tasks complete (not between tasks)
+5. Skip session-reviewer dispatch — housekeeping changes are low-risk
+6. Do NOT update STATE.md to `status: completed` — that write is reserved for session-end per state-ownership contract (`skills/_shared/state-ownership.md`). Leave `status: active`.
+7. Proceed directly to session-end (`/close`)
+
+Beyond the loop: git cleanup, SSOT refresh, CI fixes, branch merges, documentation.
+End with a single commit summarizing all housekeeping work.
+
+### Feature Sessions
+- **3 waves** (Impl-Core → Impl-Polish+Quality → Finalization) with **no Discovery wave** — read them from the shape, not from this file: `node scripts/session-shape.mjs --repo-root "$PWD" --session-type feature --no-event`
+- Per-wave agent caps come from the shape's `agentCap` (the shape caps a feature wave at 4), clamped by Session Config `agents-per-wave`
+- Balance between implementation speed and quality
+
+### Deep Sessions
+- **5 waves** from the shape (`--session-type deep`); the **Discovery wave is conditional** — pass `--known-scope true` when the scope is already established and the shape drops Discovery, leaving 4 waves
+- Per-wave agent caps come from the shape's `agentCap`, clamped by Session Config `agents-per-wave` with its per-type override (this repo: `agents-per-wave: 6 (deep: 18)`)
+- Extra emphasis on Discovery role and Quality role
+- May include security audits, performance profiling, architecture refactoring
+
+### Ultradeep Profile (`session-profile: ultradeep`)
+
+Not a fourth session type — a PROFILE over `session-type: deep`, resolved from the `/session ultradeep` argument alias (`commands/session.md`). Everything below applies only when STATE.md frontmatter carries `session-profile: ultradeep`; every other behaviour in this skill is unchanged, because downstream still reads `deep`. Full spec — wave table, mandatory artefacts, cost model: the internal ultradeep session-profile PRD (2026-09-06, not in the public mirror).
+
+- **The wave count and the wave roles come from the shape**, not from this file: `node scripts/session-shape.mjs --repo-root "$PWD" --session-type deep --profile ultradeep --no-event` returns `totalWaves: 7` (Research+Code-Discovery → Synthesis-Gate → Impl-Core → Impl-Polish → Review-Panel → Quality → Release/Finalization) and reports `wavesConfigHonored: false` with the ignored Session Config `waves` value — the profile OWNS its wave count. Role narrative: `skills/session-plan/SKILL.md` § Role-to-Wave Mapping.
+- **Wave 2 is coordinator-direct and dispatches ZERO agents.** Make NO `Agent()` call in this wave. The coordinator consolidates wave 1 into `docs/audits/<YYYY-MM-DD>-<slug>.md`, updates STATE.md, and asks ONE **blocking** `AskUserQuestion` (confirm scope / narrow / abort) per `.claude/rules/ask-via-tool.md`. Wave 3 does not start until that question is answered — this is the one gate the profile exists for, so a silent "no tasks, skip it" is a defect, not an optimisation (`skills/session-plan/SKILL.md` § Empty roles, coordinator-direct exception).
+- **`max-turns` is per ROLE, and the numbers live in the shape:** take each wave's value from `waves[].maxTurns` in the shape output above (the Research, implementing and Release/Finalization figures are produced there, not restated here). Set it on the dispatch; a wave whose `maxTurns` is `null` is coordinator-direct and dispatches nothing.
+- **Web tools are role-bound.** Research agents in wave 1 receive `WebSearch` and `WebFetch`. **No write-capable agent may receive them** — not in wave 1's Code-Discovery half, and not in any later wave. The grant follows the READ-ONLY property, so the pairing "has Write/Edit" + "has WebSearch/WebFetch" must never occur in a single dispatch. Research findings carry URL + retrieval date, the web analogue of the PSA-006 evidence rule (`.claude/rules/parallel-sessions.md`).
+- **Budgets are not implemented.** The PRD's `ultradeep.max-*` block (§ 7) is deferred until three runs have been measured (HR-105: no threshold without a firing rate). Nothing reads such a key today — do not invent one, and do not gate a wave on it.
+
+## Error Recovery
+
+| Situation | Action |
+|-----------|--------|
+| Agent times out | Re-dispatch with smaller scope |
+| Agent produces broken code | Add fix task to next wave |
+| Tests fail after wave | Diagnose in next wave, don't skip |
+| Merge conflict between agents | Resolve manually, document |
+| TypeScript errors introduced | Track count, run Full Gate per quality-gates by Quality wave |
+| New critical issue discovered | Inform user, add to Impl-Polish+ roles if fits scope |
+| Agent edits wrong files | Revert via git, re-dispatch with stricter scope |
+| New critical issue discovered with broken behavior | Apply `skills/debug/SKILL.md` Iron Law 4-phase investigation before proposing a fix |
+
+## Return Shape Contract (Autopilot Integration, #300)
+
+When wave-executor is invoked as `sessionRunner` from `scripts/lib/autopilot.mjs::runLoop`, the value it returns to the loop drives the post-session kill-switches (`spiral`, `failed-wave`, `carryover-too-high`). The loop reads schema-canonical fields off the returned object — absent fields are treated as "no signal" (forward-compatible: an older or partial implementation simply does not trip the post-session gates).
+
+```js
+// Returned by sessionRunner({mode, autopilotRunId}) — superset of session-record schema.
+{
+  session_id: string,                           // required (used since Phase C-1)
+
+  agent_summary?: {                             // schema-canonical (session-schema.mjs)
+    complete?: number,
+    partial?:  number,
+    failed?:   number,                          // > 0 → kill-switch: failed-wave
+    spiral?:   number,                          // > 0 → kill-switch: spiral
+  },
+
+  effectiveness?: {                             // schema-canonical (session-schema.mjs)
+    planned_issues?: number,                    // 0 → carryover gate is no-op (avoids div-by-zero)
+    carryover?:      number,                    // / planned > carryoverThreshold → carryover-too-high
+    completion_rate?: number,
+    completed_issues?: number,
+  },
+
+  usage?: {                                     // schema-canonical (autopilot token-budget kill-switch, #355)
+    output_tokens?: number,                     // cumulative output tokens for this session; absence → 0 (forward-compat)
+    total_tokens?: number,                      // alternative name accepted as fallback
+  },
+}
+```
+
+**`autopilot_run_id` propagation:** when wave-executor is invoked under autopilot, `args.autopilotRunId` is the loop-level run id. The per-iteration `sessions.jsonl` record MUST carry `autopilot_run_id: <id>` so retros can join autopilot.jsonl ↔ sessions.jsonl without schema changes. Manual sessions write `null` or omit the field — readers treat both identically per the v1 additive convention. See `skills/session-end/session-metrics-write.md`.
+
+## Completion
+
+After the Finalization wave completes successfully:
+1. Report final status to the user
+2. If `persistence: true`, suggest invoking `/close` to finalize the session. If `persistence: false`, note that the session is complete (no STATE.md to close — session-end would be a no-op).
+3. Do NOT auto-commit — `/close` handles that with proper verification
+4. With fleet integration this report is the session's finished or waiting answer: apply `skills/_shared/fleet-protocol.md` § Rücklauf an den Navigator (Pflicht) (wait case `fertig`, or `zug-<name>` when only a release train or pipeline is left) and, in this same turn, § Übergabe und Zug-Manifest — write the file, report „bereit zum Schließen“, stop monitors and background work, start nothing new, and leave `/close` to the coordinator. The report then ends with the sentence `Bereit zum Schließen.` instead of the `/close` suggestion of step 2: the coordinator reads only the last 600 characters, and no question may follow. Without fleet integration, nothing changes.
+
+## Vault-Sync Diff Reporting (#327)
+
+When the inter-wave Quality-Lite checkpoint invokes vault-sync, it should prefer `--mode=diff` over full enforcement so the coordinator sees only regressions introduced by the current wave — not pre-existing issues that were already present at session start.
+
+**Preferred checkpoint invocation (once a baseline exists):**
+
+```bash
+VAULT_DIR=<vault-dir> bash skills/vault-sync/validator.sh --mode diff
+```
+
+The diff JSON block (`{ new_errors, resolved_errors, baseline_count, current_count, schema_hash }`) is emitted to stdout. The coordinator parses it and surfaces a compact summary in the inter-wave checkpoint output. Focus on `new_errors` only — `resolved_errors` are informational.
+
+**First-run bootstrap:** if no baseline file exists at `<vault-dir>/.orchestrator/metrics/vault-sync-baseline.json`, the coordinator runs `--mode=baseline` once before the next wave starts, then switches to `--mode=diff` for all subsequent checkpoints.
+
+**Schema migration:** when the vendored schema in `validator.mjs` changes, the schema-hash in the existing baseline won't match. The validator falls back to full enforcement and emits a WARN to stderr. The coordinator must re-run `--mode=baseline` manually before resuming diff-mode checkpoints.
+
+**Configuration:** diff-mode is enabled by default once a baseline exists. To force full enforcement at any checkpoint, set `vault-sync.mode: full` in Session Config or pass `--mode full` explicitly.
+
+> **Cross-reference:** baseline file shape, diff output schema, and schema-hash mismatch handling are documented in `skills/vault-sync/SKILL.md` § Modes (#327).
+
+## Inter-Wave Quality-Gate (with Auto-Fix Loop — #521)
+
+> **Reference:** See [references/wave-executor-quality-gate.md](references/wave-executor-quality-gate.md) for the invocation, decision flow, skip conditions, the BE-012 test-the-mock anti-pattern reminder, the Quality-wave Full-Gate mandate (#724 C6), and the inter-wave heartbeat cadence (#590-3). Read after each wave completes, before proceeding to the next wave or session-end.
+
+## Agent-Status Telemetry (#565)
+
+Optional, best-effort operator-side observability: the coordinator pushes lightweight per-agent status at three anchors (dispatch, agent-end, wave-end rollup) via `scripts/lib/agent-status.mjs`, gated on `persistence: true`. A push NEVER blocks a wave. The tmux `--with-status-pane` flag (`skills/tmux-layout/SKILL.md`) renders the live feed. See `wave-loop.md § 3a-bis. Agent-Status Telemetry` for the exact anchors and invocation.
+
+## Frontmatter-Guard (#328)
+
+When an agent's task scope includes vault paths (`~/Projects/vault/` or vault subdirectories such as `40-learnings/`, `50-sessions/`, `03-daily/`, `01-projects/`), the wave-executor injects a deterministic frontmatter-schema snippet into the agent's prompt. This eliminates the recurring failure class where agents guess at enum values for `type`, `status`, or `tags`.
+
+See `wave-loop.md` § Pre-Dispatch: Frontmatter-Guard Injection for the exact contract. The snippet generator is `scripts/lib/frontmatter-guard.mjs` (skill: `skills/frontmatter-guard/`).
+
+## Path-Cousin-Guard (#730.3)
+
+When a wave agent's file scope includes a NEW file target, the wave-executor injects a mechanical grep-based "cousin path" check into the agent's prompt before dispatch — preventing the recurring failure class where an agent creates a duplicate file at a nearby path instead of finding/extending the existing one. See `wave-loop.md` § Pre-Dispatch: Path-Cousin-Guard Injection for the exact contract.
+
+## Worker-Pool Dispatch (#415)
+
+An opt-in bounded-concurrency cursor-based pull loop that replaces the default Promise.all() fan-out for agent dispatch. Controlled by three Session Config fields under the `worker-pool` object:
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `worker-pool.enabled` | boolean | `false` | When `false` (default), the small-batch Agent() dispatch is used (3–4 calls per message, cumulative up to `agents-per-wave`; large single-message fan-outs of >4 are forbidden — see `wave-loop.md § Dispatch Agents`, conf 1.0 silent-drop evidence). When `true`, `runWavePool()` from `scripts/lib/wave-executor/pool.mjs` is used instead. |
+| `worker-pool.max-parallel` | integer | value of `agents-per-wave` | Maximum concurrent workers in the pool. Falls back to `agents-per-wave` when unset. Useful for capping concurrency below `agents-per-wave` on memory-constrained hosts. |
+| `worker-pool.drain-timeout-ms` | integer | `10000` (10 s) | When an abort signal fires mid-run (e.g., a MAX_HOURS kill-switch), workers are sent SIGTERM via their per-worker AbortController and the pool waits at most this many milliseconds before returning partial results. |
+
+**Backward compatibility:** `worker-pool.enabled` defaults to `false`. Sessions that omit the `worker-pool` block use the default small-batch Agent() dispatch (3–4 calls per message, waiting for each batch's tool-results before the next batch — never a large single-message fan-out). No migration required.
+
+**When to enable:** use `worker-pool.enabled: true` when `agents-per-wave` is high (≥ 8) and the host is memory-constrained, or when you want to observe incremental agent completion rather than waiting for all agents to finish before inter-wave checks begin.
+
+## Anti-Patterns
+
+- **NEVER** count launch acks as completions — verify the started set against `agent-<id>.meta.json` sidecars and completions against task-notifications (`wave-loop.md § Started-Set Verification`). `run_in_background: true` is ALLOWED and RECOMMENDED for wave dispatch: measured 2026-08-22 (v2.1.239), under blocking dispatch the coordinator was 143 s incapable of acting between an agent's mid-run escalation and its own next turn — escalation latency equals the batch's remaining runtime. Background dispatch returns turns to the coordinator between agent completions; a running agent received a queued message mid-run and answered ~9 min before its final report.
+- **NEVER** skip inter-wave review — quality degrades exponentially
+- **NEVER** let agents commit independently — coordinator commits at session end
+- **NEVER** continue to next wave if previous wave has unresolved failures
+- **NEVER** dispatch more agents than configured in `agents-per-wave`
+- **NEVER** let wave execution run without reporting progress to the user
+- **NEVER** ask the user a decision as inline prose or a numbered markdown list — always use `AskUserQuestion` (see `.claude/rules/ask-via-tool.md`)
+- **NEVER** perform auto-commits from inside a dispatched subagent — the Auto-Commit Checkpoint (see `wave-loop.md § Auto-Commit Checkpoint`) is coordinator-only and fires only after Quality-Lite PASS. Agents report STATUS lines; the coordinator decides whether and when to commit. Subagent commits bypass the quality gate, skip the STATE.md deviation log, and violate parallel-session isolation (PSA-004 in `.claude/rules/parallel-sessions.md`).
+
+**Auto-commit vs. coordinator-snapshot:** these two features are complementary, not competing.
+- `coordinator-snapshot.mjs` (`wave-loop.md § Pre-Dispatch Coordinator Snapshot`) fires **before** agent dispatch as a stash-based working-tree backup — it protects uncommitted coordinator state from worktree merge-back collisions.
+- Auto-Commit Checkpoint fires **after** Quality-Lite PASS as a durable git commit — it provides a permanent recovery point for session crashes or `git stash` incidents (V3.3 RESCUE incident, GitLab #214).
+
+Both are gated on `persistence: true`. Neither replaces the other. The snapshot is pre-dispatch insurance; the auto-commit is post-gate durability.

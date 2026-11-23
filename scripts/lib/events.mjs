@@ -1,0 +1,1017 @@
+/**
+ * events.mjs — JSONL event emission + optional webhook POST for session-orchestrator.
+ *
+ * Replaces scripts/lib/events.sh. Windows-safe (no hardcoded path separators).
+ * Uses Stdlib HTTP and fs.promises — no external dependencies.
+ *
+ * Part of v3.0.0 migration (Epic #124, issue #133).
+ * Issue #228: removed hardcoded personal-domain default URL. Clank Event Bus URL
+ * must now be supplied explicitly via CLANK_EVENT_URL when CLANK_EVENT_SECRET is set.
+ *
+ * ## Correlation envelope (#1177 FA3)
+ *
+ * Measured 2026-09-02 @ c3ab480 over 33,608 ledger records: only 22.1% carry
+ * `session_id` and 4.8% carry `wave`, because filling them was every call
+ * site's own job and 32 of 34 call sites pass no options at all. `emitEvent()`
+ * now fills those keys itself — under three hard rules:
+ *
+ *   1. **Additive, never overriding.** The correlation keys are spread BEFORE
+ *      `payload`, so any caller-supplied `session_id` / `semantic_session_id` /
+ *      `wave` wins byte-for-byte. A payload that supplies EITHER session key
+ *      suppresses the session fill entirely (both keys), so a caller that
+ *      deliberately pins attribution elsewhere — `vault-mirror/telemetry.mjs`
+ *      pins to `SO_PROJECT_DIR` and passes both keys — is untouched.
+ *   2. **Omit, never fabricate.** When attribution cannot be PROVEN, both keys
+ *      are left ABSENT — never `null`, never `''`. An absent key is the only
+ *      honest encoding of "not attributable" (see `sessionAttribution()`).
+ *   3. **Never a peer's id (#1123).** A shared working copy means
+ *      `session.lock` can name a PEER session that won the acquire race. The
+ *      lock alone therefore does not prove ownership; the fill happens only
+ *      when a confirmed native PROCESS-LOCAL id (`CLAUDE_CODE_SESSION_ID` or
+ *      `CODEX_THREAD_ID`) equals the lock's raw `session_id`. STATE.md is NOT a
+ *      witness here (#1177 FX1): it is a shared working-copy file written by
+ *      the lock holder, so under a peer-owned lock both agreed about the peer
+ *      and the union stamped the peer's ids. See {@link attributionForRecord}.
+ *
+ * The attribution root is the SAME root the ledger line is pinned to
+ * (`opts.repoRoot ?? SO_PROJECT_DIR`), never `process.cwd()`. Measured cost of
+ * the whole envelope (lock + wave manifest, 100 calls, this repo):
+ * 0.0961 ms/call.
+ */
+
+import { httpRequest } from './http-request.mjs';
+import {
+  promises as fs,
+  closeSync,
+  existsSync,
+  fstatSync,
+  openSync,
+  readFileSync,
+  readSync,
+  readdirSync,
+  realpathSync,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import { getProjectDir, resolveEventsLedgerRoot, SO_SHARED_DIR } from './platform.mjs';
+import { readLock } from './session-lock.mjs';
+import { resolveStateMdWriteTarget } from './state-md/frontmatter-mutators.mjs';
+import {
+  classifyManifestSession,
+  readProcessLocalSessionIds,
+} from './session-identity/own-session.mjs';
+import {
+  ARCHIVE_DIR_NAME,
+  ARCHIVE_NAME_RE,
+  EventValidationError,
+  LEGACY_RING_MAX,
+  ROTATION_EVENT,
+  parseEventLines,
+  stampEventSchemaVersion,
+  summarizeEventRecords,
+  validateEventRecord,
+} from './events-schema.mjs';
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+/**
+ * Test seam (#1397 item 11): the absolute path of a sandbox ledger that the
+ * DEFAULT destination is redirected to whenever that default would land outside
+ * the OS temp root. Set by `tests/setup/events-ledger-guard.mjs` in every
+ * vitest worker, and inherited by every child process the suite spawns — which
+ * is the point: the default resolves via `SO_PROJECT_DIR` (env, else a walk up
+ * from the cwd), so a spawned script with `cwd = <repo>` otherwise appended
+ * synthetic records, stamped with the LIVE session id, to the real ledger.
+ * Nothing in production sets it.
+ */
+export const EVENTS_LEDGER_SANDBOX_ENV = 'SO_EVENTS_LEDGER_SANDBOX';
+
+/**
+ * OS temp root in both spellings (macOS `os.tmpdir()` is `/var/folders/…`, a
+ * symlink to `/private/var/folders/…`; `process.cwd()` inside it reports the
+ * canonical form). Only called while the sandbox variable is set.
+ * @returns {string[]}
+ */
+function tmpRoots() {
+  const raw = path.resolve(tmpdir());
+  let real = raw;
+  try { real = realpathSync(raw); } catch { /* keep the raw spelling */ }
+  return real === raw ? [raw] : [raw, real];
+}
+
+/** @param {string} p @param {string[]} roots @returns {boolean} */
+function isUnderAny(p, roots) {
+  const abs = path.resolve(p);
+  return roots.some((r) => abs === r || abs.startsWith(r + path.sep));
+}
+
+/**
+ * Apply the sandbox redirect to a DEFAULT-resolved ledger path.
+ *
+ * Rule: redirect only a default that would leave the temp root. A fixture
+ * project dir under tmp (`CLAUDE_PROJECT_DIR=<mkdtemp>`, or `cwd: <mkdtemp>`) is
+ * where a test EXPECTS its records — measured 2026-09-19 @ d92c2ca4, 38 test
+ * files set a project-dir env var and read `events.jsonl` back — so it is kept
+ * byte-identical. Keying on "outside tmp" rather than on "is this repo's ledger"
+ * is deliberate: an allow-list of protected roots fails open on the root it did
+ * not name (a sibling repo, a copied plugin tree), this invariant does not.
+ *
+ * Why the sandbox value must itself sit under the temp root: a stray or
+ * malformed export in an operator's shell must never be able to aim real
+ * telemetry at another tracked file. A value outside tmp, a relative value, or
+ * a whitespace-only value is IGNORED → production resolution, unchanged. What
+ * this cannot prevent (BV-004 ceiling): a stray export that DOES point under
+ * tmp diverts a real session's records there. The name marks it a test seam;
+ * revisit if it is ever found set outside a vitest process.
+ *
+ * @param {string} defaultPath
+ * @returns {string}
+ */
+function sandboxedDefault(defaultPath) {
+  const sandbox = (process.env[EVENTS_LEDGER_SANDBOX_ENV] || '').trim();
+  if (!sandbox || !path.isAbsolute(sandbox)) return defaultPath;
+  const roots = tmpRoots();
+  if (!isUnderAny(sandbox, roots) || isUnderAny(defaultPath, roots)) return defaultPath;
+  return path.resolve(sandbox);
+}
+
+/**
+ * Returns the absolute path to `.orchestrator/metrics/events.jsonl` under `repoRoot`.
+ *
+ * `repoRoot` defaults to the ONE events-ledger root, `resolveEventsLedgerRoot()`
+ * (`platform.mjs`, #1514 point 1): the launch dir from env, else the main
+ * checkout when the cwd is a linked git worktree, else `getProjectDir()` — the
+ * pre-#1514 default, unchanged everywhere a worktree is not involved (#941). An
+ * explicit absolute `repoRoot` inside a linked worktree is mapped to its main
+ * checkout the same way. Pass an explicit
+ * `repoRoot` when the destination must be pinned to a tree other than the
+ * CWD/env-resolved project — e.g. a unit test running the gate against a tmp
+ * repo, which must NOT append synthetic records to the real fleet telemetry.
+ *
+ * Only the zero-arg (default) form honours {@link EVENTS_LEDGER_SANDBOX_ENV};
+ * an explicit `repoRoot` is never redirected. Readers that resolve the default
+ * (session-start rotation) and raw writers that use it (the discovery-validator
+ * hook) therefore see the same sandbox `emitEvent()` writes to.
+ *
+ * @param {string} [repoRoot=SO_PROJECT_DIR] — project root the events log lives under.
+ * @returns {string}
+ */
+export function eventsFilePath(repoRoot) {
+  if (repoRoot !== undefined) {
+    // #1514 point 1 — an absolute root inside a LINKED git worktree maps to the
+    // same spot in its main checkout: one ledger per repo, never one per
+    // worktree. Identity for every other root (a plain repo, a tmp fixture, a
+    // non-git dir), and a relative/empty value is joined exactly as before —
+    // `emitEvent()` refuses it upstream.
+    const root = typeof repoRoot === 'string' && path.isAbsolute(repoRoot)
+      ? resolveEventsLedgerRoot(repoRoot)
+      : repoRoot;
+    return path.join(root, SO_SHARED_DIR, 'metrics', 'events.jsonl');
+  }
+  return sandboxedDefault(path.join(resolveEventsLedgerRoot(), SO_SHARED_DIR, 'metrics', 'events.jsonl'));
+}
+
+/**
+ * Session attribution for gate/lifecycle telemetry (#928a, hoisted here #941).
+ *
+ * The natural shared home the two former call-site copies (`quality-gate.mjs`,
+ * `run-quality-gate.mjs`) both named. Emits BOTH the UUID `session_id` and the
+ * `semantic_session_id`, mirroring the field shape of
+ * `orchestrator.session.lock.acquired` so gate events join against the same keys
+ * existing consumers already read (see `session-close-backfill.mjs`).
+ *
+ * Contract (#1874, rule 3 of the module header): the lock's ids are returned
+ * only when a confirmed native PROCESS-LOCAL id (see
+ * `readProcessLocalSessionIds()`) equals the lock's raw `session_id`; both keys
+ * are then copied verbatim. The lock alone proves nothing — it is one
+ * working-copy file, and a dead or foreign holder's id used to reach every
+ * caller that spreads this result into a payload, where it also suppresses
+ * `emitEvent()`'s own fill.
+ *
+ * BOTH keys are OMITTED rather than filled with a placeholder when there is no
+ * lock (CI runs have none), when the process carries no confirmed id, and when
+ * its id disagrees with the lock: a fabricated id would silently collide across
+ * every unattributed run and read as a real session; an empty string would
+ * satisfy a truthiness check while attributing to nothing. An absent key is the
+ * only honest encoding of "not attributable".
+ *
+ * CEILING (BV-004): a harness with no native id (Cursor and Pi, by
+ * `readProcessLocalSessionIds()`) gets no attribution from here, even on its
+ * own lock. REVISIT when one of them exports a process-scoped session id.
+ *
+ * @param {string} [repoRoot] — repo whose `session.lock` is read for attribution.
+ * @returns {{session_id?: string, semantic_session_id?: string}}
+ */
+export function sessionAttribution(repoRoot) {
+  try {
+    const lock = readLock({ repoRoot });
+    if (!lock) return {};
+    const lockRawId = typeof lock.session_id === 'string' ? lock.session_id.trim() : '';
+    if (!lockRawId || !readProcessLocalSessionIds().includes(lockRawId)) return {};
+    const out = { session_id: lock.session_id };
+    if (typeof lock.semantic_session_id === 'string' && lock.semantic_session_id.trim()) {
+      out.semantic_session_id = lock.semantic_session_id;
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Correlation envelope (#1177 FA3)
+// ---------------------------------------------------------------------------
+
+/** State-dir candidates, in the same order `state-md` resolves them. */
+const STATE_DIR_CANDIDATES = ['.claude', '.codex', '.cursor', '.pi'];
+
+/**
+ * Session-correlation keys for a record pinned to `root` — `{}` when ownership
+ * is not provable. {@link sessionAttribution} with the record's default root;
+ * the confirmation itself lives there (#1874).
+ *
+ * Decision, in one line: **only a PROCESS-LOCAL id may confirm the lock, and
+ * when one exists it decides alone.**
+ *
+ *   - No lock (CI, a bare script) → `{}`. Nothing to attribute to.
+ *   - No confirmed process-local id (absent or ambiguous native env) → `{}`. Ownership is
+ *     UNPROVEN, and an unproven attribution is exactly the peer-id write #1123
+ *     forbids; an absent key costs a correlation, a wrong key costs a false one.
+ *   - A process-local id that equals the lock's raw `session_id` → fill BOTH
+ *     keys, verbatim from the lock.
+ *   - A process-local id that DISAGREES → `{}` (the lock names a peer that won
+ *     the acquire race).
+ *
+ * **Why STATE.md is not a witness (#1177 FX1).** It used to be one, unioned
+ * with the env id — and the union was the bug: `.claude/STATE.md` is a SHARED
+ * working-copy artefact written by the session that OWNS the working copy,
+ * i.e. normally the lock holder. When a peer holds the lock, the peer also
+ * wrote STATE.md, so both "independent" witnesses name the PEER and a
+ * disagreeing process-local id could not veto them. Measured: lock=peer,
+ * STATE.md=peer, `CLAUDE_CODE_SESSION_ID`=me → the peer's ids were stamped on
+ * this session's records. A shared file cannot prove which PROCESS is emitting;
+ * see `readProcessLocalSessionIds()` for the tiering rationale (HR-102: a
+ * better signal replaces a worse one, it does not merely get outvoted by it).
+ *
+ * CEILING (BV-004): the comparison is against the lock's RAW `session_id`, so a
+ * harness that ROTATES its session id mid-session (see
+ * `tests/hooks/on-session-end.test.mjs` `new-rotated-uuid`) has an env id that
+ * no longer equals the lock's raw id, and BOTH keys are then omitted — honest
+ * absence, never misattribution. REVISIT when the rotation rate is measured in
+ * `events.jsonl` (count `orchestrator.session.started` against lock rewrites):
+ * if rotation is common, the lock must be refreshed on rotation rather than
+ * this comparison widened.
+ *
+ * **THE manifest-binding writer contract (#1207).** This function is not only
+ * `emitEvent()`'s correlation fill — it is the canonical primitive for every
+ * caller that needs to name a `.orchestrator/`-adjacent artefact as "mine"
+ * without risking a peer's id. `skills/wave-executor/wave-loop.md` § Scope
+ * Manifest step 1 calls it directly to derive `wave-scope.json`'s `session_id` /
+ * `semantic_session_id` binding — a hand-written prose comparison against
+ * STATE.md previously stood in for exactly this check, and (per the STATE.md
+ * caveat above) that comparison could not veto a peer-owned lock. Any new
+ * writer facing the same "is this working-copy-shared artefact mine to
+ * stamp?" question should call this function rather than re-deriving the
+ * raw-id-vs-process-local comparison inline (see `scripts/memory-propose.mjs`
+ * `resolveRunningWaveId()` for a case that reads the SAME lock but needs the
+ * semantic id plus diagnostic detail this function's `{}`-on-any-mismatch
+ * contract intentionally does not expose, and keeps its own comparison for
+ * that reason).
+ *
+ * @param {string} [root=SO_PROJECT_DIR] — the repo the record is pinned to.
+ * @returns {{session_id?: string, semantic_session_id?: string}}
+ */
+export function attributionForRecord(root = getProjectDir()) {
+  return sessionAttribution(root);
+}
+
+/**
+ * Absolute path of the active `wave-scope.json`, or `null` when none exists.
+ *
+ * This session's state dir is tried first (the dir of
+ * `resolveStateMdWriteTarget()`'s path), then the remaining candidates — so a
+ * Codex or Cursor run finds its own manifest rather than a stale `.claude/`
+ * one. #1636: the write target, not the first existing STATE.md, because a
+ * foreign STATE.md in another platform's dir would put that dir's (foreign)
+ * manifest first and hide this session's own wave.
+ *
+ * @param {string} root
+ * @returns {string|null}
+ */
+function waveScopePath(root) {
+  const dirs = [];
+  try {
+    dirs.push(path.dirname(resolveStateMdWriteTarget(root).path));
+  } catch {
+    /* fall through to the fixed candidate list */
+  }
+  for (const dir of STATE_DIR_CANDIDATES) {
+    const abs = path.join(root, dir);
+    if (!dirs.includes(abs)) dirs.push(abs);
+  }
+  for (const dir of dirs) {
+    const candidate = path.join(dir, 'wave-scope.json');
+    try {
+      if (existsSync(candidate)) return candidate;
+    } catch {
+      /* unreadable candidate — try the next one */
+    }
+  }
+  return null;
+}
+
+/**
+ * `{ wave }` from the live wave-scope manifest — `{}` when the manifest is
+ * missing, waveless, or belongs to another session.
+ *
+ * The manifest is a SHARED working-copy artefact (`.claude/wave-scope.json`),
+ * so a peer session's manifest is readable here and would stamp this session's
+ * events with a foreign wave number. Ownership is classified with
+ * `classifyManifestSession()` against the PROCESS-LOCAL id set plus whatever
+ * `attributionForRecord()` actually filled — the same tiering as the session
+ * keys, for the same reason (a shared file cannot prove which process emits):
+ *
+ *   - manifest classified `own` → fill (as a NUMBER, see below).
+ *   - anything else → omit. That includes an UNBOUND manifest (no `session_id` /
+ *     `semantic_session_id`): since #1123 BOTH writers stamp the binding, so a
+ *     manifest without one is a peer's or a stale artefact, never a legacy own
+ *     one. It also includes `unknown` because we cannot resolve our own
+ *     identity — stricter than `classifyManifestSession()`'s own `unknown`
+ *     doctrine on purpose: a wave number is data on the record, not a feature
+ *     gate, so "cannot tell" must not become "stamp it anyway".
+ *
+ * @param {string} root
+ * @param {{session_id?: string, semantic_session_id?: string}} attribution
+ * @returns {{wave?: number}}
+ */
+function waveForRecord(root, attribution) {
+  let scope;
+  try {
+    const file = waveScopePath(root);
+    if (!file) return {};
+    scope = JSON.parse(readFileSync(file, 'utf8'));
+  } catch {
+    return {};
+  }
+  // The ledger's `wave` is numeric in 1876 of 1876 live records; a manifest
+  // carrying `"wave": "3"` used to write the STRING through verbatim and split
+  // every downstream group-by. Coerce, and omit anything that is not an integer
+  // (`"abc"`, `2.5`) rather than writing a NaN or a fraction.
+  const waveNum = Number(scope?.wave);
+  if (scope?.wave === null || scope?.wave === '' || !Number.isInteger(waveNum)) return {};
+
+  const ownIds = new Set([
+    ...readProcessLocalSessionIds(),
+    ...[attribution.session_id, attribution.semantic_session_id].filter(Boolean),
+  ]);
+  const { verdict } = classifyManifestSession(scope, ownIds);
+  return verdict === 'own' ? { wave: waveNum } : {};
+}
+
+/**
+ * Append a JSONL event record and optionally POST to the Clank Event Bus webhook.
+ *
+ * Writes `{timestamp, event, schema_version, ...payload}` as a single JSON line
+ * to `.orchestrator/metrics/events.jsonl` (creates parent directory if needed).
+ * If both `CLANK_EVENT_SECRET` and `CLANK_EVENT_URL` are set, fires a
+ * fire-and-forget POST (not awaited, #1612 R1-03) to `CLANK_EVENT_URL` with a
+ * 3-second timeout over node:https (`scripts/lib/http-request.mjs`). Network
+ * errors are swallowed. Write errors propagate to the caller. No personal-domain
+ * default URL exists — both vars must be set explicitly (#228).
+ *
+ * Validation + versioning (#1177). Every record is stamped via
+ * `stampEventSchemaVersion()` (the schema module's own stamper — it fills the
+ * field only when absent, so a caller keeps authority over it) and run through
+ * `validateEventRecord()` BEFORE any side effect. An invalid record throws
+ * `EventValidationError` and produces NO ledger line and NO webhook POST —
+ * a malformed event is dropped at the producer rather than written and
+ * discovered by a downstream reader. The stamp is applied AFTER the payload
+ * spread, and still yields to it: the helper fills the field only when it is
+ * absent or null, so a caller supplying its own `schema_version` wins.
+ *
+ * Correlation envelope (#1177 FA3). When the payload carries neither session
+ * key, `session_id`/`semantic_session_id` are filled from
+ * {@link attributionForRecord}; when it carries no `wave`, `wave` is filled
+ * from the OWN wave-scope manifest. Both are additive and omitted whenever
+ * ownership is unproven — see the module header for the three rules.
+ *
+ * The webhook body deliberately stays `{ event_type, source, payload }` with the
+ * RAW payload — the wire format is a published contract with an external
+ * consumer; `schema_version` describes the JSONL record, not the webhook
+ * envelope, and is not added to it. One exception: a caller may pass
+ * `opts.webhookPayload`, which replaces `payload` in the webhook body only.
+ *
+ * @param {string} type — event type (e.g. "orchestrator.session.started")
+ * @param {object} [payload={}] — additional fields shallow-merged into the record
+ * @param {object} [opts={}] — emission options.
+ * @param {string} [opts.filePath] — override the destination JSONL path. Defaults
+ *   to `eventsFilePath()` (the project's `.orchestrator/metrics/events.jsonl`).
+ *   Used by `scripts/emit-event.mjs --file` so shell callers (e.g.
+ *   compute-grounding-injection.sh) can target a pre-resolved EVENTS_JSONL path
+ *   without depending on platform.mjs CWD/env resolution (#611).
+ * @param {string} [opts.repoRoot] — pin the destination to `<repoRoot>/.orchestrator/
+ *   metrics/events.jsonl` instead of the module-level `SO_PROJECT_DIR` default
+ *   (#941). Ignored when `opts.filePath` is given (explicit path wins). This is
+ *   the clean interface replacing the hand-built `join(repoRoot, …)` recipes that
+ *   used to open-code this destination at each call-site. A relative or empty
+ *   `repoRoot` is refused with one stderr WARN and nothing is written (no line,
+ *   no directory, no webhook): joining it would land relative to the working
+ *   directory — the incident class where an unset env var produced
+ *   `undefined/…/.orchestrator/metrics/events.jsonl` under the cwd.
+ * @param {object} [opts.webhookPayload] — payload for the webhook body INSTEAD of
+ *   `payload`; the JSONL record keeps the full `payload`. For fields that must
+ *   stay on this host (e.g. vault-relative paths, #2169) but whose count may
+ *   travel. Absent = the webhook carries the raw `payload`, as before.
+ * @returns {Promise<void>}
+ */
+export async function emitEvent(type, payload = {}, opts = {}) {
+  // Correlation envelope (#1177 FA3) — computed against the SAME root the line
+  // is pinned to. Both fills are gated on the payload NOT already carrying the
+  // key, and both spread BEFORE `payload`, so a caller always wins twice over.
+  // A payload that supplies EITHER session key suppresses BOTH: mixing a
+  // caller's `session_id` with a lock-derived `semantic_session_id` would
+  // silently produce a record whose two id fields name different sessions.
+  const attributionRoot = opts.repoRoot ?? getProjectDir();
+  const correlation = {};
+  if (payload.session_id === undefined && payload.semantic_session_id === undefined) {
+    Object.assign(correlation, attributionForRecord(attributionRoot));
+  }
+  if (payload.wave === undefined) {
+    Object.assign(correlation, waveForRecord(attributionRoot, correlation));
+  }
+
+  // Build the JSONL record: timestamp + event first, payload spreads last, and
+  // `stampEventSchemaVersion()` — the schema module's own stamper, which only
+  // fills an ABSENT/null field — adds the version. Routing through the helper
+  // instead of inlining `schema_version: CURRENT_SCHEMA_VERSION` keeps the
+  // stamp rule in ONE place: a caller-supplied version still wins, because the
+  // helper never overwrites a value the spread already put there.
+  const record = stampEventSchemaVersion({
+    timestamp: new Date().toISOString(),
+    event: type,
+    ...correlation,
+    ...payload,
+  });
+
+  // Validate BEFORE any side effect — no line, no directory, no webhook (#1177).
+  const verdict = validateEventRecord(record);
+  if (!verdict.valid) {
+    throw new EventValidationError(
+      `invalid event record for "${String(type)}": ${verdict.errors.join('; ')}`,
+      verdict.errors,
+      typeof type === 'string' ? type : undefined,
+    );
+  }
+
+  const line = JSON.stringify(record) + '\n';
+
+  // Ensure the destination directory exists before appending. Resolution order:
+  //   1. explicit opts.filePath (a pre-resolved path — #611)
+  //   2. opts.repoRoot → <repoRoot>/.orchestrator/metrics/events.jsonl (#941),
+  //      or refused when relative/empty (WARN, no write — see below)
+  //   3. the SO_PROJECT_DIR default (unchanged for 2-arg callers)
+  // eventsFilePath(undefined) falls through to its SO_PROJECT_DIR default, so a
+  // caller passing neither behaves EXACTLY as before (additive) — except under
+  // the test-only EVENTS_LEDGER_SANDBOX_ENV seam, which only 3. honours.
+  // An explicit filePath is never second-guessed. A defined repoRoot that is not
+  // absolute would be joined relative to the cwd, so it is refused: WARN and
+  // return (hooks must never throw). The value itself is not printed — it may
+  // carry a host-local path.
+  if (
+    opts.filePath === undefined &&
+    opts.repoRoot !== undefined &&
+    (typeof opts.repoRoot !== 'string' || !path.isAbsolute(opts.repoRoot))
+  ) {
+    process.stderr.write(
+      `[events] ${String(type)} not emitted: opts.repoRoot is not an absolute path; refusing to write relative to the working directory.\n`,
+    );
+    return;
+  }
+  const filePath = opts.filePath ?? eventsFilePath(opts.repoRoot);
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
+  await fs.appendFile(filePath, line, 'utf8');
+
+  // R1-03: do not await: multiple events per hook × 3s exceed the 5s hook budget.
+  // No personal-domain default: CLANK_EVENT_URL must be set explicitly (#228).
+  if (process.env.CLANK_EVENT_SECRET && process.env.CLANK_EVENT_URL) {
+    const url = process.env.CLANK_EVENT_URL;
+    const body = JSON.stringify({
+      event_type: type,
+      source: 'session-orchestrator',
+      payload: 'webhookPayload' in opts ? opts.webhookPayload : payload,
+    });
+
+    void httpRequest(`${url}/api/webhooks/events`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${process.env.CLANK_EVENT_SECRET}`,
+      },
+      body,
+      timeoutMs: 3000,
+      maxBytes: 64 * 1024,
+    }).catch(() => {});
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Rotation-aware reading (#1401)
+// ---------------------------------------------------------------------------
+
+/**
+ * Read one JSONL source into a descriptor — never throws.
+ *
+ * @param {string} filePath
+ * @param {'active'|'archive'|'legacy-ring'} kind
+ * @returns {{path: string, kind: string, readable: boolean, records: object[],
+ *            malformed_lines: number, first_ts: string|null, last_ts: string|null,
+ *            error?: string}}
+ */
+function readEventSource(filePath, kind) {
+  let text;
+  try {
+    text = readFileSync(filePath, 'utf8');
+  } catch (err) {
+    return {
+      path: filePath,
+      kind,
+      readable: false,
+      records: [],
+      malformed_lines: 0,
+      first_ts: null,
+      last_ts: null,
+      error: err?.message ?? String(err),
+    };
+  }
+  const { records, malformedLines } = parseEventLines(text);
+  const { firstTs, lastTs } = summarizeEventRecords(records);
+  return {
+    path: filePath,
+    kind,
+    readable: true,
+    records,
+    malformed_lines: malformedLines,
+    first_ts: firstTs,
+    last_ts: lastTs,
+  };
+}
+
+/**
+ * Every archive belonging to `logPath`, in BOTH schemes.
+ *
+ * Reading the legacy `.1`..`.N` ring is not politeness towards old code — it is
+ * a live requirement: measured 2026-09-19, two fleet repos hold a ~10 MB
+ * `events.jsonl.1` written before #1401 switched the writer to `_archive/`. A
+ * reader that saw only the new scheme would drop that history and call the
+ * result complete.
+ *
+ * `unindexed` (#1423) names every OTHER `.jsonl` in that directory — a file the
+ * reader will NOT fold into the timeline because rotation did not write it.
+ * Reporting it is not the same as counting it as missing: this repo's own
+ * `_archive/` holds a hand-placed `events-worktree-vault-session-analysis-…`
+ * (80 records), and calling that a GAP would pin the ledger at
+ * `complete: false` forever, which is the instrument HR-101 calls broken. It is
+ * a NOTICE — visible, never a verdict.
+ *
+ * @param {string} logPath — absolute path of the ACTIVE log.
+ * @returns {{archives: string[], legacy: string[], ringHoles: number[], unindexed: string[]}}
+ */
+function discoverArchives(logPath) {
+  const dir = path.dirname(logPath);
+
+  const archives = [];
+  const unindexed = [];
+  const archiveDir = path.join(dir, ARCHIVE_DIR_NAME);
+  try {
+    for (const name of readdirSync(archiveDir).sort()) {
+      const abs = path.join(archiveDir, name);
+      if (ARCHIVE_NAME_RE.test(name)) archives.push(abs);
+      else if (name.endsWith('.jsonl')) unindexed.push(abs);
+    }
+  } catch {
+    /* no archive directory yet — not a gap, just nothing rotated here */
+  }
+
+  // The ring was contiguous BY CONSTRUCTION (each rotation shifted every slot
+  // up by one), so a hole between two present slots can only mean a backup was
+  // removed out of band. Slots above the highest present one are simply
+  // "not rotated that many times" and are not holes.
+  const present = [];
+  for (let i = 1; i <= LEGACY_RING_MAX; i += 1) {
+    if (existsSync(`${logPath}.${i}`)) present.push(i);
+  }
+  const highest = present.length > 0 ? present[present.length - 1] : 0;
+  const ringHoles = [];
+  for (let i = 1; i < highest; i += 1) {
+    if (!present.includes(i)) ringHoles.push(i);
+  }
+  return { archives, legacy: present.map((i) => `${logPath}.${i}`), ringHoles, unindexed };
+}
+
+/**
+ * The one tombstone-to-archive match (#1505 5c) — shared by
+ * {@link readEventsWithRotations} rule 1, {@link scanEventsBackwards}, and
+ * `planWithGaps` in `scripts/backfill-abandoned-sessions.mjs`, which used to
+ * carry three hand-kept copies of it.
+ *
+ * #1411 — the tombstone resolves against THIS ledger's own `_archive/`, by
+ * BASENAME, never against the absolute value it stores. The writer keeps
+ * `archived_as` absolute (`events-rotation.mjs` joins the repo root) and that
+ * value stays in the record as PROVENANCE. It is not a lookup key: a moved
+ * checkout, a clone, or a sibling git worktree — routine here — makes every
+ * tombstone name a path that does not exist in THIS tree, so an exact
+ * comparison reported a phantom `missing-archive` for an archive sitting right
+ * beside the active file. Basename, not `realpath`: realpath cannot resolve a
+ * path that no longer exists, which IS the failure mode.
+ *
+ * ORDER (why the absolute value has no second chance): the sibling answer is
+ * consulted first, and an absolute hit would only be trustworthy while it
+ * pointed INSIDE this ledger's own archive dir — but any such path resolves to
+ * exactly the sibling path already tested, so once the sibling misses, an
+ * absolute hit can ONLY be a still-present OLD checkout. Honouring it would
+ * validate THIS ledger against a FOREIGN repo's archive: a silent false
+ * negative, worse than the phantom gap.
+ *
+ * #1423 — THREE outcomes, not two: read (`null`), present-but-unread
+ * (`unindexed-archive`), gone (`missing-archive`). The middle one used to be
+ * folded into the first by `existsSync`, so a tombstone whose archive had been
+ * RENAMED out of `ARCHIVE_NAME_RE` reported `complete: true` while its records
+ * were absent.
+ *
+ * @param {unknown} record  a parsed ledger line
+ * @param {string} ownArchiveDir  this ledger's `_archive/`, built exactly as
+ *   `discoverArchives` builds it so a read archive matches `readSet` by string
+ * @param {Set<string>} readSet  the paths this read actually took as sources
+ * @returns {{kind: 'unindexed-archive'|'missing-archive', path: string,
+ *            archived_as: string, first_ts: string|null, last_ts: string|null}|null}
+ *   `null` when `record` is not a rotation tombstone, names no archive, or its
+ *   archive was read.
+ */
+export function tombstoneGap(record, ownArchiveDir, readSet) {
+  if (record?.event !== ROTATION_EVENT) return null;
+  const target = record.archived_as;
+  if (typeof target !== 'string' || target.length === 0) return null;
+  const sibling = path.join(ownArchiveDir, path.basename(target));
+  if (readSet.has(sibling)) return null;
+  return {
+    kind: existsSync(sibling) ? 'unindexed-archive' : 'missing-archive',
+    path: sibling,
+    archived_as: target,
+    first_ts: record.first_ts ?? null,
+    last_ts: record.last_ts ?? null,
+  };
+}
+
+/**
+ * Read the events ledger ACROSS rotation boundaries — active file plus every
+ * archive still on disk — in time order, reporting what is missing instead of
+ * silently returning less.
+ *
+ * ## Why this exists (#1401)
+ *
+ * Before it, nothing in `scripts/` or `hooks/` read a rotated backup at all
+ * (census 2026-09-19 @ `8f15f77b`: `rg -n 'jsonl\.1|jsonl\.[0-9]' scripts/ hooks/`
+ * excluding tests → zero code hits). Every window analysis therefore lost its
+ * whole history at each rotation, silently — which is what reduced the #1037
+ * guard-attribution join to 2 of 38 sessions.
+ *
+ * ## The three honesty rules
+ *
+ * 1. **A missing archive is a FINDING, not an empty result.** When a record in
+ *    a later file names `archived_as: X` and X is not on disk, that appears in
+ *    `gaps` with the range X covered, and `complete` is `false`. This is the
+ *    exact shape of the 2026-09-19 loss, and it is detectable only because the
+ *    rotation writes that pointer (see `events-rotation.mjs`) — an archive
+ *    deleted before #1401 left no trace and is undetectable by construction.
+ *    EXISTENCE IS NOT READING (#1423): the sibling counts only when it was an
+ *    actual SOURCE of this read. A file that exists beside the active log but
+ *    whose name misses `ARCHIVE_NAME_RE` is never read, so treating
+ *    `existsSync` as proof silenced the tombstone while its records stayed
+ *    out — that case is its own gap kind, `unindexed-archive`.
+ * 2. **Unreadable lines are COUNTED** (`malformed_lines`, per source and total).
+ *    A silently skipping JSONL parser turns a partial result into a clean
+ *    verdict.
+ * 3. **Order is by measured time, not by filename.** Sources are sorted on
+ *    their earliest parseable timestamp; records within a source keep file
+ *    (append) order. A source with no parseable timestamp sorts last rather
+ *    than being dropped.
+ * 4. **`complete` has THREE states, because the answer does (#1423).** `true` =
+ *    measured and whole, `false` = measured with a named gap, `null` = NOT
+ *    MEASURED: no source existed at all (no active file, no archive, no legacy
+ *    ring), so `events: []` is the absence of a ledger and not the absence of
+ *    events. `complete: true` on a repo with no ledger is the house failure
+ *    class "a missing measurement looks like zero".
+ *
+ * Separate from `gaps`, `notices` carries what was SEEN but deliberately not
+ * read — today only `unindexed-archive-file` (see {@link discoverArchives}).
+ * A notice never moves `complete`.
+ *
+ * CEILING (BV-004): every source is read fully into memory — at the default
+ * `max-size-mb: 10` / `max-backups: 5` that is up to ~60 MB transient. There is
+ * no windowing parameter because no caller has asked for one; revisit when a
+ * consumer needs a `since` filter or `max-size-mb` is raised past ~100.
+ *
+ * @param {string} [repoRoot] — project root; defaults exactly as
+ *   {@link eventsFilePath} does (and only the default form honours the test
+ *   sandbox seam).
+ * @param {object} [opts={}]
+ * @param {string} [opts.filePath] — override the active-log path outright.
+ * @returns {{events: object[], sources: object[], malformed_lines: number,
+ *            gaps: object[], notices: object[], complete: boolean|null,
+ *            active_path: string}}
+ */
+export function readEventsWithRotations(repoRoot, opts = {}) {
+  const activePath = opts.filePath ?? eventsFilePath(repoRoot);
+  const { archives, legacy, ringHoles, unindexed } = discoverArchives(activePath);
+
+  const sources = [
+    ...archives.map((p) => readEventSource(p, 'archive')),
+    ...legacy.map((p) => readEventSource(p, 'legacy-ring')),
+  ];
+  if (existsSync(activePath)) sources.push(readEventSource(activePath, 'active'));
+
+  // Time order across sources; undatable sources last, stable by path.
+  sources.sort((a, b) => {
+    const am = a.first_ts ? Date.parse(a.first_ts) : Infinity;
+    const bm = b.first_ts ? Date.parse(b.first_ts) : Infinity;
+    if (am !== bm) return am - bm;
+    return a.path < b.path ? -1 : a.path > b.path ? 1 : 0;
+  });
+
+  const gaps = [];
+  const onDisk = new Set(sources.map((s) => s.path));
+  // Same construction `discoverArchives` uses, so its unresolved entries in
+  // `onDisk` still match by string.
+  const ownArchiveDir = path.join(path.dirname(activePath), ARCHIVE_DIR_NAME);
+
+  // Rule 1 — every rotation tombstone must still point at a file (resolution
+  // and the three outcomes: {@link tombstoneGap}).
+  for (const source of sources) {
+    for (const record of source.records) {
+      const gap = tombstoneGap(record, ownArchiveDir, onDisk);
+      if (gap === null) continue;
+      gaps.push({
+        ...gap,
+        lines: record.lines ?? null,
+        size_before: record.size_before ?? null,
+        reported_by: source.path,
+        rotated_at: record.timestamp ?? null,
+      });
+    }
+  }
+
+  for (const slot of ringHoles) {
+    gaps.push({
+      kind: 'ring-hole',
+      archived_as: `${activePath}.${slot}`,
+      first_ts: null,
+      last_ts: null,
+      reported_by: activePath,
+    });
+  }
+
+  for (const source of sources) {
+    if (source.readable) continue;
+    gaps.push({
+      kind: 'unreadable-source',
+      archived_as: source.path,
+      first_ts: null,
+      last_ts: null,
+      reported_by: source.path,
+      error: source.error ?? null,
+    });
+  }
+
+  const events = [];
+  let malformed = 0;
+  for (const source of sources) {
+    events.push(...source.records);
+    malformed += source.malformed_lines;
+  }
+
+  return {
+    events,
+    sources: sources.map(({ records, ...rest }) => ({ ...rest, records: records.length })),
+    malformed_lines: malformed,
+    gaps,
+    notices: unindexed.map((p) => ({ kind: 'unindexed-archive-file', path: p })),
+    // Honesty rule 4: no source at all ⇒ NOT MEASURED (`null`), never a clean
+    // `true` over an empty read.
+    complete: sources.length === 0 ? null : gaps.length === 0,
+    active_path: activePath,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Streaming reads across rotations (#1414)
+// ---------------------------------------------------------------------------
+
+/**
+ * Default chunk for the streaming readers — 256 KiB, ~800 records in this
+ * repo's ledger.
+ *
+ * NAMED CEILING (BV-004): a line LONGER than one chunk is carried, never
+ * dropped, so the constant bounds memory and not correctness. REVISIT when one
+ * repo's `events.jsonl` passes 50 MB — at that size the backwards "never
+ * happened" walk needs an index rather than a scan.
+ */
+export const SCAN_CHUNK_BYTES = 256 * 1024;
+
+/**
+ * Every source of this ledger that EXISTS, NEWEST FIRST — without reading one
+ * byte of their contents (#1414).
+ *
+ * Order: the active file, then `_archive/` archives by name DESCENDING (the
+ * name encodes `first_ts`/`last_ts`, so lexical order is chronological), then
+ * the legacy ring ASCENDING (`.1` is the most recent backup, `.N` the oldest).
+ * Reverse the result for an oldest-first pass.
+ *
+ * Hand-placed files in `_archive/` that rotation did not write are NOT sources
+ * here, exactly as in {@link readEventsWithRotations} — one definition of "what
+ * belongs to this ledger", not two.
+ *
+ * @param {object} [opts={}]
+ * @param {string} [opts.filePath] — the ACTIVE log path; defaults as {@link eventsFilePath}.
+ * @param {string} [opts.repoRoot] — used only when `filePath` is absent.
+ * @returns {Array<{path: string, kind: 'active'|'archive'|'legacy-ring'}>}
+ */
+export function listEventSourcesNewestFirst(opts = {}) {
+  const activePath = opts.filePath ?? eventsFilePath(opts.repoRoot);
+  const { archives, legacy } = discoverArchives(activePath);
+  const out = [];
+  if (existsSync(activePath)) out.push({ path: activePath, kind: 'active' });
+  for (const p of [...archives].reverse()) out.push({ path: p, kind: 'archive' });
+  for (const p of legacy) out.push({ path: p, kind: 'legacy-ring' });
+  return out;
+}
+
+/**
+ * Walk the ledger BACKWARDS across rotation boundaries, newest record first,
+ * stopping at the first record the caller accepts (#1414).
+ *
+ * ## Why this exists
+ *
+ * `readEventsWithRotations` loads every source fully — up to ~60 MB transient
+ * at the default `max-size-mb: 10` × `max-backups: 5`. That is the right shape
+ * for a cold analysis and the wrong one for a session-start probe, so the two
+ * HOT-PATH readers (`maintenance-due-banner.mjs`, `backfill-abandoned-sessions.mjs`)
+ * stayed single-file and answered "never happened" from the active file alone.
+ * This reader gives them the whole history at a bounded memory cost.
+ *
+ * A record SPLIT across a chunk boundary is CARRIED, never parsed twice or
+ * dropped: the bytes before a chunk's first newline are the tail of a line
+ * whose head sits in the chunk not read yet. Splitting on the 0x0A byte is safe
+ * on UTF-8 (no continuation byte equals a newline), and the carry is joined as
+ * a BUFFER, so a multibyte character never splits either.
+ *
+ * @param {object} opts
+ * @param {string} [opts.filePath] — the ACTIVE log path; defaults as {@link eventsFilePath}.
+ * @param {string} [opts.repoRoot] — used only when `filePath` is absent.
+ * @param {number} [opts.chunkBytes={@link SCAN_CHUNK_BYTES}]
+ * @param {(record: object, source: {path: string, kind: string}) => boolean} opts.onRecord —
+ *   called with each PARSED record, newest first; returning `true` stops the walk.
+ * @param {string} [opts.filter] — cheap substring pre-filter applied to the RAW
+ *   line before `JSON.parse`. The measured reason it exists: the caller that
+ *   this replaced pre-filtered on the event name, and parsing every line of a
+ *   7.9 MB ledger to answer one question is the cost that made it do so.
+ *   NOTE: with a filter set, `malformed_lines` counts only unreadable lines
+ *   AMONG THE MATCHING ones — the rest are never parsed.
+ * @param {number} [opts.budgetMs] — wall-clock budget. When it runs out before
+ *   a stop, the walk ends with `truncated: true` — which is NOT "not found":
+ *   the caller must report undeterminable, never a clean negative.
+ * @returns {{stopped: boolean, truncated: boolean, malformed_lines: number,
+ *            sources: string[], unreadable: string[], gaps: object[]}} `gaps`
+ *   (#1489): every rotation tombstone the walk passed, on any line and
+ *   regardless of `filter`, whose archive is not one of this walk's sources — pruned
+ *   (`missing-archive`) or renamed out of `ARCHIVE_NAME_RE`
+ *   (`unindexed-archive`), the same two kinds and fields
+ *   {@link readEventsWithRotations} reports. Non-empty ⇒ the history the walk
+ *   read is CUT, so a walk that found nothing has not proven "never happened".
+ */
+export function scanEventsBackwards(opts = {}) {
+  const { onRecord, filter, budgetMs } = opts;
+  if (typeof onRecord !== 'function') {
+    throw new TypeError('scanEventsBackwards: opts.onRecord must be a function');
+  }
+  const chunkBytes =
+    Number.isInteger(opts.chunkBytes) && opts.chunkBytes > 0 ? opts.chunkBytes : SCAN_CHUNK_BYTES;
+  const deadline = Number.isFinite(budgetMs) ? Date.now() + budgetMs : null;
+  const outOfTime = () => deadline !== null && Date.now() > deadline;
+
+  const scanned = [];
+  const unreadable = [];
+  const gaps = [];
+  let malformed = 0;
+  let stopped = false;
+  let truncated = false;
+
+  const sources = listEventSourcesNewestFirst(opts);
+  const listed = new Set(sources.map((s) => s.path));
+  // Same construction as `discoverArchives`, so a listed archive matches by string.
+  const ownArchiveDir = path.join(
+    path.dirname(opts.filePath ?? eventsFilePath(opts.repoRoot)),
+    ARCHIVE_DIR_NAME,
+  );
+
+  /**
+   * Every rotation tombstone the walk passes is checked, on whatever line it
+   * sits — the semantics of {@link readEventsWithRotations}, which checks every
+   * rotation record of every source. Not only first lines (#1489 review
+   * LOW-2): `maybeRotate` renames, prunes, THEN appends the tombstone, from an
+   * async SessionStart hook, so a concurrent append can land first and push it
+   * to line 2. Called BEFORE the caller's `filter`, which names another event
+   * and would otherwise hide the cut. Matched by {@link tombstoneGap}.
+   */
+  const noteCut = (line, source) => {
+    if (!line.includes(ROTATION_EVENT)) return;
+    let record;
+    try {
+      record = JSON.parse(line);
+    } catch {
+      return; // counted by `consume` like every other malformed line
+    }
+    const gap = tombstoneGap(record, ownArchiveDir, listed);
+    if (gap !== null) gaps.push({ ...gap, reported_by: source.path });
+  };
+
+  /** @returns {boolean} true ⇒ the caller accepted a record; stop everything. */
+  const consume = (block, source) => {
+    const lines = block.toString('utf8').split('\n');
+    for (let i = lines.length - 1; i >= 0; i -= 1) {
+      const line = lines[i];
+      if (!line) continue;
+      noteCut(line, source);
+      if (typeof filter === 'string' && !line.includes(filter)) continue;
+      let record;
+      try {
+        record = JSON.parse(line);
+      } catch {
+        malformed += 1; // counted, never silently skipped (honesty rule 2)
+        continue;
+      }
+      if (onRecord(record, source) === true) return true;
+    }
+    return false;
+  };
+
+  for (const source of sources) {
+    if (stopped || truncated) break;
+    if (outOfTime()) {
+      truncated = true;
+      break;
+    }
+    scanned.push(source.path);
+    let fd;
+    try {
+      fd = openSync(source.path, 'r');
+      const stats = fstatSync(fd);
+      // Windows opens a directory "as a file" with size 0; without this it
+      // would read as an EMPTY source instead of an unreadable one (POSIX
+      // throws EISDIR on the first read).
+      if (!stats.isFile()) throw new Error(`not a regular file: ${source.path}`);
+      let pos = stats.size;
+      /** Partial line at the FRONT of everything read from THIS source so far. */
+      let carry = Buffer.alloc(0);
+      while (pos > 0) {
+        if (outOfTime()) {
+          truncated = true;
+          break;
+        }
+        const length = Math.min(chunkBytes, pos);
+        pos -= length;
+        const buf = Buffer.alloc(length);
+        readSync(fd, buf, 0, length, pos);
+        const block = carry.length > 0 ? Buffer.concat([buf, carry]) : buf;
+        const firstNewline = block.indexOf(0x0a);
+        if (firstNewline === -1) {
+          carry = block; // a line longer than one chunk — no complete line yet
+          continue;
+        }
+        if (consume(block.subarray(firstNewline + 1), source)) {
+          stopped = true;
+          break;
+        }
+        carry = block.subarray(0, firstNewline);
+      }
+      // pos === 0: the carry is this source's FIRST line, complete by construction.
+      if (!stopped && !truncated && consume(carry, source)) stopped = true;
+    } catch (err) {
+      // An unreadable source is a FINDING, not an empty one: it is exactly the
+      // case where "no record found" must not be reported as "never happened".
+      unreadable.push(source.path);
+      void err;
+    } finally {
+      if (fd !== undefined) {
+        try {
+          closeSync(fd);
+        } catch {
+          /* best-effort */
+        }
+      }
+    }
+  }
+
+  return { stopped, truncated, malformed_lines: malformed, sources: scanned, unreadable, gaps };
+}

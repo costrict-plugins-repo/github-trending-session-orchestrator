@@ -1,0 +1,183 @@
+import { matchBlockHeader } from './block-header.mjs';
+import { preprocessBlockLines } from './block-preprocess.mjs';
+
+/**
+ * drift-check.mjs — Parser for the top-level `drift-check:` YAML block.
+ *
+ * Ported from config-yaml-parser.sh (v2).
+ *
+ * SCOPE NOTE — this file parses FLAGS ONLY; it implements no check. The
+ * `check-command-count` flag below toggles the `command-count` surface in
+ * `skills/claude-md-drift-check/checker.mjs`, which is where the counting lives.
+ *
+ * `command-count` STAYS on `ls commands/*.md | wc -l` on purpose. The checker is
+ * GENERIC over any consumer repo, where a slash command still IS a
+ * `commands/*.md` file. The 2026-09-16 command→skill fold (#1370) is a fact
+ * about THIS plugin — 24 command files folded into their same-named
+ * `skills/<name>/SKILL.md` behind `user-invocable: true` (absent counts as true, #1515) — so
+ * teaching the shared checker that union would mis-measure every repo that never
+ * folded. `scripts/site-numbers.mjs` `countCommands()` carries the union for this
+ * plugin's own tile, and names the divergence in its docblock.
+ *
+ * CONSEQUENCE for THIS repo, left deliberately visible rather than papered over:
+ * a prose claim of the shape "N commands" / "N slash commands" in a
+ * drift-check-scanned doc is compared against the `commands/` listing (2 after
+ * the fold), so such a claim must either be dropped or reworded off the
+ * `\b(\d+)\s+(?:\/)?commands?\b` pattern the checker matches.
+ */
+
+/**
+ * Parse the top-level `drift-check:` YAML block from markdown content.
+ * Mirrors the shell parse_drift_check() in config-yaml-parser.sh.
+ * Defaults: enabled=false, mode="warn",
+ * include-paths=["CLAUDE.md","AGENTS.md","_meta/**\/*.md"] (CLAUDE.md and
+ * AGENTS.md are transparent aliases per
+ * skills/_shared/instruction-file-resolution.md),
+ * all ten per-check flags default to true.
+ * @param {string} content — full file contents
+ * @returns {{enabled: boolean, mode: string, "include-paths": string[], "check-path-resolver": boolean, "check-project-count-sync": boolean, "check-issue-reference-freshness": boolean, "check-session-file-existence": boolean, "check-command-count": boolean, "check-session-config-parity": boolean, "check-vault-dir-parity": boolean, "check-generated-rule-staleness": boolean, "check-rule-scoping": boolean, "check-docs-parity": boolean}}
+ */
+export function _parseDriftCheck(content) {
+  // CLAUDE.md and AGENTS.md are transparent aliases per
+  // skills/_shared/instruction-file-resolution.md. Both are included so
+  // drift-check covers the project-instruction file regardless of which
+  // platform created it.
+  const DEFAULT_INCLUDE_PATHS = ['CLAUDE.md', 'AGENTS.md', '_meta/**/*.md'];
+  const defaults = {
+    enabled: false,
+    mode: 'warn',
+    'include-paths': DEFAULT_INCLUDE_PATHS,
+    'check-path-resolver': true,
+    'check-project-count-sync': true,
+    'check-issue-reference-freshness': true,
+    'check-session-file-existence': true,
+    'check-command-count': true,
+    'check-session-config-parity': true,
+    'check-vault-dir-parity': true,
+    'check-generated-rule-staleness': true,
+    'check-rule-scoping': true,
+    'check-docs-parity': true,
+  };
+
+  const lines = preprocessBlockLines(content);
+  let inBlock = false;
+  const blockLines = [];
+
+  for (const rawLine of lines) {
+    const line = rawLine.replace(/\r$/, '');
+    if (!inBlock) {
+      if (matchBlockHeader(line, 'drift-check')) inBlock = true;
+      continue;
+    }
+    if (line.length > 0 && !/^\s/.test(line)) break;
+    blockLines.push(line);
+  }
+
+  if (blockLines.length === 0) return defaults;
+
+  let dcEnabled = false;
+  let dcMode = 'warn';
+  let dcChkPath = true;
+  let dcChkCount = true;
+  let dcChkIssue = true;
+  let dcChkSess = true;
+  let dcChkCommandCount = true;
+  let dcChkSessionConfigParity = true;
+  let dcChkVaultDirParity = true;
+  let dcChkGeneratedRuleStaleness = true;
+  let dcChkRuleScoping = true;
+  let dcChkDocsParity = true;
+  const dcInclude = [];
+  let inIncludeList = false;
+
+  for (const rawLine of blockLines) {
+    const clean = rawLine.replace(/\s*#.*$/, '').replace(/\s+$/, '');
+    if (!clean.trim()) continue;
+
+    if (/^\s+-\s+/.test(clean)) {
+      if (inIncludeList) {
+        let item = clean.replace(/^\s+-\s+/, '').trim();
+        if (item.startsWith('"') && item.endsWith('"')) item = item.slice(1, -1);
+        else if (item.startsWith("'") && item.endsWith("'")) item = item.slice(1, -1);
+        if (item) dcInclude.push(item);
+      }
+      continue;
+    }
+
+    inIncludeList = false;
+
+    const kvMatch = clean.match(/^\s+([a-zA-Z_-]+):\s*(.*)/);
+    if (!kvMatch) continue;
+
+    const k = kvMatch[1];
+    let v = kvMatch[2].trim();
+    if (v.startsWith('"') && v.endsWith('"') && v.length >= 2) v = v.slice(1, -1);
+    else if (v.startsWith("'") && v.endsWith("'") && v.length >= 2) v = v.slice(1, -1);
+
+    switch (k) {
+      case 'enabled':
+        dcEnabled = v.toLowerCase() === 'true';
+        break;
+      case 'mode':
+        // Enum: strict|warn|off. `hard` is a legacy alias for `strict`,
+        // normalized here. This is the drift-check half of the #217 enum
+        // migration (vault-sync moved hard→strict on 2026-04-21; drift-check
+        // was forgotten, so a committed `mode: strict` silently fell back to
+        // the `warn` default and the narrative-drift gate ran unenforced).
+        // Invalid values still fall back to the 'warn' default below.
+        if (['strict', 'hard', 'warn', 'off'].includes(v)) {
+          dcMode = v === 'hard' ? 'strict' : v;
+        }
+        break;
+      case 'include-paths':
+        if (!v) inIncludeList = true;
+        break;
+      case 'check-path-resolver':
+        dcChkPath = v.toLowerCase() !== 'false';
+        break;
+      case 'check-project-count-sync':
+        dcChkCount = v.toLowerCase() !== 'false';
+        break;
+      case 'check-issue-reference-freshness':
+        dcChkIssue = v.toLowerCase() !== 'false';
+        break;
+      case 'check-session-file-existence':
+        dcChkSess = v.toLowerCase() !== 'false';
+        break;
+      case 'check-command-count':
+        dcChkCommandCount = v.toLowerCase() !== 'false';
+        break;
+      case 'check-session-config-parity':
+        dcChkSessionConfigParity = v.toLowerCase() !== 'false';
+        break;
+      case 'check-vault-dir-parity':
+        dcChkVaultDirParity = v.toLowerCase() !== 'false';
+        break;
+      case 'check-generated-rule-staleness':
+        dcChkGeneratedRuleStaleness = v.toLowerCase() !== 'false';
+        break;
+      case 'check-rule-scoping':
+        dcChkRuleScoping = v.toLowerCase() !== 'false';
+        break;
+      case 'check-docs-parity':
+        dcChkDocsParity = v.toLowerCase() !== 'false';
+        break;
+    }
+  }
+
+  return {
+    enabled: dcEnabled,
+    mode: dcMode,
+    'include-paths': dcInclude.length > 0 ? dcInclude : DEFAULT_INCLUDE_PATHS,
+    'check-path-resolver': dcChkPath,
+    'check-project-count-sync': dcChkCount,
+    'check-issue-reference-freshness': dcChkIssue,
+    'check-session-file-existence': dcChkSess,
+    'check-command-count': dcChkCommandCount,
+    'check-session-config-parity': dcChkSessionConfigParity,
+    'check-vault-dir-parity': dcChkVaultDirParity,
+    'check-generated-rule-staleness': dcChkGeneratedRuleStaleness,
+    'check-rule-scoping': dcChkRuleScoping,
+    'check-docs-parity': dcChkDocsParity,
+  };
+}

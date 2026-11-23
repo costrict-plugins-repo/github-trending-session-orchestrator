@@ -1,0 +1,649 @@
+# Rule Authoring Reference
+
+> Canonical authoring spec for `.claude/rules/*.md` frontmatter and the rule-loader's conditional-loading contract (Epic #693 FA1, issue #694).
+> For the higher-level wave-boundary injection flow, see [`skills/_shared/config-reading.md`](../skills/_shared/config-reading.md) § "Glob-Scoped Rule Injection (#336)" — that doc links here for the deep field reference.
+
+## Purpose & Overview
+
+Files under `.claude/rules/*.md` are engineering rules injected into agent prompts. The loader — `loadApplicableRules()` in [`scripts/lib/rule-loader.mjs`](../scripts/lib/rule-loader.mjs) — reads every `*.md` file in the rules directory, parses its optional YAML frontmatter, and returns the subset applicable to a given wave. The wave-executor calls it at each wave boundary with the wave's `allowedPaths` (from `wave-scope.json`) as `scopePaths` — see `skills/wave-executor/wave-loop.md` § "Pre-Dispatch: Glob-Scoped Rule Injection". **The saving that scoping buys is smaller than it looks, and on Claude Code it can be negative:** measured 2026-07-30 on a real wave, the glob axis saved 4.0% of a 169,961-byte corpus, and because Claude Code already delivers every `.claude/rules/*.md` through native project-instruction loading, prepending the block on top costs +72% rather than saving anything. Scoping pays where the harness does NOT auto-load the directory (Codex CLI, Pi, Cursor). Full measurement: [`docs/instruction-delivery.md`](instruction-delivery.md).
+
+Two rule categories existed before FA1:
+
+- **Always-on** — no frontmatter (or no `globs:` key). Loaded for every wave regardless of scope. The cross-cutting baseline (e.g. `security.md`, `development.md`, `parallel-sessions.md`).
+- **Glob-scoped (#336)** — a `globs:` frontmatter array. Loaded only when at least one `scopePath` matches at least one glob (e.g. `frontend.md`, `testing.md`, `backend.md`).
+
+FA1 (issue #694) extends the frontmatter parser to capture additional **conditional activation axes** on each rule entry and to apply **deterministic gating** after a successful parse. The new axes are session-mode, host-class, and expiry, plus metadata keys (`learning-key`, `auto-generated`, `confidence`, `description`, `alwaysApply`) that future waves (FA2 reconciliation, FA4 validation) consume. The glob-scoping contract is unchanged; the new gates compose with it.
+
+A third category, added by issue #722 Epic A: **vendored rules** — files sourced from this repo's `rules/` library and copied into a consumer repo's `.claude/rules/` via `/bootstrap --sync-rules`. Vendored rules carry a mandatory provenance header (see [Provenance header + frontmatter coexistence](#provenance-header--frontmatter-coexistence-issue-722) below) and are validated before every write (see [Vendoring validation](#vendoring-validation-issue-722) below).
+
+## Frontmatter Field Reference
+
+All keys are optional. Unknown keys are **ignored without error** — adding a new key never breaks the loader. Frontmatter is the standard `---`-delimited YAML block at the top of the file.
+
+| Field | Type | Required | Meaning | Example |
+|-------|------|----------|---------|---------|
+| `globs` | `string[]` (block or flow style) | no | Glob patterns relative to repo root. Rule loads only when a `scopePath` matches at least one. Absent = always-on; `[]` = matches nothing (disabled). | `globs:` then `  - src/**/*.tsx` |
+| `paths` | `string[]` (block or flow style) | no — **required alongside `globs` with the identical list in a path-scoped VENDORED rule** (`rules/` library, #1449) | Alias for `globs` in `rule-loader.mjs` (#795; `globs` wins when both are present). It is the ONLY key Claude Code's native loader reads, and only from a frontmatter that opens on line 1 — a rule without it loads always-on there. A vendored rule therefore carries both keys: `paths` for Claude Code, `globs` for `rule-loader.mjs`, which reads it first. A repo's own consolidated `.claude/rules/` files are `paths`-only (see [Consolidated rules](#consolidated-rules-n-provenance-pairs-in-one-file-the-merge-contract) point 3). | `paths:` then `  - src/**/*.tsx` |
+| `description` | `string` | no | Human-readable summary of what the rule covers. Surfaced on the rule entry; used by FA2/FA4 tooling and authors. | `description: Tailwind + a11y conventions` |
+| `mode` | `string` (`housekeeping` \| `feature` \| `deep`) | no | Session-mode gate. Rule loads only in the named session mode. Absent = passes every mode. | `mode: deep` |
+| `host-class` | `string` | no | Host-class gate. Matched against `host_class` in `.orchestrator/host.json`. Rule loads only on matching hosts. Absent = passes every host. | `host-class: macos-arm64-m4pro` |
+| `alwaysApply` | `boolean` | no | Author intent flag (distinct from the loader's internal `alwaysOn` "no globs" computation). Used by FA4 validation, not by gating. | `alwaysApply: false` |
+| `expires-at` | `string` (ISO 8601 date) | no | Expiry gate, **inclusive**: the rule still loads on this date and is EXCLUDED (with a stderr WARN) from the following UTC midnight. A malformed value never excludes (fail-open). Read by `rule-loader.mjs` and the expiry sweep only — Claude Code's native loader ignores it, so an expired rule keeps loading natively until the sweep rewrites it (#1779). | `expires-at: 2026-12-31` |
+| `learning-key` | `string` | no | Links the rule to a `learnings.jsonl` entry (type/subject key). Required on auto-generated rules. | `learning-key: testing/shard-dont-widen` |
+| `auto-generated` | `boolean` | no | Marks a rule produced by the FA2 reconciliation engine (not hand-authored). Triggers the never-always-on invariant (see below). | `auto-generated: true` |
+| `confidence` | `number` (0..1) | no | Confidence of the source learning that generated the rule. Mirrors the `learnings.jsonl` confidence field. | `confidence: 0.85` |
+| `tier` | `string` (`always` \| `coordinator-only` \| `wave-only`) | no | Load-context tier (issue #692). Gates which contexts the rule loads in, via the `context` param to `loadApplicableRules`. Absent = no tier gating (backward-compatible). See [Tier gating](#tier-gating-issue-692) below. | `tier: coordinator-only` |
+| `review-date` | `string` (ISO 8601 date) | no | **check-rules.mjs-only, advisory (#880 FA5).** Periodic-review marker for handwritten rules. NOT read by `rule-loader.mjs` (not in `SCALAR_META_KEYS`) — zero effect on loading. Deliberately distinct from `expires-at`, which IS a live gate. See [Handwritten Rule Review Date](#handwritten-rule-review-date-880-fa5) below. | `review-date: 2026-10-23` |
+
+**Surfaced names.** The loader normalises kebab-case YAML keys to camelCase on the rule entry: `host-class` → `hostClass`, `expires-at` → `expiresAt`, `learning-key` → `learningKey`, `auto-generated` → `autoGenerated`. (`tier` is already a single lowercase token, so it is surfaced unchanged as `tier`.)
+
+## Gating Semantics
+
+After a rule's frontmatter parses successfully, the loader applies deterministic gates. A rule is included **only if it clears ALL active gates** (an AND across axes). Gating runs on both always-on and glob-matched candidates.
+
+**Per-axis rules:**
+
+- **Glob axis (#336)** — `globs:` absent → always-on (passes). `globs:` present and non-empty → must intersect `scopePaths`. `globs: []` → matches nothing, never loaded.
+- **Mode-gating** — when the `mode` runtime param is non-null and the rule declares a `mode` that differs, the rule is EXCLUDED. A **null `mode` param disables mode filtering entirely**. A rule **without a `mode` key always passes** the mode gate.
+- **Host-class-gating** — identical logic against the `hostClass` runtime param vs the rule's `host-class` value. Null param = no filtering; absent rule key = passes.
+- **Expiry** — a rule whose parseable `expires-at` has passed is EXCLUDED, with a mandatory stderr WARN. A bare `YYYY-MM-DD` is inclusive: the rule loads through that whole UTC day and drops out at the next UTC midnight (#1521); a full timestamp is taken as written. Loader, the maintenance probe's `generated-rules-expiring` signal and the rule-expiry sweep share one predicate (`ruleExpiryInstantMs` in `scripts/lib/rule-loader.mjs`), so none of them calls a rule expired while another still treats it as live. A rule without `expires-at`, or with a malformed `expires-at`, is **not** excluded. This gate exists in `rule-loader.mjs` only: Claude Code's native loader reads nothing but `paths` (code.claude.com/docs/en/memory, read 2026-10-24), so on Claude Code expiry takes effect only when the sweep below removes the content (#1779).
+- **Tier-gating (#692)** — gated on the `context` runtime param (not a host/mode param). `context: 'wave'` excludes `tier: coordinator-only` rules; `context: 'coordinator'` excludes `tier: wave-only` rules; `context: null` (the default) disables tier filtering entirely. A rule without a `tier` key passes the tier gate in every context. See [Tier gating](#tier-gating-issue-692) below.
+
+**The activation logic in one sentence:** *a null/absent gate parameter performs no filtering on that axis, and a rule that lacks a given gate key passes that gate unconditionally — so a rule with no frontmatter clears every gate and is always-on, byte-for-byte.*
+
+### Tier gating (issue #692)
+
+`tier:` is an **optional** frontmatter scalar that adds a *load-context* dimension on top of the existing axes. It answers the question the #668 instruction-budget audit raised (Follow-up 2, "Tier rules by load-context"): a rule is no longer only binary always-on / glob-scoped — it can also declare *which contexts* it belongs in.
+
+**Valid values** (exactly three; anything else is treated as "no recognised tier" and the gate does not fire):
+
+| Value | Meaning | Examples (this repo) |
+|-------|---------|----------------------|
+| `always` | Behavioural rule needed in **every** context — both the coordinator and wave implementation agents. Never excluded by tier gating. | `ask-via-tool`, `verification-before-completion`, `parallel-sessions`, `security`, `receiving-review`, `development`, `quality-gates-autofix` |
+| `coordinator-only` | Operator/coordinator-context rule **not** needed by wave implementation agents. Excluded when `context: 'wave'`. | `owner-persona`, `lsp`, `mvp-scope`, `loop-and-monitor` |
+| `wave-only` | Path-scoped implementation rule (the files that also carry `globs:`). Excluded when `context: 'coordinator'`. | `backend`, `backend-data`, `cli-design`, `frontend`, `prompt-caching`, `security-web`, `swift`, `testing` |
+
+**How gating fires** (`applyGates` in `rule-loader.mjs`):
+
+- The gate is driven by the `context` parameter to `loadApplicableRules` (and the `--context <c>` flag on `scripts/print-applicable-rules.mjs`).
+- `context: 'wave'` → excludes rules with `tier: coordinator-only`.
+- `context: 'coordinator'` → excludes rules with `tier: wave-only`.
+- `context: null` (the default) → **no tier gating whatsoever**; all tiers load regardless of their `tier:` value. This is the backward-compatible path — every existing caller that does not pass `context` is unaffected.
+- A rule with **no `tier:` key** is never excluded by the tier gate, in any context.
+
+**`tier:` is orthogonal to `globs:`.** A `wave-only` rule still uses its `globs:` patterns for path-scoping within a wave; the `tier` key only adds the coordinator-vs-wave context dimension on top. The two compose: a `wave-only` rule must clear *both* the glob axis (its globs intersect the wave's `scopePaths`) and the tier axis (the context is not `coordinator`).
+
+**Budget-neutral.** `tier:` is advisory metadata for the per-wave rule-injection surface. It does **not** change the always-on directive count measured by the instruction-budget guard — that guard skips frontmatter, so adding a `tier:` line never moves the count. `tier:` is parsed identically to the other scalar activation keys (#694): it lives in the same `SCALAR_META_KEYS` set, is quote-stripped, and is surfaced on the rule entry as `tier`.
+
+### Byte-for-byte always-on guarantee
+
+A rule file with no frontmatter (or no recognised activation keys) is loaded exactly as it is today: full content, every wave, every mode, every host. FA1 adds no behavioural change for the 11 existing always-on rules. The new keys are purely additive.
+
+### Fail-open on parse error
+
+Degraded loading is always preferable to silently missing a security or architecture constraint:
+
+- **Malformed frontmatter** → the rule is treated as **always-on** and a WARN is written to stderr. A rule is never silently dropped.
+- **Malformed `expires-at`** → the expiry gate does **not** exclude the rule (fail-open); the rule continues to load.
+
+## Vendored Rules (issue #722 Epic A)
+
+Rules sourced from this repo's `rules/` library (`rules/always-on/*.md`, `rules/opt-in-stack/*.md`, and `rules/opt-in-domain/*.md`) and copied into a consumer repo's `.claude/rules/` via `/bootstrap --sync-rules` are a third rule category, alongside hand-authored and FA2 auto-generated rules. The sync pipeline (`scripts/lib/rules-sync.mjs`) has its own authoring contract, documented here.
+
+Since issue #743, `rules/opt-in-stack/{backend,backend-data,frontend,swift,security-web}.md` and `rules/opt-in-domain/prompt-caching.md` are the live worked example of the provenance-header + frontmatter shape described below — they were lifted verbatim (content unchanged) out of this repo's own `.claude/rules/`, which had been carrying them as dead exemplar content never vendored anywhere.
+
+### Provenance header + frontmatter coexistence (issue #722)
+
+Vendored rule sources carry a mandatory single-line provenance header — `rules-sync.mjs` uses that header (`PLUGIN_HEADER_PREFIX = '<!-- source: session-orchestrator plugin ...'`) to tell "plugin-owned, safe to overwrite on re-sync" apart from "local override, preserve". Where it goes depends on whether the rule has frontmatter (#1449):
+
+- **Rule with frontmatter** — the frontmatter opens on **line 1** (the file's first bytes are `---`), and the header is the first line directly after the closing `---`. Claude Code reads a rule's frontmatter only when it opens on line 1, so a header above the opener makes the whole block body text and the rule loads always-on in every consumer.
+- **Rule without frontmatter** — the header stays on line 1.
+
+The shape for a path-scoped vendored rule:
+
+```markdown
+---
+globs:
+  - src/**/*.tsx
+paths:
+  - src/**/*.tsx
+tier: wave-only
+---
+<!-- source: session-orchestrator plugin (canonical: rules/opt-in-stack/foo.md) -->
+# Foo Rules (Path-scoped)
+```
+
+A path-scoped vendored rule declares its patterns under **both** `globs:` and `paths:`, with identical lists. `paths:` is the only key Claude Code reads from a rule; `globs:` is what `rule-loader.mjs` reads first (#742/#795 — when both are present `globs:` wins silently), so one key alone, or two different lists, would scope the rule differently per loader.
+
+`rule-loader.mjs`'s frontmatter parser (`parseGlobsFrontmatter`) counts a frontmatter block only when its opening `---` is line 1 — the same rule Claude Code applies. Until #1449 it skipped a leading run of blank lines and single-line HTML comments, which classified a header-first rule as path-scoped while Claude Code loaded it always-on. Now a block with anything before its opener (a comment, a blank line, any text) yields no globs and no meta: the rule is always-on, and its entry carries `defect: 'frontmatter-not-at-top'` so callers such as the instruction-budget guard can report the file instead of loading it always-on without a trace. The header after the closing `---` is ordinary body text and has no effect on loading.
+
+Consumer copies written before #1449 (header on line 1, frontmatter after it) still count as plugin-owned: `isPluginOwnedContent()` (`validate-vendored-rules.mjs`, re-exported by `rules-sync.mjs`) accepts the header at either position, so the next `/bootstrap --sync-rules` rewrites such a copy into the current format rather than preserving it as a local override.
+
+This convention binds only files that are actual sync SOURCES — the entries `syncRules()` resolves from `rules/_index.md` (`join(pluginRoot, 'rules', '_index.md')`, the manifest it reads before writing anything into a consumer's `.claude/rules/`). `rules/README.md` and `rules/_index.md` itself are never entries in that manifest, so they are never sync targets and carry no provenance header by construction — not an oversight to fix.
+
+### Vendoring validation (issue #722)
+
+Before `syncRules()` writes a source file into a consumer repo's `.claude/rules/`, it runs a pre-write gate via `validateRuleContent()` (`scripts/lib/validate-vendored-rules.mjs`). Six probes:
+
+| Probe | Severity | Rejects / flags |
+|-------|----------|------------------|
+| `frontmatter-not-at-top` | error | A `---` frontmatter block preceded by anything — the provenance comment, a blank line, any text (#1449). Claude Code reads frontmatter only when it opens on line 1, so such a rule loads ALWAYS-ON in every consumer repo, whatever its scope keys say. Fix: move the block to line 1 and put the provenance header on the first line after the closing `---`. |
+| `globs-paths-mismatch` | error | A library source whose line-1 frontmatter carries exactly one of `globs:` / `paths:`, or both with different lists (compared order-insensitively) (#1449). A path-scoped vendored rule carries both with the identical list: `paths:` is the only key Claude Code reads, `globs:` is what `rule-loader.mjs` reads first (#742/#795). Replaces the pre-#1449 `paths-frontmatter` probe, which rejected `paths:` in a library source outright. Its population is what `syncRules()` reads, i.e. `<pluginRoot>/rules/**` as listed by `rules/_index.md`; the consolidated files under `.claude/rules/` are `paths:`-only by design (see § Consolidated rules point 3) and are never its input. |
+| `provenance-header` | error (opt-in via `requireProvenance`, default `true` in `syncRules()`) | Missing provenance header on a library source — without it, `rules-sync.mjs` mis-detects the file as a local override on the next re-sync and can never update it again. Two positions are accepted: line 1 (a rule without frontmatter) or the first non-blank line after the closing `---` of a frontmatter that opens on line 1. A header on line 1 ABOVE a frontmatter (the pre-#1449 format) still satisfies this probe — `frontmatter-not-at-top` reports that shape, once — and keeps an old consumer copy plugin-owned, so the next sync upgrades it to the current format instead of freezing it as a local override. |
+| `placeholder` | error | Unfilled placeholder tokens: `{{PROJECT_NAME}}`-style handlebars, a `## TODO: Customize` heading, or a `<!-- TODO:` comment — skeleton content, not a finished rule. |
+| `zero-match-globs` | warn | A `globs:` pattern matching 0 files in the target repo's tracked file list (`git ls-files`, falling back to a directory walk). Legitimately possible in a freshly-scaffolded repo. |
+| `foreign-glob` | warn | A glob segment carrying a PascalCase, product-like token (regex `[A-Z][a-z]+[A-Z]`, e.g. `WalkAITalkieTests`) — a likely copy-paste leftover from another project's rule scope. |
+
+Error-severity violations skip the write for that file (recorded in `syncRules()`'s `errors[]`); warn-severity violations do not block the write and are recorded additively in `warnings[]`. Since #1098 the envelope also carries `sanitizer[]` — `{file, line, kind, text}` records from `scanVendoringLeaks()` for plugin-internal citations that resolve to a real file under the plugin root (`scripts/…`, `hooks/…`, `skills/…`, `docs/…`, `tests/…`) and for `See Also` references that name no entry in `rules/_index.md`. The sanitizer is report-only: it never rewrites content and never contributes to `errors[]`, so a finding changes neither the write decision nor the exit code — a human decides whether the citation is a leak. `rules-sync.mjs`'s CLI additionally prints each finding to **stderr** as `rules-sync: sanitizer <kind> <file>:<line> — <text>`, so the report reaches an operator who never parses the JSON envelope.
+
+`scanVendoringLeaks()` itself lives in `scripts/lib/validate-vendored-rules.mjs` (it has the validator's shape — judge one rule file, return findings); `rules-sync.mjs` re-exports it for importers that predate the move. The standalone CLI (`node scripts/lib/validate-vendored-rules.mjs --dir <rulesDir> [--target-root <repo>] [--plugin-root <dir>] [--require-provenance] [--json] [--mode hard|warn]`) exits `0` (no errors, or errors under `--mode warn`), `1` (errors present under `--mode hard`), or `2` (invocation error). Passing `--plugin-root <dir>` turns on the same sanitizer scan there: findings appear under a `sanitizer` key in `--json` mode and as `validate-vendored-rules: sanitizer <kind> <file>:<line> — <text>` stderr lines otherwise. The `unresolvable-see-also` half needs `<pluginRoot>/rules/_index.md` to be readable; when it is not, only the `repo-local-path` check runs. Report-only there too — `sanitizer[]` never moves the exit code.
+
+### Archetype-scoped manifest tags (issue #722 Epic A Wave 3)
+
+`rules/_index.md` entries may carry an optional trailing `[archetypes: a, b]` tag:
+
+```markdown
+- `opt-in-stack/foo.md` — description [archetypes: nextjs-minimal, node-minimal]
+```
+
+Absent tag = universal (vendored to every consumer repo, the default and fully backward compatible). Present tag = scoped — vendored only when the consumer repo's resolved archetype matches one of the listed values (case-insensitive). Archetype resolution precedence: explicit `archetype` argument (CLI `--archetype`) > `<repoRoot>/.orchestrator/bootstrap.lock`'s `archetype:` line > unknown. A mismatch or an unresolvable target archetype records a `skipped[]` entry with reason `archetype-mismatch` or `archetype-unknown` respectively — never a hard error. See `rules/_index.md` § Entry syntax for the full archetype value list.
+
+## The Never-Always-On Invariant (Auto-Generated Rules)
+
+> Delivered by FA4 (issue #697) in `scripts/lib/validate/check-rules.mjs`, wired into CI via `scripts/validate-plugin.mjs`. FA1 (this doc) specifies the contract that gate enforces.
+
+Hand-authored rules are the curated, cross-cutting baseline. **Auto-generated rules are *extra* rules** — narrow, learning-derived, and time-boxed. They must never inflate the always-on instruction budget (cross-ref #668 instruction-budget). The brandmauer (firewall) is:
+
+Any rule with `auto-generated: true` **MUST**:
+
+1. Carry **at least one activation axis** — `globs` or `host-class`. It must **NOT** be always-on.
+2. Carry a `learning-key` (provenance — which learning produced it).
+3. Carry an `expires-at` (time-box — auto-generated rules are not permanent).
+
+A rule that sets `auto-generated: true` but lacks an activation axis, or omits `learning-key` / `expires-at`, is a violation. The FA4 CI gate (`scripts/lib/validate/check-rules.mjs`) fails the build on such a rule (exit 1). This keeps every machine-authored rule conditional and self-expiring — the always-on surface stays the hand-curated baseline.
+
+> Note: `scripts/lib/reconcile/emitter.mjs`'s own module doc additionally lists `mode` as a third accepted axis for the *emitter's* internal throw-guard (the pure function that produces a rule's activation metadata before it is ever written to disk). `check-rules.mjs`'s CI gate — which audits `.claude/rules/*.md` files already on disk — checks only `globs`/`host-class`, not `mode`. This is a pre-existing discrepancy between the emitter's internal guard and the CI gate's scope, not something #880 (below) introduced or resolved; every currently-emitted rule uses `globs` as its axis in practice, so the discrepancy has not yet produced a false pass.
+
+## Handwritten Rule Review Date (#880 FA5)
+
+The invariant above only binds the **machine author** (the FA2 reconciliation engine, via the emitter's throw-guard). A human authoring a `.claude/rules/*.md` file by hand bypasses it entirely — there was previously no check at all on handwritten rules' activation scoping or on when they were last reviewed. Issue #880 found that most of this repo's handwritten rules carry no `globs`/`paths`/`host-class` frontmatter and no periodic-review marker, and nothing in the system ever prompted a re-review.
+
+**Correction to a common misreading:** "no `globs`/`paths`/`host-class`" does **not** mean "no activation axis at all." Since issue #692, `tier:` (`always` | `coordinator-only` | `wave-only`) is a real load-context gating axis — `rule-loader.mjs`'s `applyGates()` excludes `coordinator-only` rules from wave context and `wave-only` rules from coordinator context (see [Tier gating](#tier-gating-issue-692) above). Every handwritten rule in this repo already carries a `tier:` key. Treating `tier:` as *not* an axis and flagging all of them as "no activation axis" would be both factually wrong and operationally dangerous: the obvious-looking fix — adding a `globs:`/`paths:` filter to a rule that is intentionally always-on (e.g. `security.md`, `verification-before-completion.md`) — would silently stop that rule from loading in most waves, a live behaviour change to a safety-critical directive disguised as a metadata fix. **`check-rules.mjs` therefore counts `tier:` as a valid activation axis for handwritten rules, on equal footing with `globs`/`paths`/`host-class`.**
+
+### The symmetric check (WARN-only, `check-rules.mjs`)
+
+For every `.claude/rules/*.md` file **without** `auto-generated: true`, the gate checks:
+
+1. **Activation axis** — a non-empty `globs` array, its `paths` alias (#795), a `host-class` key, **or** a `tier` key. Missing all four → `WARN: ... no activation axis ...`.
+2. **`review-date`** (ISO 8601, e.g. `2026-10-23`) — a periodic-review marker. Missing → `WARN: ... missing a review-date ...`.
+
+> **`globs: []` is not a fourth way to pass — and no other axis can rescue it.** An *empty* `globs` array is not the same as an *absent* one. `rule-loader.mjs` excludes such a rule unconditionally (`if (globs.length === 0) continue;`), and that check runs **after** `applyGates()` — so a co-present `tier:`, `host-class:` or `mode:` cannot bring it back. The rule matches nothing and never loads, in any context. `check-rules.mjs` therefore emits its own distinct WARN for `globs: []` that wins over the axis check, rather than reporting the (opposite) "loads always-on". Read rule 1 as a flat OR only for a *non-empty* or *absent* `globs`.
+
+Both checks are **advisory (WARN), not a build failure** — `check-rules.mjs`'s exit code is driven **solely** by the pre-existing auto-generated hard-fail invariants above. A handwritten-rule WARN never turns CI red. Promoting this to a hard gate is a later, deliberate step (not part of #880), once every handwritten rule in the fleet has a `review-date`.
+
+### Why `review-date`, not `expires-at`
+
+`expires-at` was deliberately **not** reused as the handwritten review marker. `rule-loader.mjs`'s `applyGates()` treats `expires-at` as a **live expiry gate**: once the date passes, the rule is silently **excluded** from every load (fail-open only on a malformed date — see [Fail-open on parse error](#fail-open-on-parse-error) above). Stamping `expires-at` on an always-on safety rule (`security.md`, `parallel-sessions.md`, …) as a "please review this periodically" reminder would mean that rule **actually stops loading** the day the reminder date passes — the opposite of what a review marker should do.
+
+`review-date` is a **new, inert** frontmatter key instead:
+
+- It is **not** in `rule-loader.mjs`'s `SCALAR_META_KEYS` allowlist (that module is contract-locked as of #880 — its allowlist was not extended). An unrecognised key is ignored without error per the existing parser contract, so `review-date` has **zero effect** on `loadApplicableRules()` / `applyGates()` — it is parsed only by `check-rules.mjs`, via a small local regex helper (`hasFrontmatterKey()`) that scans the raw frontmatter block directly.
+- Format: a bare ISO 8601 date (`YYYY-MM-DD`), same shape as `expires-at`, but purely advisory.
+
+```markdown
+---
+tier: always
+review-date: 2026-10-23
+---
+# Security Rules (Always-on)
+```
+
+### Current fleet state (as migrated by #880)
+
+**Every** handwritten rule in this repo's own `.claude/rules/` carries a `review-date`: the #880 migration added one to the then-current set (2026-07-25, +90 days from the session date), and every rule added since ships with one from the start. None gained a new `globs:`/`paths:` axis — every file's pre-existing activation-axis state (`tier:`, with or without `globs:`) is unchanged; only the `review-date:` line was added. The auto-generated rules are untouched by this section (they already satisfy the FA4 invariant in full).
+
+Four of them (`loop-and-monitor.md`, `lsp.md`, `mvp-scope.md`, `owner-persona.md`) carry `tier: coordinator-only` — genuinely excluded from wave context, not part of the wave-time always-on budget despite lacking `globs:`. The rest carry either `tier: always` or `tier: wave-only` + `globs:` (`bash-harness-pitfalls.md`, `cli-design.md`, `testing.md`) — the `tier: always` cohort is the genuinely unconditional, every-context, every-wave one.
+
+## Learning Type-Taxonomy, TTL & Provenance Standard (issue #723 B6 / #733)
+
+The `learning-key` field above links a rule to a learning record, but does not by itself define *how long* that learning (and any rule generated from it) stays alive, or *which* learning types are even eligible for agent-proposal or rule-conversion. Those two axes — per-type TTL and per-type capability — are governed by a single registry, and the resulting auto-generated `## Provenance` section format is a distinct, richer artifact from the single-line vendored-rule provenance header documented above. This section names both as the standard.
+
+### The type-taxonomy + per-type TTL registry (single source of truth)
+
+`LEARNING_TYPE_REGISTRY` in [`scripts/lib/learnings/schema.mjs`](../scripts/lib/learnings/schema.mjs) (~L92–127) is the **single source of truth** for every learning `type`'s TTL policy and its three cross-module capability flags (`agentProposable`, `ruleConvertible`, `hostScoped` — four axes in total, counting `ttlDays`). Before this registry existed (pre-#733), three modules independently hand-maintained overlapping type lists that drifted out of sync. `LEARNING_TTL_DAYS` (this file), `PROPOSAL_TYPES` (`scripts/lib/memory-proposals/schema.mjs`), and `CONVERT_TYPES` (`scripts/lib/reconcile/eligibility.mjs`) are now all **derived** from this one registry — no hand-maintained duplicate lists remain.
+
+Transcribed verbatim from `LEARNING_TYPE_REGISTRY` (17 types):
+
+| Type | ttlDays | agentProposable | ruleConvertible | hostScoped |
+|------|---------|------------------|------------------|------------|
+| `mode-selector-accuracy` | 30 | true | false | false |
+| `hardware-pattern` | 60 | true | false | true |
+| `fragile-file` | 45 | true | true | false |
+| `effective-sizing` | 45 | true | false | false |
+| `recurring-issue` | 45 | true | true | false |
+| `workflow-pattern` | 90 | true | true | false |
+| `proven-pattern` | 90 | true | true | false |
+| `anti-pattern` | 90 | true | true | false |
+| `autopilot-effectiveness` | 90 | true | false | false |
+| `autonomy-verdict` | 90 | false | false | false |
+| `domain-regression` | 60 | true | false | false |
+| `owner-preference` | 60 | false | false | false |
+| `convention` | 90 | true | true | false |
+| `architecture-pattern` | 90 | true | true | false |
+| `design-pattern` | 90 | true | true | false |
+| `fragile-pattern` | 45 | false | true | false |
+| `stagnation-class-frequency` | 60 | false | true | false |
+
+Capability axes:
+- **`agentProposable`** — the type may appear in `PROPOSAL_TYPES` (a wave-agent may `memory.propose()` this type). `autonomy-verdict`, `owner-preference`, `fragile-pattern`, and `stagnation-class-frequency` are `false` — these are analyzer-synthesized classes, not agent-observed, so they are never agent-proposable.
+- **`ruleConvertible`** — the type may appear in `CONVERT_TYPES` (the FA2 reconciliation engine may convert a learning of this type into a conditional `.claude/rules/*.md` proposal). `fragile-file`, `recurring-issue`, `anti-pattern`, `convention`, `architecture-pattern`, `design-pattern`, `fragile-pattern`, `stagnation-class-frequency`, `workflow-pattern`, and `proven-pattern` are the ten `ruleConvertible: true` types (issue #900 flipped the last two from `false` — the real corpus census showed a large volume of these records carrying usable `file_paths` scope that were structurally unconvertible before the flip).
+- **`hostScoped`** — `reconcile/emitter.mjs` may copy the record's `host_class` through as the emitted rule's `host-class` activation axis (issue #1090; derived set: that module's `HOST_SPECIFIC_TYPES`). `hardware-pattern` is the ONLY `true` type today — its content IS the chip/OS, so gating the emitted rule by host-class is faithful rather than an accidental one-machine restriction. For every other type `host_class` merely records the machine the learning was authored on and must never gate the rule.
+
+### Type aliasing (issue #900)
+
+The real learnings corpus also accumulated free-form type names that were never registered — the same semantic classes as two registered types, written with a different literal. `LEARNING_TYPE_ALIASES` in `scripts/lib/learnings/schema.mjs` maps these to their canonical counterpart (`gotcha` → `anti-pattern`, `pattern` → `proven-pattern`), applied by `normalizeDialects()` on both the read and write/migration funnels — mirroring the existing `files` → `file_paths` dialect-normalization pattern one level up (a type-name alias instead of a field-name alias). No alias key may collide with a registry key (guarded by a test in `tests/lib/learnings-schema-normalization.test.mjs`).
+
+`LEARNING_TTL_DAYS[type]` derives its value from `LEARNING_TYPE_REGISTRY[type].ttlDays` for every listed type, plus a `default: 60` fallback entry for any type not present in the registry (`deriveExpiresAt()` looks up `LEARNING_TTL_DAYS[type] ?? LEARNING_TTL_DAYS.default`).
+
+### The auto-generated rule `## Provenance` section format
+
+This is a **distinct artifact** from the single-line HTML-comment provenance header documented above under [Provenance header + frontmatter coexistence](#provenance-header--frontmatter-coexistence-issue-722) — that header marks a *vendored* rule sourced from this repo's `rules/` library; the `## Provenance` section below marks a rule *generated* by the FA2 reconciliation engine from a learning record. A rule file can only ever carry one of the two, never both.
+
+The reconciliation engine emits a body section immediately after a do-not-hand-edit HTML comment. The example includes the optional `vault-note` bullet.
+
+```markdown
+<!-- provenance (auto-generated by the reconciliation engine — do not hand-edit; the `- expires-at:` bullet below is the value AT GENERATION and is never updated, the frontmatter `expires-at` is the live one the sweep raises) -->
+## Provenance
+- learning-key: `<type>/<subject-slug>`
+- learning-id: `<learning UUID>`
+- vault-note: `<vault-relative note path>`
+- source-session: `<source_session slug, e.g. main-2026-07-03-session-1>`
+- confidence: <learning confidence, 0..1>
+- generated-by: reconciliation-engine (Epic #693 FA2 / #695)
+- expires-at: <ISO 8601 date>
+```
+
+Field-by-field:
+
+| Field | Source | Notes |
+|-------|--------|-------|
+| `learning-key` | the learning's `type`/`subject` composite key | Duplicated from the frontmatter `learning-key` field — the body section is the human-readable rendering, frontmatter is what `rule-loader.mjs` and `claude-md-drift-check` Check 8 parse. |
+| `learning-id` | the learning record's `id` (UUID v4) | Uniquely identifies the exact learning record, distinct from the type/subject key which is not guaranteed unique across sessions. |
+| `vault-note` | the vault-relative learning note path, when resolvable and vault integration is enabled | Reconcile adds this field only to newly generated rules. It omits the field if the owner policy cannot load or the path matches any private slug, including vault-clear slugs. |
+| `source-session` | the learning's `source_session` field | **Session-slug based, not issue-number based** — see the callout below. |
+| `confidence` | the learning's `confidence` field | Mirrors frontmatter `confidence`. |
+| `generated-by` | fixed literal | Always `reconciliation-engine (Epic #693 FA2 / #695)` — identifies the producing subsystem, not a per-rule variable. |
+| `expires-at` | the derived/floored expiry (see `reconcile.rule-expiry-days` / `min-rule-days` in [`docs/session-config-reference.md`](session-config-reference.md#reconcile-693--696--697)) | The value AT GENERATION — never updated. The frontmatter `expires-at` is the live one: the rule-expiry sweep raises only that key, so after a raise the two differ by design. Key and value stay byte-identical, since `scripts/backfill-learnings-from-vault.mjs` `parseRuleProvenance` reads this line with `/^- expires-at:\s*(.+)$/m`. |
+
+**Provenance is session-slug based, not issue-number based.** The only session-identity field the schema carries is `source_session` (a kebab-slug like `main-2026-07-03-session-1`) — there is currently no issue-number provenance field on a learning record or a generated rule. Adding issue-number provenance (linking a rule back to the GitHub/GitLab issue that motivated the learning) would require a schema addition to `scripts/lib/learnings/schema.mjs` — out of scope for this documentation pass.
+
+### Consolidated rules: N provenance pairs in ONE file (the merge contract)
+
+A rule file may ABSORB several generated rules. This is the supported way to
+stop `.claude/rules/` growing one 2.6 kB file per learning — measured
+2026-09-06 @ `e4674109`: 43 generated files / 112,443 B, 46.2 % of it pure
+frontmatter + provenance overhead, consolidated to 8 thematic files (33
+absorbed, 10 dropped). Four rules make a merge safe, and skipping any one of
+them silently loses a learning or regenerates it:
+
+1. **Frontmatter `learning-key:` is a SCALAR — so N−1 markers live in the
+   body.** `engine.mjs` reads BOTH forms: the frontmatter
+   `FRONTMATTER_LEARNING_KEY_RE` (`^learning-key: <value>`) and the body
+   bullets `BODY_LEARNING_KEY_RE` / `BODY_LEARNING_ID_RE`
+   (`` - learning-key: `<value>` `` / `` - learning-id: `<value>` ``). A merged
+   file therefore carries **one `- learning-key:` + `- learning-id:` bullet
+   PAIR per absorbed learning** in its `## Provenance` section, and may omit
+   the frontmatter scalar entirely. Removing a pair does not "tidy up" the
+   file — it makes that learning look unmaterialized, and the next
+   `/reconcile` regenerates it as a standalone rule.
+
+2. **`expires-at` is the EARLIEST of the absorbed dates.** A merged file must
+   not outlive its shortest-lived content: one date now covers several
+   learnings, so it must expire when the FIRST of them is due for review, not
+   the last. (Taking the latest would silently extend every other learning's
+   TTL past what its type registry granted it.) State the rule in the file
+   itself, so the next editor does not "fix" it upward.
+
+   Since #1387 an expired file also stops DEDUPING: the `/reconcile` provenance
+   reader (`scripts/lib/reconcile/backlog.mjs`
+   `defaultReadMaterializedProvenance`) skips an expired file whole —
+   frontmatter key and body bullets alike — through the same `isRuleExpired`
+   predicate the loader's injection gate uses, fail-open on an absent or
+   unparseable date. Two KNOWN LIMITS, both measured 2026-09-18 and both left
+   unsolved on purpose:
+
+   - **Only the on-disk third.** `partitionMaterialized` marks a learning
+     materialized on `sidecarTerminal || ledgerTerminal || onDisk`; this covers
+     `onDisk` only. On this repo 79 of 92 provenance keys are ALSO terminal in
+     `.orchestrator/runtime/reconcile-candidates.jsonl`, so only 13 keys
+     actually become re-proposable. The sidecar and the append-only verdict
+     ledger `.orchestrator/metrics/reconcile-verdicts.jsonl` (#1710) stay
+     untouched because they carry operator DECLINES — expiring a rule must not
+     re-ask a question the operator already answered. The ledger holds
+     DECISIONS only (`rejected`, `expired-swept`), never the branch-scoped
+     `written` / `already-on-disk`, so a rule's own `written` verdict does not
+     pin its learning there.
+   - **A file the sweep cannot split re-proposes forever.** A file the sweep
+     skips (`no-1to1-mapping`, `no-provenance-block`, `unreadable`,
+     `no-counter-sentence`) that then
+     expires legitimately becomes re-proposable on EVERY run, with no
+     mechanical exit: the sweep will not rewrite it, so nothing retires its
+     markers. The live tree is currently clear of this —
+     `node scripts/sweep-expired-rules.mjs --dry-run --json` reported
+     `skipped: []` over 7 generated files (2026-09-18) — but the class has no
+     guard, so a future unsplittable file lands in it silently.
+
+   The expiry sweep (`node scripts/sweep-expired-rules.mjs`) maintains the
+   earliest-date rule in
+   ONE direction: a header sitting EARLIER than the earliest absorbed date is
+   RAISED to it — the raise is its own rewrite trigger (`action: "rewrite"`,
+   `reason: "header-raise"`, visible in `--json` before `--apply`), and it
+   touches nothing but the frontmatter line and the sentence above. Without it
+   the file passes its header date with nothing expired, `rule-loader.mjs`
+   stops injecting it, and the surviving provenance markers keep `/reconcile`
+   treating its learnings as materialized — the substance goes dark and is
+   never re-proposed. The sweep never LOWERS a header: a header that outlives
+   its content is reported as an `advisory` only, because lowering on every run
+   would cut a healthy entry's TTL short.
+
+3. **`paths:` is the canonical scope key, and it carries the UNION of the
+   parts.** The merged file loads for any path any of its parts covered, so its
+   list is the union of theirs. `paths:` is the key Claude Code's OWN native
+   rule loader reads, and it treats a rule lacking it as unconditional,
+   always-on (`check-rules.mjs` check #1108) — exactly the instruction-budget
+   failure consolidation exists to prevent. `globs:` is an accepted ALIAS, not a
+   second required mirror: `rule-loader.mjs` resolves either key
+   (`parseGlobsFrontmatter`, issue #795) and `instruction-budget-guard.mjs`
+   (`:960`) goes through that same parser, so a `paths:`-only file is
+   glob-scoped for every reader in this repo and still counts under
+   `bySurface.pathScoped`. Measured 2026-09-18 over this repo's own
+   `.claude/rules/` (25 files; NOT the vendored `rules/` library, and not the
+   private baseline's `rules/` population `docs/baseline.md` counts separately)
+   (`for f in .claude/rules/*.md; do awk '/^---$/{n++;next} n==1 && /^(paths|globs):/{print FILENAME": "$1}' "$f"; done`):
+   10 path-scoped rule files, ALL 10 `paths:`-only — 0 carry `globs:`, 0 carry
+   both (`grep -rn '^globs:' .claude/rules/` → no match, exit 1). Until this
+   session `cli-design.md` carried both; the duplicate `globs:` was removed
+   here. Only rules VENDORED OUT through the `rules/` fleet library carry
+   both keys, with identical lists — `paths:` for Claude Code, `globs:` for
+   `rule-loader.mjs` (issues #742, #1449) — and `validate-vendored-rules.mjs`'s
+   `globs-paths-mismatch` probe enforces it; that probe judges `rules/`
+   sources only and never sees a consolidated file under `.claude/rules/`. Carrying both keys is
+   allowed, but NEVER with different values: `globs:` wins SILENTLY when both
+   are present (#795), and `check-rules.mjs` fails a divergent pair outright.
+
+4. **Substance in, boilerplate out.** Each absorbed learning becomes an `###`
+   heading carrying its original rule sentence, plus its evidence line. What is
+   dropped is only the per-file repetition (the `# Auto-generated rule:` title,
+   the untrusted-content wrapper repeated 43×, the `evidence-digest` /
+   `evidence-digest-input` / `source-session` fields). Never drop an evidence
+   line to hit a byte target — an insight with no measurement behind it is the
+   thing `.claude/rules/measurement-discipline.md` exists to forbid.
+
+**Dropping a learning requires a stamp BEFORE the delete.** Deleting a
+generated rule file whose insight is already carried verbatim by a hand-written
+always-on rule is legitimate — but `rm` alone does not stick. `engine.mjs`
+treats a learning as `alreadyMaterialized` if the idempotency sidecar holds a
+terminal verdict for its `learning_key` (`isProcessed`), OR the append-only
+verdict ledger `.orchestrator/metrics/reconcile-verdicts.jsonl` does (#1710),
+OR a `.claude/rules/*.md` file still carries its marker. Delete the file
+without stamping and the marker is gone; the `written` sidecar record keeps it
+terminal only in the checkout that wrote the rule, so the next `/reconcile` in
+any other checkout (a fresh worktree) proposes it again. Stamp it first, via the store's only sanctioned writer —
+with `outcome: 'rejected'`: only a decision reaches the ledger, so an
+`already-on-disk` stamp holds in the stamping checkout alone:
+
+```js
+import { markCandidateProcessed } from '../scripts/lib/reconcile/idempotency.mjs';
+markCandidateProcessed({
+  learningKey: 'anti-pattern/<subject-slug>',
+  outcome: 'rejected',        // 'already-on-disk' (it lives elsewhere) stays checkout-local
+  fallbackSlug: '<the .claude/rules slug>',
+  repoRoot,
+});
+```
+
+This writes `.orchestrator/runtime/reconcile-candidates.jsonl` (creating it if
+absent). Verify with a dry run: `alreadyMaterialized` must equal
+absorbed + dropped, not absorbed alone.
+
+#### The untrusted-content envelope (#1015, #1779)
+
+The prose a generated rule carries is agent-authored learning text, so the
+renderer wraps it in an envelope that says so. The envelope is two VISIBLE
+blockquote lines, `> **untrusted-content:start** — …` and
+`> **untrusted-content:end** — …`, each with a blank line on both sides.
+Until #1779 they were block-level HTML comments, and Claude Code strips those
+before it injects a rule (code.claude.com/docs/en/memory, read 2026-10-24):
+the model received the prose with no envelope at all. Readers recognise both
+forms through `isUntrustedStartLine` / `isUntrustedEndLine` in
+`scripts/lib/reconcile/sanitize.mjs`; `sanitizeProse` blanks the envelope
+token inside learning text — also when it is spelled with a look-alike dash or
+colon, spaces or Markdown emphasis — so a learning cannot write a line that
+reads as a sentinel. Full-width or homoglyph LETTERS still pass that
+neutraliser (a named limit), but not validation:
+`scripts/lib/validate/check-rules.mjs` (f) fails a generated rule whose
+envelope is still an HTML comment, any line whose NORMALISED form carries the
+token without being byte-equal to a visible sentinel (`carriesEnvelopeToken`:
+NFKD, then combining marks and default-ignorable code points stripped, then
+NFKC, lower-case and a small Cyrillic/Greek homoglyph fold, separators and
+emphasis, #1792 — letters outside that fold, such as the small capital
+U+1D07 `ᴇ`, are not folded, a named limit), and an
+envelope that is not exactly one start line before exactly one end line. The
+sentinels carry no per-file token, so a forged line byte-equal to the real one
+is caught only by that count — a named ceiling.
+
+Copies outside this repo still carrying the HTML-comment envelope are migrated
+by `node scripts/migrate-rule-envelope.mjs --root <repo> [--root <repo> …]`
+(dry-run by default, `--apply` to write, `--json`). It rewrites only the two
+lines that are exactly a legacy sentinel, keeps every other byte and line
+ending, skips (with a reason) a file whose envelope is malformed or mixed,
+never follows a symlink, and writes atomically. It never walks a directory to
+find repos: the caller passes each root and owns the fleet boundary check for
+it. Run it from a maintenance runner, not inside an unrelated feature MR.
+
+#### The expiry sweep (`scripts/sweep-expired-rules.mjs`, #1377)
+
+`rule-loader.mjs` stops INJECTING a generated rule once its `expires-at` has
+passed; nothing removed one from disk, so an expired consolidated file stayed
+tracked, kept costing bytes against `generated-byte-ceiling`, and kept reading
+as live corpus to every human and every grep. On Claude Code it also kept
+LOADING: the native loader never reads `expires-at` (#1779). The sweep is the
+only mechanism that retires expired content there, so the housekeeping
+maintenance loop runs it with `--horizon-days 7`, which also removes content
+that would expire before the next sweep. The CLI defaults to `--horizon-days 0`.
+The sweep (`scripts/lib/reconcile/rule-expiry-sweep.mjs`, CLI
+`node scripts/sweep-expired-rules.mjs`, `--dry-run` default) closes that gap
+under four contracts, all of them consequences of the four merge rules above:
+
+1. **Prose goes, the pair STAYS.** An expired entry's `###` block is deleted;
+   its provenance pair is converted to the `markers only` shape already present
+   in the corpus — a same-line HTML comment appended to the `- learning-id:`
+   bullet, leaving the backticked value regex-visible to
+   `BODY_LEARNING_ID_RE`. Per point 1, deleting the pair would make the
+   learning look unmaterialized and `/reconcile` would regenerate it. **A pair
+   is never deleted while its file survives.**
+
+2. **Three fail-open cases, all reported rather than guessed.** An entry carries
+   no date of its own; its date is recoverable only via `learning-id` →
+   `.orchestrator/metrics/learnings.jsonl` or its sibling
+   `learnings-archive.jsonl` `expires_at`, with the live store taking precedence
+   for duplicate ids; the archive supplies the learning's own expiry evidence
+   (measured 2026-09-17 @
+   `9e8146b4`: 87 of 92 unique ids resolve, 5 do not). An **unresolvable id**
+   keeps its entry and blocks the file delete. An **ambiguous file** — where the
+   `###` headings do not map 1:1 onto the non-`markers only` pairs, because
+   several learnings were merged into one prose entry — gets `action: 'keep'`
+   plus a `skipped` record with reason `no-1to1-mapping`. Measured the same day,
+   the 1:1 mapping held in 3 of the 7 live files
+   (`measurement-discipline` 12/12, `process-contracts` 6/6,
+   `toolchain-and-build` 10/10) and failed in the other 4. The third case is an
+   **unrecognised counter sentence** (GH#70, 2026-09-20): when the body sentence
+   restating `expires-at` is in no spelling `COUNTER_FORMS` knows, the file gets
+   `action: 'keep'` plus a `skipped` record with reason `no-counter-sentence`
+   and NO write of any kind — not a rewrite, not a raise, and not a delete
+   either, because a shape the sweep cannot read is the last shape whose most
+   destructive action should run. Moving only the header would ship a
+   frontmatter date contradicting a body sentence that forbids exactly that
+   correction. Malformed `learnings.jsonl` lines are COUNTED
+   (`malformedLines`), never skipped.
+
+3. **Deleting a whole file obeys the stamp-before-delete rule above.** A file is
+   deleted only when it has zero kept AND zero unresolved pairs, and EVERY pair
+   on it — markers-only ones included, since those are dedupe markers too — is
+   stamped via `markCandidateProcessed` BEFORE the `unlink`. Stamping afterwards
+   leaves a window in which neither the file nor a terminal verdict exists.
+
+4. **The header is recomputed only for a file the sweep actually rewrites.**
+   Point 2's earliest-date rule is re-applied over the pairs that remain and
+   are not expired, in the frontmatter and in the body sentence
+   ``**`expires-at` <D> = the EARLIEST of the <N> absorbed dates**``. A file
+   with nothing expired is left BYTE-IDENTICAL, so a recompute-on-every-run
+   cannot silently shorten a healthy file's TTL. The discrepancy is reported as
+   the plan's `advisory` field instead — computed over every RESOLVABLE pair on
+   the file and emitted BEFORE the `no-1to1-mapping` skip, so an ambiguous file
+   still gets one. Measured 2026-09-17
+   (`node scripts/sweep-expired-rules.mjs --json`, 7 files scanned, 0 expired),
+   **6 of the 7 files carry a discrepancy**: `identity-and-locks` 2026-10-01 vs
+   2026-10-02, `measurement-discipline` 2026-10-04 vs 2026-10-02,
+   `process-contracts` 2026-10-04 vs 2026-10-27,
+   `review-and-adapter-contracts` 2026-10-04 vs 2026-10-02, `test-hygiene`
+   2026-10-20 vs 2026-10-07, `toolchain-and-build` 2026-10-01 vs 2026-10-16 —
+   only `guard-design` agrees with its content. Three are the harmful direction,
+   a header OUTLIVING its content (`measurement-discipline`,
+   `review-and-adapter-contracts`, `test-hygiene`); the other three expire
+   earlier than they need to, which costs injection and loses nothing. `N`
+   counts the pairs remaining in the file, which is the total pair count — an
+   absorbed date stays absorbed after its prose is gone, and all 7 live
+   sentences carry that number.
+
+**The `description:` is reported, never rewritten (#2023).** It is authored
+summary prose — it may enumerate the very lessons a rewrite removes — and no
+sweep can regenerate it honestly. Every `reason: 'expired-entries'` rewrite
+therefore carries `descriptionReview: { removedHeadings, remainingEntries,
+countWord? }`; `countWord` (`{ found, value, remaining }`) appears only when the
+description's first count word (English two–twelve, German zwei–zwölf) or bare
+number 2–99 differs from the remaining entry count. The CLI prints one
+`description <file>:` line per such plan and passes the field unchanged in
+`--json`; the hint is a matcher, not a parser, so a human edits the description.
+
+`--apply` emits `orchestrator.rules.expiry_sweep_applied` after the writes
+succeed (see `docs/events-schema.md`); a dry run emits nothing.
+
+**Single-entry files (#1513).** A generated rule holding exactly ONE learning
+(one provenance pair, no `###` entry, no counter sentence — the per-learning
+shape a consumer's reconciliation engine writes; all 21 generated rules of the
+Meta-Vault on 2026-10-03) is dated by its own frontmatter `expires-at`, the
+date `rule-loader.mjs` acts on. There is no body sentence to keep in agreement,
+so the `no-counter-sentence` refusal does not apply: the file is deleted
+(`reason: 'single-entry-expired'`, pair stamped terminal first) once the LATER
+of that date and the learning's store `expires_at` (when it resolves) has
+passed. A re-stamped learning therefore keeps its rule.
+
+## Authoring Examples
+
+### (a) Hand-authored always-on rule (no frontmatter)
+
+The default for cross-cutting baseline rules. No frontmatter at all — loads every wave.
+
+```markdown
+# Security Rules (Always-on)
+
+Core security principles that apply to ALL code.
+
+## SEC-004: Auth-at-Boundary
+- Every server action MUST authenticate first.
+```
+
+### (b) Glob-scoped rule (block-style `globs:`)
+
+Loads only on waves whose `allowedPaths` intersect the patterns. Mirrors the real `frontend.md` (the vendored `rules/opt-in-stack/frontend.md` additionally carries `paths:` with the same list, `tier: wave-only`, and its provenance header after the closing `---` — see [Vendored Rules](#vendored-rules-issue-722-epic-a)):
+
+```markdown
+---
+globs:
+  - src/**/*.tsx
+  - src/**/*.css
+  - src/**/*.module.css
+  - "**/components/**/*.{ts,tsx}"
+---
+# Frontend Rules (Path-scoped)
+
+## React & Next.js
+- Use Server Components by default.
+```
+
+Flow-style is equivalent: `globs: ["src/**/*.tsx", "src/**/*.css"]`.
+
+### (b2) Tier-tagged rules (issue #692)
+
+A `coordinator-only` rule — informational posture the coordinator needs but wave implementation agents do not (mirrors the real `lsp.md`):
+
+```markdown
+---
+tier: coordinator-only
+---
+# Language-Server / LSP Posture
+```
+
+A `wave-only` rule pairs `tier` with `globs:` — the tier scopes it out of the coordinator context, the globs scope it within a wave (mirrors the real `testing.md`):
+
+```markdown
+---
+globs:
+  - "**/*.test.*"
+  - vitest.config.*
+tier: wave-only
+---
+# Testing Rules (Path-scoped)
+```
+
+An `always` rule is behaviour-critical in both contexts and is never excluded by tier gating (mirrors the real `verification-before-completion.md`):
+
+```markdown
+---
+tier: always
+---
+# Verification Before Completion (Always-on)
+```
+
+### (c) Auto-generated conditional rule (full key set)
+
+Produced by the FA2 reconciliation engine from a high-confidence learning. Carries the complete activation + provenance + time-box set, and is explicitly **not** always-on:
+
+```markdown
+---
+auto-generated: true
+alwaysApply: false
+description: Shard a contention-bound test suite; never widen the global timeout.
+globs:
+  - "**/*.test.*"
+  - .gitlab-ci.yml
+  - vitest.config.*
+learning-key: testing/shard-dont-widen-timeout
+expires-at: 2026-12-31
+confidence: 0.85
+---
+# Auto-generated: shard, don't widen
+
+When a CI test suite times out under runner contention, split it with
+`parallel:` + `--shard` rather than raising `testTimeout`. Widening the
+timeout masks real perf regressions.
+```
+
+## See Also
+
+- [`skills/_shared/config-reading.md`](../skills/_shared/config-reading.md) § "Glob-Scoped Rule Injection (#336)" — wave-boundary injection flow + match algorithm
+- [`scripts/lib/rule-loader.mjs`](../scripts/lib/rule-loader.mjs) — `loadApplicableRules()` implementation (the contract this doc specifies)
+- `scripts/lib/validate/check-rules.mjs` — FA4 hard-fail CI gate (auto-generated invariants, #697) + FA5 warn-mode symmetric check (handwritten rules, #880)
+- `tests/lib/validate/check-rules.test.mjs` — auto-generated invariant coverage (FA4 #697); lives in the full GitLab repository, not in the public GitHub mirror
+- `tests/rules/check-rules-handwritten.test.mjs` — handwritten warn-mode coverage (#880 FA5); lives in the full GitLab repository, not in the public GitHub mirror
+- [`scripts/print-applicable-rules.mjs`](../scripts/print-applicable-rules.mjs) — `--context wave|coordinator` flag exercises the tier gate (#692)
+- [`scripts/lib/validate-vendored-rules.mjs`](../scripts/lib/validate-vendored-rules.mjs) — pre-write vendoring validator (issue #722 Epic A Wave 2)
+- [`scripts/lib/rules-sync.mjs`](../scripts/lib/rules-sync.mjs) — `syncRules()` implementation, archetype resolution (issue #722 Epic A)
+- [`rules/_index.md`](../rules/_index.md) — canonical manifest, `[archetypes: ...]` tag syntax
+- [`skills/claude-md-drift-check/SKILL.md`](../skills/claude-md-drift-check/SKILL.md) — Check 9 `rule-scoping` validates this frontmatter contract post-vendoring
+- [`scripts/lib/learnings/schema.mjs`](../scripts/lib/learnings/schema.mjs) — `LEARNING_TYPE_REGISTRY` / `LEARNING_TTL_DAYS` (SSOT for the type-taxonomy + TTL table above)
+- [`scripts/lib/reconcile/eligibility.mjs`](../scripts/lib/reconcile/eligibility.mjs) — `CONVERT_TYPES` (derived from `LEARNING_TYPE_REGISTRY`), rule-conversion eligibility gates
+- [`scripts/lib/memory-proposals/schema.mjs`](../scripts/lib/memory-proposals/schema.mjs) — `PROPOSAL_TYPES` (derived from `LEARNING_TYPE_REGISTRY`)
+- [`docs/session-config-reference.md`](session-config-reference.md#reconcile-693--696--697) § Reconcile — `reconcile.rule-expiry-days` / `min-rule-days` / `min-insight-chars` config keys that tune the emitted `expires-at` and eligibility gates
+- Issues: #336 (glob-scoping), #668 (instruction-budget), #692 (tier load-context gating), #693 (Rule Activation epic), #694 (FA1 foundation), #697 (FA4 validation), #722 (vendoring validation + archetype-scoped manifest), #723 B6 / #733 (type-taxonomy + provenance standard), #880 (FA5 — handwritten-rule symmetric check, warn mode), #1449 (frontmatter on line 1, `globs:` + `paths:` pair and provenance-header position for vendored rules)

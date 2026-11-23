@@ -1,0 +1,498 @@
+# Bootstrap Shared Template Partials
+
+> This file is NOT a standalone template. It contains shared step definitions
+> referenced from the tier templates (and, for `#store-lock-ignore`, from the
+> `SKILL.md` Upgrade and Refresh-Lock flows) via
+> `<!-- @include _shared-template.md#section-name -->` markers.
+>
+> When the bootstrap skill reads a tier template, sections marked with an
+> include marker must be sourced from the corresponding heading in this file.
+> The tier templates remain fully readable on their own — the markers serve as
+> an editorial cross-reference so the canonical text lives in one place.
+
+---
+
+## #parallel-sessions-rule — Step 3a: Install Canonical Rules
+
+Vendor the canonical always-on rules from the plugin's `rules/` library into `$REPO_ROOT/.claude/rules/`. `rules/` is the single source of truth for every distributable rule — never `cp` a rule file from anywhere else (see "Why one writer" below).
+
+Idempotency is handled by the writer itself:
+- Missing → create
+- Exists, plugin-owned (the `<!-- source: session-orchestrator plugin ... -->` header is on line 1, or is the first line after a line-1 frontmatter's closing `---` — `isPluginOwnedContent()`, #1449) and byte-identical → skip silently
+- Exists, plugin-owned and stale → overwrite (the plugin copy is canonical)
+- Exists WITHOUT that header → preserved untouched (a repo-private rule the operator authored)
+
+Shell:
+```bash
+mkdir -p "$REPO_ROOT/.claude"
+export PLUGIN_ROOT REPO_ROOT CONFIRMED_ARCHETYPE
+RULES_RESULT=$(node --input-type=module <<'NODE'
+import { pathToFileURL } from 'node:url';
+const { syncBootstrapRules } = await import(pathToFileURL(`${process.env.PLUGIN_ROOT}/scripts/lib/baseline-archetypes.mjs`).href);
+const result = await syncBootstrapRules({ repoRoot: process.env.REPO_ROOT, archetype: process.env.CONFIRMED_ARCHETYPE || undefined });
+process.stdout.write(`${JSON.stringify(result)}\n`);
+if (result.status === 'error') process.exitCode = 2;
+NODE
+) || exit 2
+printf '%s\n' "$RULES_RESULT"
+while IFS= read -r _file; do BOOTSTRAP_FILES+=("$_file"); done \
+  < <(printf '%s\n' "$RULES_RESULT" | jq -r '.created[]')
+if [[ ! -e "$REPO_ROOT/.claude/loop.md" && ! -L "$REPO_ROOT/.claude/loop.md" ]]; then
+  cp "$PLUGIN_ROOT/templates/_shared/loop.md" "$REPO_ROOT/.claude/loop.md"
+  BOOTSTRAP_FILES+=(.claude/loop.md)
+fi
+```
+
+The command prints a JSON report (`written` / `skipped` / `preserved` / `errors` / `warnings` / `sanitizer`) and exits non-zero on any error. Surface `errors[]` to the operator; a non-empty `preserved[]` is normal and means a repo-private rule was left alone.
+
+Also surface `sanitizer[]` (issue #1098) — `{file, line, kind, text}` records for citations that read fine inside the plugin repo and dangle once vendored (`repo-local-path`, `unresolvable-see-also`). The CLI additionally prints each one to stderr as `rules-sync: sanitizer <kind> <file>:<line> — <text>`. **Report it to the operator; do not act on it automatically** — the sanitizer never rewrites content and never changes the exit code, because silently stripping a citation would change a rule's meaning at vendoring time. A human decides whether the citation is a leak.
+
+The wrapper re-reads a configured private contract and passes its required plugin
+basenames into the canonical writer. The full set must resolve uniquely before
+any rule is written; source/provenance validation and local preservation still
+apply. On the public path, normal archetype filtering is unchanged. The selected
+ID is explicit during bootstrap; later `/bootstrap --sync-rules` can use the lock.
+
+Why: PSA-003 destructive-command safeguards require every consumer repo to carry the parallel-sessions rule. See issue #155. The `loop.md` vendor gives bare `/loop` a repo-aware maintenance prompt (issue #633 Hebel 3).
+
+Why one writer (issue #1060): a literal `cp` from a second source directory bypasses the pre-write validator AND lands a file carrying no provenance header. On the next `--sync-rules` a headerless file is classified as a repo-private override and preserved forever — so the plugin can never update it again, and whichever rival copy is smaller silently wins. For every basename declared in `rules/_index.md`, `rules-sync.mjs` is the sole writer: it owns the manifest, archetype scoping, basename-collision guard and pre-write validation. S99 may deliver baseline-only rules after excluding all plugin-owned basenames.
+
+Note: This step runs before S99/D99. Both the private local rule projection and the optional public fetch filter every basename in `rules/_index.md`, including currently nonmatching scoped entries. `parallel-sessions.md` and any future plugin-owned rule therefore remain under the same single writer.
+
+---
+
+## #agents-scaffold — Step: .claude/agents/ Scaffold (#189)
+
+Copy the opinionated agent templates into the consumer repo:
+
+```bash
+mkdir -p "$REPO_ROOT/.claude/agents"
+for _source in "$PLUGIN_ROOT/skills/bootstrap/templates/agents/"*.md; do
+  _target=".claude/agents/$(basename "$_source")"
+  if [[ ! -e "$REPO_ROOT/$_target" && ! -L "$REPO_ROOT/$_target" ]]; then
+    cp "$_source" "$REPO_ROOT/$_target"
+    BOOTSTRAP_FILES+=("$_target")
+  fi
+done
+```
+
+This scaffolds 3 opinionated agents (`project-discovery`, `project-code-review`, `project-quality-gate`) following CLAUDE.md Agent Authoring Rules. Consumer repos should edit descriptions/bodies to match project specifics — but keep the frontmatter structure intact (validated by `agent-frontmatter-invalid` probe).
+
+**Idempotency:** Existing files under `.claude/agents/` are not overwritten — skip any file that already exists.
+
+---
+
+## #vault-registration — Step: Vault-Registration Prompt (Product Repos) (#190)
+
+If this repo shows product-repo signals (framework dep + personas/content dir + product env vars), offer to register a vault entry in Session Config.
+
+**Detection (via `scripts/lib/product-repo-detect.mjs`):**
+
+```bash
+node --input-type=module -e "
+import { detectProductRepo, hasVaultConfig } from '${PLUGIN_ROOT}/scripts/lib/product-repo-detect.mjs';
+const result = detectProductRepo({ repoRoot: process.cwd() });
+const already = hasVaultConfig('$REPO_ROOT/CLAUDE.md') || hasVaultConfig('$REPO_ROOT/AGENTS.md');
+if (!result.isProductRepo || already) process.exit(0);
+process.stdout.write(JSON.stringify(result, null, 2));
+process.exit(10);  // signal: prompt user
+"
+```
+
+When the script exits 10 (product signals detected, no vault yet): prompt the user:
+
+Under `--no-interview`: skip this block and note `vault registration skipped (--no-interview)` in the bootstrap summary (contract: SKILL.md § Invocation flag table).
+
+> Repo appears to carry product data (framework: \<detected>, signals: \<list>). Create vault registration in Session Config? [Y/n]
+
+**On Y (default):** Append the following block to the `## Session Config` section of CLAUDE.md:
+
+```yaml
+vault:
+  path: ${VAULT_PATH:-$HOME/Projects/vault}
+  product-domain: <prompt user for a short domain tag, e.g. "buchhaltung", "lead-gen">
+  persona-db: <optional: path to persona data file, blank if N/A>
+```
+
+**On N:** skip silently. The detection may re-run on next bootstrap; idempotency comes from `hasVaultConfig` — once `vault:` exists in Session Config, the prompt is skipped.
+
+**Examples from real repos:**
+
+| Repo | Framework | Signals | Vault Entry |
+|------|-----------|---------|-------------|
+| ExampleSaaS | Next.js | supabase, stripe, personas/ | `product-domain: accounting` |
+| ExampleLeadGen | Next.js | stripe, posthog | `product-domain: lead-gen` |
+| ExamplePortfolio | Nuxt | postgres, sentry | `product-domain: portfolio` |
+
+**Idempotent.** If CLAUDE.md already has a `vault:` key inside Session Config, the prompt is skipped.
+
+---
+
+## #baseline-fetch — Step S99: (Optional) Fetch Canonical Rules + Agents from Baseline
+
+For `PATH_TYPE = private` and a confirmed archetype, this step applies only the
+validated local contract rule targets from `private-contract.md`. It is offline,
+rechecks conditional dependencies after scaffolding, preserves existing files,
+and fails closed on an invalid configured contract.
+
+For `PATH_TYPE = public`, the existing remote fetch remains OPT-IN and only
+executes when ALL of the following are true:
+- `baseline-ref` is present in Session Config (e.g., `baseline-ref: main`)
+- `GITLAB_TOKEN` env var is set
+- The session-orchestrator plugin includes `scripts/lib/fetch-baseline.mjs`
+- `GITLAB_HOST` env var is set (the committed `gitlab-host` Session Config key is never used for the token request)
+
+When triggered, this step pulls the canonical `.claude/rules/*.md` and (optionally) `.claude/agents/*.md` files directly from the baseline GitLab project (project 52 by default) into the new repo, then writes `.claude/.baseline-fetch.lock` recording the fetch.
+
+Without this step, rules arrive in the repo via Clank's weekly baseline sync MRs (the legacy path). This step short-circuits that delay so a freshly-bootstrapped repo starts with current rules immediately.
+
+**Implementation:**
+
+```bash
+if [[ "${PATH_TYPE:-public}" = "private" ]]; then
+  export PLUGIN_ROOT REPO_ROOT CONFIRMED_ARCHETYPE
+  BASELINE_RULES_RESULT=$(node --input-type=module <<'NODE'
+import { pathToFileURL } from 'node:url';
+const { applyBaselineRules } = await import(pathToFileURL(`${process.env.PLUGIN_ROOT}/scripts/lib/baseline-archetypes.mjs`).href);
+const result = await applyBaselineRules({
+  repoRoot: process.env.REPO_ROOT,
+  archetype: process.env.CONFIRMED_ARCHETYPE,
+});
+process.stdout.write(`${JSON.stringify(result)}\n`);
+if (result.status === 'error') process.exitCode = 2;
+NODE
+) || exit 2
+  printf '%s\n' "$BASELINE_RULES_RESULT"
+  while IFS= read -r _file; do BOOTSTRAP_FILES+=("$_file"); done \
+    < <(printf '%s\n' "$BASELINE_RULES_RESULT" | jq -r '.created[]')
+else
+BASELINE_REF=$(echo "$CONFIG" | jq -r '."baseline-ref" // empty')
+BASELINE_PROJECT_ID=$(echo "$CONFIG" | jq -r '."baseline-project-id" // "52"')
+
+# The .mjs fetcher requires a GitLab host (it fails closed with no private default).
+# GITLAB_TOKEN goes to that host, so it comes only from this machine's GITLAB_HOST
+# env var — never from the target repo's committed `gitlab-host` Session Config key.
+GITLAB_HOST_CFG=$(echo "$CONFIG" | jq -r '."gitlab-host" // empty')
+if [[ -z "${GITLAB_HOST:-}" && -n "$GITLAB_HOST_CFG" ]]; then
+  echo "Note: the committed gitlab-host is not used for the token request; set GITLAB_HOST in the environment to fetch from it"
+fi
+
+if [[ -n "$BASELINE_REF" && -n "${GITLAB_TOKEN:-}" && -n "${GITLAB_HOST:-}" && -f "$PLUGIN_ROOT/scripts/lib/fetch-baseline.mjs" ]]; then
+  # Default rule manifest — superset will harmlessly 404 individual files
+  # if the baseline ever drops one (cache will keep last-known-good).
+  RULES_MANIFEST=$(mktemp)
+  cat > "$RULES_MANIFEST" <<MANIFEST
+.claude/rules/development.md
+.claude/rules/security.md
+.claude/rules/security-web.md
+.claude/rules/security-compliance.md
+.claude/rules/testing.md
+.claude/rules/test-quality.md
+.claude/rules/frontend.md
+.claude/rules/backend.md
+.claude/rules/backend-data.md
+.claude/rules/infrastructure.md
+.claude/rules/swift.md
+.claude/rules/mvp-scope.md
+.claude/rules/cli-design.md
+.claude/rules/ai-agent.md
+.claude/rules/claude-code-usage.md
+MANIFEST
+  # Every plugin-owned basename is excluded, including currently unmatched scoped
+  # rules. rules-sync is their sole writer; ownership does not depend on scope.
+  export PLUGIN_ROOT RULES_MANIFEST
+  node --input-type=module <<'NODE'
+import { readFileSync, writeFileSync } from 'node:fs';
+import path from 'node:path';
+import { pathToFileURL } from 'node:url';
+const { pluginRuleTargets } = await import(pathToFileURL(`${process.env.PLUGIN_ROOT}/scripts/lib/baseline-archetypes.mjs`).href);
+const owned = new Set(pluginRuleTargets(process.env.PLUGIN_ROOT));
+const files = readFileSync(process.env.RULES_MANIFEST, 'utf8').split('\n')
+  .filter(file => file && !owned.has(path.posix.basename(file)));
+writeFileSync(process.env.RULES_MANIFEST, files.join('\n') + '\n');
+NODE
+
+  echo "Fetching canonical rules from baseline (project $BASELINE_PROJECT_ID, ref $BASELINE_REF)…"
+  # The .mjs CLI is single-file: it prints ONE file body to stdout, exit 0 on success
+  # (1=auth, 2=404, 3=network). There is no batch and no lock-write in the CLI — the
+  # bootstrap layer orchestrates the per-rule loop and writes the lock itself.
+  SUCCESS_LOG=$(mktemp)
+  _REAL_REPO_ROOT=$(cd "$REPO_ROOT" && pwd -P)
+  while IFS= read -r rule_path; do
+    [[ -z "$rule_path" ]] && continue
+    _RULE_TARGET="$REPO_ROOT/$rule_path"
+    _RULE_DIR=$(dirname "$_RULE_TARGET")
+    # Never write through a symlink: refuse a symlinked or directory target and any
+    # symlinked directory between REPO_ROOT and the target.
+    _RULE_UNSAFE=false
+    if [[ -L "$_RULE_TARGET" || -d "$_RULE_TARGET" ]]; then _RULE_UNSAFE=true; fi
+    _RULE_WALK="$REPO_ROOT"
+    IFS='/' read -ra _RULE_PARTS <<< "$(dirname "$rule_path")"
+    for _part in "${_RULE_PARTS[@]}"; do
+      if [[ -z "$_part" || "$_part" = . ]]; then continue; fi
+      if [[ "$_part" = .. ]]; then _RULE_UNSAFE=true; break; fi
+      _RULE_WALK="$_RULE_WALK/$_part"
+      if [[ -L "$_RULE_WALK" ]]; then _RULE_UNSAFE=true; break; fi
+    done
+    if [[ "$_RULE_UNSAFE" = true ]]; then
+      echo "baseline-fetch: $rule_path is a symlink or lies under one — skipped" >&2
+      continue
+    fi
+    _RULE_CREATED=false
+    [[ -e "$_RULE_TARGET" ]] || _RULE_CREATED=true
+    mkdir -p "$_RULE_DIR"
+    case "$(cd "$_RULE_DIR" && pwd -P)/" in
+      "$_REAL_REPO_ROOT"/*) ;;
+      *) echo "baseline-fetch: $rule_path resolves outside the repository — skipped" >&2; continue ;;
+    esac
+    # Fetch into a temp file beside the target; only a complete, non-empty body
+    # replaces the rule, so a failed fetch keeps the previous copy.
+    _RULE_TMP=$(mktemp "$_RULE_DIR/.baseline-fetch.XXXXXX") || continue
+    if node "$PLUGIN_ROOT/scripts/lib/fetch-baseline.mjs" \
+         "$BASELINE_PROJECT_ID" "$rule_path" "$BASELINE_REF" > "$_RULE_TMP" \
+       && [[ -s "$_RULE_TMP" && ! -L "$_RULE_TARGET" && ! -d "$_RULE_TARGET" ]] \
+       && chmod "$(printf '%04o' $(( 0666 & ~0$(umask) )))" "$_RULE_TMP" \
+       && mv -f "$_RULE_TMP" "$_RULE_TARGET"; then
+      printf '%s\n' "$rule_path" >> "$SUCCESS_LOG"
+      if [[ "$_RULE_CREATED" = true ]]; then BOOTSTRAP_FILES+=("$rule_path"); fi
+    else
+      # A 404 (or any error) for one rule must not abort the batch — drop only the
+      # temp file and continue with the next manifest line.
+      rm -f "$_RULE_TMP"
+    fi
+  done < "$RULES_MANIFEST"
+
+  if [[ -s "$SUCCESS_LOG" ]]; then
+    FETCHED_JSON=$(jq -R . < "$SUCCESS_LOG" | jq -s .)
+    LOCK_FILE="$REPO_ROOT/.claude/.baseline-fetch.lock"
+    _FETCH_LOCK_CREATED=false
+    [[ -e "$LOCK_FILE" || -L "$LOCK_FILE" ]] || _FETCH_LOCK_CREATED=true
+    # Same rule as the rule loop: never write through a symlinked lock or .claude/,
+    # and replace the lock only from a complete temp file inside .claude/.
+    _LOCK_TMP=""
+    if [[ -L "$REPO_ROOT/.claude" || -L "$LOCK_FILE" || -d "$LOCK_FILE" ]]; then
+      echo "baseline-fetch: .claude/.baseline-fetch.lock is a symlink or lies under one — lock not written" >&2
+    else
+      mkdir -p "$REPO_ROOT/.claude"
+      case "$(cd "$REPO_ROOT/.claude" && pwd -P)/" in
+        "$_REAL_REPO_ROOT"/*) _LOCK_TMP=$(mktemp "$REPO_ROOT/.claude/.baseline-fetch.lock.XXXXXX") || _LOCK_TMP="" ;;
+        *) echo "baseline-fetch: .claude/ resolves outside the repository — lock not written" >&2 ;;
+      esac
+    fi
+    if [[ -n "$_LOCK_TMP" ]] \
+       && FETCHED_JSON="$FETCHED_JSON" BASELINE_PROJECT_ID="$BASELINE_PROJECT_ID" \
+          BASELINE_REF="$BASELINE_REF" LOCK_FILE="$_LOCK_TMP" \
+          node --input-type=module -e "
+      import { writeFileSync } from 'node:fs';
+      const files = JSON.parse(process.env.FETCHED_JSON);
+      const lock = {
+        version: 1,
+        project_id: Number(process.env.BASELINE_PROJECT_ID),
+        baseline_ref: process.env.BASELINE_REF,
+        fetched_at: new Date().toISOString().replace(/\.\d{3}Z\$/, 'Z'),
+        files,
+      };
+      writeFileSync(process.env.LOCK_FILE, JSON.stringify(lock, null, 2) + '\n');
+    " \
+       && [[ -s "$_LOCK_TMP" && ! -L "$LOCK_FILE" && ! -d "$LOCK_FILE" ]] \
+       && chmod "$(printf '%04o' $(( 0666 & ~0$(umask) )))" "$_LOCK_TMP" \
+       && mv -f "$_LOCK_TMP" "$LOCK_FILE"; then
+      echo "Wrote .claude/.baseline-fetch.lock ($(wc -l < "$SUCCESS_LOG" | tr -d ' ') files)"
+      if [[ "$_FETCH_LOCK_CREATED" = true ]]; then BOOTSTRAP_FILES+=(.claude/.baseline-fetch.lock); fi
+    else
+      if [[ -n "$_LOCK_TMP" ]]; then rm -f "$_LOCK_TMP"; fi
+      echo "WARNING: .claude/.baseline-fetch.lock was not written; the fetched rules are in place" >&2
+    fi
+  else
+    echo "WARNING: baseline fetch produced no files; rules will arrive via Clank sync MRs (legacy path)" >&2
+  fi
+  rm -f "$SUCCESS_LOG"
+  rm -f "$RULES_MANIFEST"
+else
+  echo "Skipping baseline fetch: baseline-ref / GITLAB_TOKEN / GITLAB_HOST not configured (legacy Clank-sync path)"
+fi
+fi
+```
+
+**Failure handling:** A private contract/apply error aborts bootstrap. For the public optional remote path, if the fetch fails, this step DOES NOT abort bootstrap. The repo still has its scaffold; rules will arrive via the legacy Clank weekly sync MR. The user is informed via stderr.
+
+**Idempotency:** Private local rules preserve existing files and report them for review. On the public optional remote path, re-running bootstrap on an existing repo will overwrite `.claude/rules/*.md` files. Local edits to baseline rules in a repo will be lost on re-fetch — this is intentional (rules are canonical). Repo-specific extensions belong in `.claude/rules/local/*.md` (not fetched).
+
+---
+
+## #quality-gate-policy — Step 6.5: Quality-Gate Policy File (#183)
+
+Write canonical commands to `.orchestrator/policy/quality-gates.json`. A private
+contract supplies exact test/typecheck/lint IDs, with `false` and an unavailable
+reason for absent IDs. Public bootstrap retains package-manager defaults.
+
+**Idempotency:** Skip this step if `.orchestrator/policy/quality-gates.json` already exists. Do not overwrite user edits.
+
+```bash
+POLICY_FILE="$REPO_ROOT/.orchestrator/policy/quality-gates.json"
+if [[ "${PATH_TYPE:-public}" = private ]]; then
+  export PLUGIN_ROOT REPO_ROOT CONFIRMED_ARCHETYPE
+  POLICY_RESULT=$(node --input-type=module <<'NODE'
+import { pathToFileURL } from 'node:url';
+const { writeBaselineQualityPolicy } = await import(pathToFileURL(`${process.env.PLUGIN_ROOT}/scripts/lib/baseline-archetypes.mjs`).href);
+const result = await writeBaselineQualityPolicy({ repoRoot: process.env.REPO_ROOT, archetype: process.env.CONFIRMED_ARCHETYPE });
+process.stdout.write(`${JSON.stringify(result)}\n`);
+if (result.status === 'error') process.exitCode = 2;
+NODE
+) || exit 2
+  printf '%s\n' "$POLICY_RESULT"
+  while IFS= read -r _file; do BOOTSTRAP_FILES+=("$_file"); done \
+    < <(printf '%s\n' "$POLICY_RESULT" | jq -r '.created[]')
+elif [[ ! -e "$POLICY_FILE" && ! -L "$POLICY_FILE" ]]; then
+  mkdir -p "$REPO_ROOT/.orchestrator/policy"
+  # Detect package manager via scripts/lib/package-manager.mjs (falls back to npm defaults)
+  PM_JSON="$(node --input-type=module -e "
+    import { detectPackageManager, defaultQualityGateCommands } from '$PLUGIN_ROOT/scripts/lib/package-manager.mjs';
+    const pm = detectPackageManager('$REPO_ROOT');
+    process.stdout.write(JSON.stringify(defaultQualityGateCommands(pm)));
+  " 2>/dev/null)"
+
+  # Fallback if node helper unavailable: hardcode npm defaults
+  if [[ -z "$PM_JSON" ]]; then
+    PM_JSON='{"test":{"command":"npm test","required":true},"typecheck":{"command":"npm run typecheck","required":true},"lint":{"command":"npm run lint","required":true}}'
+  fi
+
+  jq -n --argjson cmds "$PM_JSON" '{
+    "version": 1,
+    "rationale": "Canonical quality-gate commands. Generated by bootstrap. Edit to change test/typecheck/lint invocations across skills. Schema: .orchestrator/policy/quality-gates.schema.json",
+    "commands": $cmds
+  }' > "$POLICY_FILE"
+  BOOTSTRAP_FILES+=(.orchestrator/policy/quality-gates.json)
+  echo "Wrote $POLICY_FILE"
+fi
+```
+
+---
+
+## #state-md-scaffold — Step 6.6: STATE.md Scaffold (#184)
+
+Scaffold a placeholder `.claude/STATE.md`. <!-- path-check: example -->
+Use the template at `skills/bootstrap/STATE.md.template`; the placeholder records `status: idle` — sessions overwrite it at Pre-Wave 1b.
+
+**Idempotency:** Skip if `.claude/STATE.md` already exists. <!-- path-check: example -->
+
+```bash
+STATE_FILE="$REPO_ROOT/.claude/STATE.md"
+if [[ ! -e "$STATE_FILE" && ! -L "$STATE_FILE" ]]; then
+  mkdir -p "$REPO_ROOT/.claude"
+  ISO_NOW="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  sed "s|<ISO>|$ISO_NOW|g" "$PLUGIN_ROOT/skills/bootstrap/STATE.md.template" > "$STATE_FILE"
+  BOOTSTRAP_FILES+=(.claude/STATE.md)
+  echo "Wrote $STATE_FILE"
+fi
+```
+
+On Codex CLI / Cursor IDE, substitute `.codex/` or `.cursor/` for `.claude/` per the platform state-directory convention.
+
+---
+
+## #store-lock-ignore — Store-Lock and Runtime-Lock Artifacts in .gitignore (#1487, #1489 Pkt 17, #1495, #1500)
+
+Applied by Fast Step 3 (so by every tier), by the Upgrade Flow and by the Refresh-Lock Flow in `SKILL.md` — the last two because a repo bootstrapped before this step existed never gets it otherwise: both flows write no `.gitignore` of their own.
+
+`.orchestrator/` itself stays versioned: `bootstrap.lock`, `policy/`, `steering/`, `peers/` and the `.orchestrator/metrics/*.jsonl` ledgers are durable project data. What the plugin writes there at runtime is per-process state or a per-run artifact that a `git add -A` would otherwise commit — the session lock is rewritten on every SessionStart, every store rewrite leaves a full backup copy of the ledger beside it, the auto-dream sidecar is a full replacement body of the operator's private MEMORY.md, and the quality-gate and ux-grill artifacts can carry secrets or a rendered password. Each pattern below names one writer's file, its `.acquire` guard where it has one, and its own temp files (left behind only by a crash mid-write). Rotated and archived ledger copies (`*.jsonl.[0-9]*`, `*.jsonl.archive-*`, `metrics/_archive/`) are ignored too (owner decision 2026-10-03, #1507 Pkt 4): the live `*.jsonl` ledger is the versioned record, and the rotated history beside it is not.
+
+| Pattern(s) | Written by |
+|---|---|
+| `.orchestrator/metrics/*.jsonl.lock*`, `.file.lock.*` | the store locks of the ledgers (`scripts/lib/file-lock.mjs` temps sit beside every lock) |
+| `.orchestrator/metrics/*.jsonl.bak-*` | the store backups: the keep-3 `<store>.bak-<ISO>` copy before every learnings rewrite (`scripts/lib/learnings/io.mjs`) and the `<stem>.pre-drop-malformed.jsonl.bak-<ISO>` snapshot of `sweep-expired-learnings --drop-malformed` (`scripts/lib/learnings/expiry-sweep.mjs`); the `*.jsonl` ledgers themselves stay versioned |
+| `.orchestrator/session.lock`, `.orchestrator/.session.lock.*` | the session lock, every SessionStart (`scripts/lib/session-lock.mjs`, `hooks/_lib/lock-bootstrap.mjs`) |
+| `.orchestrator/runtime/` | the lock-owner proof written beside it on every SessionStart, plus agent-status and cache files |
+| `.orchestrator/current-session.json`, `.orchestrator/.current-session.*` | the SessionStart hook |
+| `.orchestrator/host.json*` | the host-identity cache |
+| `.orchestrator/state.lock*`, `.orchestrator/.state.lock.*` | the STATE.md write lock |
+| `.orchestrator/rules.lock*` | the `/reconcile` rules lock |
+| `.orchestrator/wave-dispatch-scopes.*`, `.orchestrator/.wave-dispatch-scopes.*` | the dispatch-scope ledger and its lock (`hooks/pre-task-scope-disjoint.mjs`) |
+| `.orchestrator/wave-transcript-tail.lock*`, `.orchestrator/.wave-transcript-tail.lock.*` | the wave-transcript-tail singleton |
+| `.orchestrator/metrics/proposals-write.lock*`, `.orchestrator/metrics/.proposals-write.lock.*` | the memory-proposals store lock |
+| `.orchestrator/staging-fence/` | the staging-fence commit mutex and intent log |
+| `.orchestrator/tmp/` | machine-local scratch: lock-reaper archives of reaped session locks (`tmp/reaped-locks/`, carrying host name, pid and session ids), worktree metadata (`tmp/worktree-meta/`), the orphan-reaper throttle marker (`tmp/reaper-last-scan`) |
+| `.orchestrator/metrics/*.jsonl.bak.*` | the legacy evolve backup `learnings.jsonl.bak.evolve-<ts>`, a full store copy still on disk in older repos (`scripts/lib/learnings/io.mjs`) |
+| `.orchestrator/metrics/*.jsonl.[0-9]*`, `.orchestrator/metrics/*.jsonl.archive-*`, `.orchestrator/metrics/_archive/` | rotated ledger history of the events log (`scripts/lib/events.mjs`): the legacy numbered `events.jsonl.<n>` slots, older `*.jsonl.archive-*` copies and the `_archive/` directory of rotated `events-<first>_<last>.jsonl` files (`scripts/lib/events-schema.mjs`); the live `*.jsonl` ledgers stay versioned |
+| `.orchestrator/metrics/*.jsonl.tmp-*` | atomic-write temp files of the ledgers (`scripts/lib/autopilot/telemetry.mjs`), left behind only by a crash |
+| `.orchestrator/metrics/.*.tmp.*` | temp files of the shared atomic writers (`scripts/lib/io.mjs`, named `.<base>.tmp.<hex>`), left behind only by a crash |
+| `.orchestrator/pending-dream.md` | the auto-dream sidecar — a full replacement body of the private MEMORY.md (`scripts/lib/auto-dream.mjs`) |
+| `.orchestrator/dialectic-pending.md`, `.orchestrator/dialectic-last-run`, `.orchestrator/consumed/` | the auto-dialectic sidecar, its last-run timestamp and the archive of consumed sidecars (`scripts/lib/auto-dialectic.mjs`) |
+| `.orchestrator/promoted-from.json` | the worktree-promotion marker, a per-worktree fact (`scripts/lib/autopilot/worktree-pipeline.mjs`, read by `scripts/lib/session-end/worktree-cleanup.mjs`) |
+| `.orchestrator/welcome-banner-pending` | the zero-byte cold-start marker (`scripts/migrate-cold-start-seed.mjs`, read by `scripts/lib/cold-start-detector.mjs`) |
+| `.orchestrator/debug/` | the `/debug` Phase-1 investigation artifacts |
+| `.orchestrator/eval/` | the eval HTML run reports, rebuildable from `eval.jsonl` (`scripts/lib/eval/report.mjs`) |
+| `.orchestrator/metrics/verification-failures/` | the quality-gate auto-fix diagnostics bundles, which can carry secrets from gate output (`scripts/lib/quality-gate.mjs`) |
+| `.orchestrator/metrics/ux-grill/`, `.orchestrator/metrics/test-runs/` | the per-run artifact directories of `/ux-grill` and `/test`, screenshots included — ux-grill takes one after every journey step, including the step after a password fill (`scripts/lib/ux-grill/paths.mjs`, `scripts/lib/test-runner/artifact-paths.mjs`); their `*.jsonl` rollups stay versioned |
+| `.orchestrator/metrics/repo-audit-*.json` | the `/repo-audit` JSON sidecar of each run |
+| `.orchestrator/metrics/proposals-summary-*.json` | the per-wave memory-proposals summary sidecars (`scripts/lib/memory-proposals/sink.mjs`) |
+| `.orchestrator/metrics/.backfilled-*.marker` | the session-close-backfill idempotency markers (`scripts/lib/session-close-backfill.mjs`) |
+| `.orchestrator/*.log`, `.orchestrator/metrics/*.log` | the append-only diagnostic logs: the declined-proposal archives `reconcile.rejected.log` (`scripts/lib/reconcile/writer.mjs`) and `proposals.rejected.log` (`scripts/lib/memory-proposals/sink.mjs`), and `metrics/session-close-backfill.log`, whose `error` text carries fs error messages with absolute paths (`scripts/lib/session-close-backfill.mjs`) |
+
+Append the missing patterns:
+
+```bash
+# The Upgrade and Refresh-Lock flows run in a fresh shell where REPO_ROOT may be unset.
+_GI_ROOT="${REPO_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null)}"
+_GI="$_GI_ROOT/.gitignore"
+_GI_MISSING=()
+_GI_UNREADABLE=false
+# Never add a file consumers COMMIT here: .orchestrator/bootstrap.lock, policy/, steering/, the *.jsonl ledgers.
+_GI_PATTERNS=(
+  '.orchestrator/metrics/*.jsonl.lock*' '.file.lock.*'
+  '.orchestrator/metrics/*.jsonl.bak-*'
+  '.orchestrator/session.lock' '.orchestrator/.session.lock.*'
+  '.orchestrator/runtime/'
+  '.orchestrator/current-session.json' '.orchestrator/.current-session.*'
+  '.orchestrator/host.json*'
+  '.orchestrator/state.lock*' '.orchestrator/.state.lock.*'
+  '.orchestrator/rules.lock*'
+  '.orchestrator/wave-dispatch-scopes.*' '.orchestrator/.wave-dispatch-scopes.*'
+  '.orchestrator/wave-transcript-tail.lock*' '.orchestrator/.wave-transcript-tail.lock.*'
+  '.orchestrator/metrics/proposals-write.lock*' '.orchestrator/metrics/.proposals-write.lock.*'
+  '.orchestrator/staging-fence/'
+  '.orchestrator/tmp/'
+  '.orchestrator/metrics/*.jsonl.bak.*' '.orchestrator/metrics/*.jsonl.tmp-*' '.orchestrator/metrics/.*.tmp.*'
+  '.orchestrator/metrics/*.jsonl.[0-9]*' '.orchestrator/metrics/*.jsonl.archive-*' '.orchestrator/metrics/_archive/'
+  '.orchestrator/pending-dream.md'
+  '.orchestrator/dialectic-pending.md' '.orchestrator/dialectic-last-run' '.orchestrator/consumed/'
+  '.orchestrator/promoted-from.json'
+  '.orchestrator/welcome-banner-pending'
+  '.orchestrator/debug/'
+  '.orchestrator/eval/'
+  '.orchestrator/metrics/verification-failures/'
+  '.orchestrator/metrics/ux-grill/' '.orchestrator/metrics/test-runs/'
+  '.orchestrator/metrics/repo-audit-*.json'
+  '.orchestrator/metrics/proposals-summary-*.json'
+  '.orchestrator/metrics/.backfilled-*.marker'
+  '.orchestrator/*.log' '.orchestrator/metrics/*.log'
+)
+if [[ -z "$_GI_ROOT" ]]; then
+  # No repo root: never fall back to "/.gitignore" (a stray file at / when run as root).
+  echo "store-lock-ignore: no repository root (REPO_ROOT unset, not inside a repo) — skipped" >&2
+elif [[ ! -e "$_GI" ]]; then
+  _GI_MISSING=("${_GI_PATTERNS[@]}")
+else
+  for _pat in "${_GI_PATTERNS[@]}"; do
+    # A CRLF .gitignore stores "pattern\r" — count that as present, or every run appends a duplicate block.
+    _gi_rc=0; grep -qxF -- "$_pat" "$_GI" 2>/dev/null || _gi_rc=$?
+    if [[ $_gi_rc -eq 1 ]]; then _gi_rc=0; grep -qxF -- "$_pat"$'\r' "$_GI" 2>/dev/null || _gi_rc=$?; fi
+    # grep exit 2 = the file could not be read (a denial `-r` does not see, e.g. a Windows ACL).
+    if [[ $_gi_rc -gt 1 ]]; then _GI_UNREADABLE=true; break; fi
+    if [[ $_gi_rc -eq 1 ]]; then _GI_MISSING+=("$_pat"); fi
+  done
+  if [[ "$_GI_UNREADABLE" = true ]]; then
+    echo "store-lock-ignore: $_GI could not be read — append skipped" >&2
+    _GI_MISSING=()
+  fi
+fi
+# An unreadable .gitignore (e.g. mode 0200) defeats both the presence check and the newline check — leave it alone.
+if [[ -n "$_GI_ROOT" && ! -L "$_GI" && ( ! -e "$_GI" || -r "$_GI" ) && ${#_GI_MISSING[@]} -gt 0 ]]; then
+  # A last line without a trailing newline would fuse with the comment below: `.env` + `# …`
+  # becomes `.env# …`, which git no longer reads as `.env` — the append would UN-ignore it.
+  if [[ -s "$_GI" && -n "$(tail -c1 "$_GI")" ]]; then printf '\n' >> "$_GI"; fi
+  printf '%s\n' '# session-orchestrator runtime locks and state (never versioned)' "${_GI_MISSING[@]}" >> "$_GI"
+fi
+```
+
+Idempotent (only missing patterns are appended — a repo that already carries the two store-lock lines from before #1495 gets just the runtime lines), and a symlinked `.gitignore` is left alone. A `.gitignore` created earlier in the same run is already in `BOOTSTRAP_FILES` and is committed with that run; an append to a pre-existing one stays an unstaged change, because no bootstrap commit stages a file bootstrap did not create (the Upgrade Flow stages only its delta files, the Refresh-Lock Flow commits nothing). Name the append in the flow's report so the operator commits it.

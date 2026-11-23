@@ -1,0 +1,447 @@
+/**
+ * subagents-schema.mjs — schema module for subagent lifecycle records.
+ *
+ * Mirrors learnings.mjs style: Zod-free, custom ValidationError, validate /
+ * normalize / migrate / append / read functions. No top-level side effects.
+ *
+ * Part of issue #342 (PostToolUseFailure + PostToolBatch + SubagentStart/Stop
+ * hook handlers). W1-Part1 scope: schema module only.
+ *
+ * Canonical schema (schema_version: 1):
+ *   timestamp         ISO 8601 string — when the event occurred
+ *   event             'start' | 'stop' — lifecycle event type
+ *   agent_id          string — unique identifier for the subagent instance
+ *   schema_version    1 (integer)
+ *
+ * Required for event='stop':
+ *   duration_ms       positive integer | null — wall-clock time from start to stop.
+ *                     null means "unknown": the producer could not recover a
+ *                     matching 'start' record to measure against (#917). null is
+ *                     an honest absence and is NOT interchangeable with 0.
+ *
+ * duration_ms provenance (#917) — why the write path and the read path differ:
+ *   Before #917 the producer defaulted duration_ms to 0 whenever the harness
+ *   omitted it, which it always does. Every stop record written up to that point
+ *   therefore carries a fabricated 0 (measured 2026-07-30: 2770 of 2770 stop
+ *   records in .orchestrator/metrics/subagents.jsonl). Those records still have
+ *   to read and migrate cleanly, so validation is lenient BY DEFAULT and accepts
+ *   0. Callers on the WRITE path opt into `{ strictDuration: true }`, which
+ *   rejects 0 outright — appendSubagent() does this, so no new record can
+ *   reintroduce the fabricated zero.
+ *
+ * Optional:
+ *   agent_type        string | null — e.g. 'explore', 'writer', 'test-writer'
+ *   parent_session_id string | null — session that spawned this subagent
+ *   token_input       integer | null — BILLABLE PROMPT VOLUME for this subagent.
+ *                     schema_version 1: raw `usage.input_tokens` only.
+ *                     schema_version 2 (#1244, 2026-09-09): uncached + cache_read +
+ *                     cache_creation. This is a REDEFINITION — a v1 and a v2 value
+ *                     are not comparable and must never be summed together.
+ *   token_input_uncached  integer | null — raw `usage.input_tokens` (v2+)
+ *   token_cache_read      integer | null — `usage.cache_read_input_tokens` (v2+)
+ *   token_cache_creation  integer | null — `usage.cache_creation_input_tokens` (v2+)
+ *   token_output      integer | null — completion token count for this subagent
+ *   model             string  | null — model id from the transcript (v2+); null when
+ *                                      the transcript exposes none, or when its token-
+ *                                      bearing turns used two or more models or one turn
+ *                                      named none (#1470). Required to price the record —
+ *                                      see scripts/lib/telemetry/pricing.mjs.
+ *   models_usage      array   | absent — per-model breakdown of a record whose token-
+ *                                      bearing turns used two or more models, every
+ *                                      one named (#1470): [{ model, token_input_uncached,
+ *                                      token_cache_read, token_cache_creation,
+ *                                      token_output }], one entry per model. The session
+ *                                      rollup prices each part; absent on every other record.
+ *   total_cost_usd    number  | null — native total cost in USD (#624, fractional,
+ *                                      best-effort: null when the harness does not
+ *                                      expose it; no rate table is applied)
+ *   cost_basis        'api-list-equivalent' | null — explicitly supplied cost
+ *                                      provenance; null means unknown (#1543)
+ *
+ * OTel aliases (optional, stop-only, additive — #411, schema_version=1 backwards-compat):
+ *   gen_ai.usage.input_tokens   integer | null — RAW UNCACHED prompt tokens (OTel
+ *                                                semantic). Under schema_version 2
+ *                                                this is deliberately ≠ token_input.
+ *   gen_ai.usage.cache_read_input_tokens      integer | null (v2+)
+ *   gen_ai.usage.cache_creation_input_tokens  integer | null (v2+)
+ *   gen_ai.usage.output_tokens  integer | null — alias of token_output
+ *   gen_ai.system               'anthropic'    — AI provider identifier
+ */
+
+import { readFile, appendFile, mkdir } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import path from 'node:path';
+import { COST_BASIS } from './telemetry/pricing.mjs';
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/** Current subagent-record schema version (2 since #1244, 2026-09-09). */
+export const CURRENT_SCHEMA_VERSION = 2;
+
+/**
+ * Schema versions this module reads. v1 records stay valid forever — the ledger
+ * is append-only — but their `token_input` means something different (see the
+ * module header), which is why consumers gate on the version rather than trust
+ * the field name.
+ */
+export const SUPPORTED_SCHEMA_VERSIONS = Object.freeze([1, 2]);
+
+/**
+ * Version assumed for a record read from disk that carries none. It is 1, NOT
+ * `CURRENT_SCHEMA_VERSION`: a versionless record predates the field, so
+ * stamping it with the current version would relabel legacy token semantics as
+ * v2 and let the rollup sum a raw-input-only figure into a billable-volume
+ * total — exactly the silent mixing #1244 exists to prevent.
+ */
+export const LEGACY_SCHEMA_VERSION = 1;
+
+/** Allowed event values. */
+export const VALID_EVENTS = Object.freeze(['start', 'stop']);
+
+// ---------------------------------------------------------------------------
+// ValidationError
+// ---------------------------------------------------------------------------
+
+export class ValidationError extends Error {
+  /**
+   * @param {string} message
+   * @param {string|undefined} field — optional field name that triggered the error
+   */
+  constructor(message, field) {
+    super(message);
+    this.name = 'ValidationError';
+    this.field = field;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Validate
+// ---------------------------------------------------------------------------
+
+/**
+ * Validate a subagent record. Throws ValidationError on any constraint
+ * violation. Does NOT mutate the input.
+ *
+ * Required fields: timestamp, event, agent_id, schema_version.
+ * Additional requirement when event='stop': duration_ms (integer or null).
+ * Optional: agent_type, parent_session_id, token_input, token_output, the cache
+ * buckets, model, models_usage, total_cost_usd and the OTel aliases.
+ *
+ * @param {object} entry
+ * @param {object} [options]
+ * @param {boolean} [options.strictDuration=false] — when true, a stop record's
+ *   duration_ms must be a POSITIVE integer or null; 0 is rejected. Write-path
+ *   callers set this; readers/migrations leave it false so the pre-#917 corpus
+ *   (every stop record carrying a fabricated 0) still validates. See the module
+ *   header § duration_ms provenance.
+ * @returns {object} the entry (unchanged) — validation is side-effect-free
+ * @throws {ValidationError}
+ */
+export function validateSubagent(entry, options = {}) {
+  const strictDuration = options?.strictDuration === true;
+  if (!entry || typeof entry !== 'object') {
+    throw new ValidationError('subagent record must be a non-null object');
+  }
+
+  // schema_version — v1 and v2 both validate (append-only ledger, #1244).
+  if (!SUPPORTED_SCHEMA_VERSIONS.includes(entry.schema_version)) {
+    throw new ValidationError(
+      `schema_version must be one of ${SUPPORTED_SCHEMA_VERSIONS.join('|')}, got: ${entry.schema_version}`,
+      'schema_version',
+    );
+  }
+
+  // timestamp
+  if (typeof entry.timestamp !== 'string' || !entry.timestamp.trim()) {
+    throw new ValidationError('timestamp must be a non-empty ISO 8601 string', 'timestamp');
+  }
+  if (Number.isNaN(Date.parse(entry.timestamp))) {
+    throw new ValidationError(
+      `timestamp is not a valid ISO 8601 date: ${entry.timestamp}`,
+      'timestamp',
+    );
+  }
+
+  // event
+  if (!VALID_EVENTS.includes(entry.event)) {
+    throw new ValidationError(
+      `event must be one of ${VALID_EVENTS.join('|')}, got: ${entry.event}`,
+      'event',
+    );
+  }
+
+  // agent_id
+  if (typeof entry.agent_id !== 'string' || !entry.agent_id.trim()) {
+    throw new ValidationError('agent_id must be a non-empty string', 'agent_id');
+  }
+
+  // duration_ms — required for stop events.
+  //
+  // null is an explicit, honest "duration unknown" (#917) — the producer found no
+  // matching 'start' record to measure against. It is deliberately distinct from
+  // 0, which under strictDuration is rejected as the signature of the pre-#917
+  // fabricated default. `undefined` still throws in BOTH modes: a stop record
+  // that omits the field entirely is a producer bug, not an unknown duration.
+  if (entry.event === 'stop' && entry.duration_ms !== null) {
+    const floor = strictDuration ? 1 : 0;
+    if (
+      typeof entry.duration_ms !== 'number' ||
+      !Number.isInteger(entry.duration_ms) ||
+      entry.duration_ms < floor
+    ) {
+      throw new ValidationError(
+        strictDuration
+          ? 'duration_ms must be a positive integer or null when event=stop (0 is not a measurement)'
+          : 'duration_ms must be a non-negative integer or null when event=stop',
+        'duration_ms',
+      );
+    }
+  }
+
+  // agent_type (optional)
+  if (entry.agent_type !== undefined && entry.agent_type !== null && typeof entry.agent_type !== 'string') {
+    throw new ValidationError('agent_type must be a string or null', 'agent_type');
+  }
+
+  // parent_session_id (optional)
+  if (
+    entry.parent_session_id !== undefined &&
+    entry.parent_session_id !== null &&
+    typeof entry.parent_session_id !== 'string'
+  ) {
+    throw new ValidationError('parent_session_id must be a string or null', 'parent_session_id');
+  }
+
+  // token_input (optional)
+  if (entry.token_input !== undefined && entry.token_input !== null) {
+    if (typeof entry.token_input !== 'number' || !Number.isInteger(entry.token_input) || entry.token_input < 0) {
+      throw new ValidationError('token_input must be a non-negative integer or null', 'token_input');
+    }
+  }
+
+  // token_output (optional)
+  if (entry.token_output !== undefined && entry.token_output !== null) {
+    if (typeof entry.token_output !== 'number' || !Number.isInteger(entry.token_output) || entry.token_output < 0) {
+      throw new ValidationError('token_output must be a non-negative integer or null', 'token_output');
+    }
+  }
+
+  // Cache-bucket fields (optional, #1244 / schema_version 2). Same
+  // non-negative-integer-or-null contract as token_input above.
+  for (const field of ['token_input_uncached', 'token_cache_read', 'token_cache_creation']) {
+    const value = entry[field];
+    if (value !== undefined && value !== null) {
+      if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
+        throw new ValidationError(`${field} must be a non-negative integer or null`, field);
+      }
+    }
+  }
+
+  // model (optional, #1244) — the transcript's model id; null is an honest
+  // absence and makes the record unpriceable, never free.
+  if (entry.model !== undefined && entry.model !== null && typeof entry.model !== 'string') {
+    throw new ValidationError('model must be a string or null', 'model');
+  }
+
+  // models_usage (optional, #1470) — per-model parts of a mixed-model record.
+  // Each part is priced on its own, so each needs a model and four buckets.
+  if (entry.models_usage !== undefined && entry.models_usage !== null) {
+    if (!Array.isArray(entry.models_usage)) {
+      throw new ValidationError('models_usage must be an array or null', 'models_usage');
+    }
+    for (const part of entry.models_usage) {
+      const bucketsValid = ['token_input_uncached', 'token_cache_read', 'token_cache_creation', 'token_output']
+        .every((field) => Number.isInteger(part?.[field]) && part[field] >= 0);
+      if (typeof part?.model !== 'string' || part.model.length === 0 || !bucketsValid) {
+        throw new ValidationError(
+          'models_usage entries must carry a model string and four non-negative integer token buckets',
+          'models_usage'
+        );
+      }
+    }
+  }
+
+  // total_cost_usd (optional, #624) — fractional number (not integer), best-effort.
+  if (entry.total_cost_usd !== undefined && entry.total_cost_usd !== null) {
+    if (typeof entry.total_cost_usd !== 'number' || !Number.isFinite(entry.total_cost_usd) || entry.total_cost_usd < 0) {
+      throw new ValidationError('total_cost_usd must be a non-negative number or null', 'total_cost_usd');
+    }
+  }
+
+  // #1543 additive: never infer provenance from a native dollar value.
+  if (entry.cost_basis !== undefined && entry.cost_basis !== null && entry.cost_basis !== COST_BASIS) {
+    throw new ValidationError(`cost_basis must be ${COST_BASIS} or null`, 'cost_basis');
+  }
+
+  // OTel alias — #411 additive, schema_version=1 backwards-compat
+  const otelInputTokens = entry['gen_ai.usage.input_tokens'];
+  if (otelInputTokens !== undefined && otelInputTokens !== null) {
+    if (typeof otelInputTokens !== 'number' || !Number.isInteger(otelInputTokens) || otelInputTokens < 0) {
+      throw new ValidationError('gen_ai.usage.input_tokens must be a non-negative integer or null', 'gen_ai.usage.input_tokens');
+    }
+  }
+
+  // OTel alias — #411 additive, schema_version=1 backwards-compat
+  const otelOutputTokens = entry['gen_ai.usage.output_tokens'];
+  if (otelOutputTokens !== undefined && otelOutputTokens !== null) {
+    if (typeof otelOutputTokens !== 'number' || !Number.isInteger(otelOutputTokens) || otelOutputTokens < 0) {
+      throw new ValidationError('gen_ai.usage.output_tokens must be a non-negative integer or null', 'gen_ai.usage.output_tokens');
+    }
+  }
+
+  // OTel cache aliases — #1244 additive (schema_version 2).
+  for (const field of [
+    'gen_ai.usage.cache_read_input_tokens',
+    'gen_ai.usage.cache_creation_input_tokens',
+  ]) {
+    const value = entry[field];
+    if (value !== undefined && value !== null) {
+      if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
+        throw new ValidationError(`${field} must be a non-negative integer or null`, field);
+      }
+    }
+  }
+
+  // OTel alias — #411 additive, schema_version=1 backwards-compat
+  if (entry['gen_ai.system'] !== undefined && entry['gen_ai.system'] !== null) {
+    if (typeof entry['gen_ai.system'] !== 'string') {
+      throw new ValidationError('gen_ai.system must be a string or null', 'gen_ai.system');
+    }
+  }
+
+  return entry;
+}
+
+// ---------------------------------------------------------------------------
+// Normalize
+// ---------------------------------------------------------------------------
+
+/**
+ * Normalize a subagent record read from disk. Applies defaults for optional
+ * fields so callers can treat legacy and new entries uniformly.
+ * Does NOT throw — malformed entries are passed through unchanged.
+ *
+ * @param {object} entry
+ * @returns {object} entry with optional fields defaulted to null / CURRENT_SCHEMA_VERSION
+ */
+export function normalizeSubagent(entry) {
+  if (!entry || typeof entry !== 'object') return entry;
+  return {
+    ...entry,
+    schema_version: entry.schema_version ?? LEGACY_SCHEMA_VERSION,
+    agent_type: entry.agent_type ?? null,
+    parent_session_id: entry.parent_session_id ?? null,
+    token_input: entry.token_input ?? null,
+    token_output: entry.token_output ?? null,
+    // #1244 additive (schema_version 2) — cache buckets + model id.
+    token_input_uncached: entry.token_input_uncached ?? null,
+    token_cache_read: entry.token_cache_read ?? null,
+    token_cache_creation: entry.token_cache_creation ?? null,
+    model: entry.model ?? null,
+    // total_cost_usd — #624 additive, best-effort native cost (null when absent)
+    total_cost_usd: entry.total_cost_usd ?? null,
+    cost_basis: entry.cost_basis ?? null,
+    // OTel alias — #411 additive, schema_version=1 backwards-compat
+    'gen_ai.usage.input_tokens': entry['gen_ai.usage.input_tokens'] ?? null,
+    'gen_ai.usage.cache_read_input_tokens': entry['gen_ai.usage.cache_read_input_tokens'] ?? null,
+    'gen_ai.usage.cache_creation_input_tokens': entry['gen_ai.usage.cache_creation_input_tokens'] ?? null,
+    'gen_ai.usage.output_tokens': entry['gen_ai.usage.output_tokens'] ?? null,
+    'gen_ai.system': entry['gen_ai.system'] ?? null,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Migrate
+// ---------------------------------------------------------------------------
+
+/**
+ * Migrate a legacy / partial subagent record to the canonical v1 shape.
+ * Idempotent — calling it on an already-canonical record is a safe no-op.
+ * No-op for v1; reserved for future schema bumps.
+ *
+ * The caller MUST still run validateSubagent() on the result before writing.
+ *
+ * @param {object} entry
+ * @returns {object} record with schema_version stamped
+ */
+export function migrateLegacySubagent(entry) {
+  if (!entry || typeof entry !== 'object') return entry;
+  const out = { ...entry };
+  if (out.schema_version === undefined || out.schema_version === null) {
+    out.schema_version = LEGACY_SCHEMA_VERSION;
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Append
+// ---------------------------------------------------------------------------
+
+/**
+ * Append a single subagent record to a JSONL file.
+ *
+ * Steps:
+ *   1. Stamp schema_version if missing.
+ *   2. Normalize (apply optional-field defaults).
+ *   3. Validate with strictDuration — throws ValidationError on bad input.
+ *   4. Serialize to JSON + newline.
+ *   5. mkdir(dirname, recursive: true).
+ *   6. appendFile (POSIX append ≤ PIPE_BUF is atomic for typical JSONL lines).
+ *
+ * This is the WRITE path, so it validates with `{ strictDuration: true }`: a stop
+ * record may carry a positive duration or an explicit null, never 0 (#917). The
+ * historic corpus is unaffected — it is only ever read, and readers/migrations use
+ * the lenient default. See the module header § duration_ms provenance.
+ *
+ * @param {string} filePath — absolute path to target .jsonl file
+ * @param {object} entry — candidate subagent record
+ * @returns {Promise<object>} the validated + normalized entry that was written
+ * @throws {ValidationError} when the entry fails schema validation
+ */
+export async function appendSubagent(filePath, entry) {
+  const stamped = {
+    ...entry,
+    schema_version: entry?.schema_version ?? CURRENT_SCHEMA_VERSION,
+  };
+  const normalized = normalizeSubagent(stamped);
+  const validated = validateSubagent(normalized, { strictDuration: true });
+  const line = JSON.stringify(validated) + '\n';
+  await mkdir(path.dirname(filePath), { recursive: true });
+  await appendFile(filePath, line, 'utf8');
+  return validated;
+}
+
+// ---------------------------------------------------------------------------
+// Read
+// ---------------------------------------------------------------------------
+
+/**
+ * Read all valid subagent records from a JSONL file. Malformed lines are
+ * skipped with a stderr warning — never throws.
+ *
+ * @param {string} filePath — absolute path to target .jsonl file
+ * @returns {Promise<object[]>} array of normalized subagent records
+ */
+export async function readSubagents(filePath) {
+  if (!existsSync(filePath)) return [];
+  let raw;
+  try {
+    raw = await readFile(filePath, 'utf8');
+  } catch (err) {
+    process.stderr.write(`[subagents-schema] WARN: could not read ${filePath}: ${err?.message ?? err}\n`);
+    return [];
+  }
+  const lines = raw.split('\n').filter((l) => l.trim().length > 0);
+  const entries = [];
+  for (const line of lines) {
+    try {
+      const parsed = JSON.parse(line);
+      entries.push(normalizeSubagent(parsed));
+    } catch {
+      process.stderr.write(`[subagents-schema] WARN: skipping malformed JSONL line: ${line.slice(0, 120)}\n`);
+    }
+  }
+  return entries;
+}

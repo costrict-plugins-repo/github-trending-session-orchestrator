@@ -1,0 +1,18 @@
+---
+name: npm-publish
+description: Use when publishing this package to npm — a version release (npm publish), verifying the registry/pi.dev listing, or diagnosing npm auth failures (E403 2FA/token errors). Default staged route (write token in .env.local via a temp userconfig, owner approves on npmjs.com; Bypass-2FA only for the `--direct` route), the leakage gate before every publish, post-publish verification and marker/badge upkeep. Trigger on "publish to npm", "npm release", "E403 publish error".
+metadata:
+  user-invocable: "false"
+  model: sonnet
+---
+
+# npm-publish
+
+> **Portable mirror — generated, do not edit.** The canonical workflow lives at
+> [`skills/npm-publish/SKILL.md`](../../../skills/npm-publish/SKILL.md); read that file for the full instructions.
+> This mirror carries only agentskills.io-spec-legal frontmatter so harnesses that
+> discover skills under `.agents/skills/` can find and route to the skill.
+>
+> Regenerate with `node scripts/generate-agents-skills.mjs`.
+
+Read the linked document in full and follow its complete workflow, including prechecks and stop conditions. Resolve its link relative to this SKILL.md, not the project working directory. The plugin root is three directories above this file. Resolve package paths such as `skills/` and `scripts/` from that root and relative links in the canonical document from its own directory. Keep the user’s project as the target of project operations.

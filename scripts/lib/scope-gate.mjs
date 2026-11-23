@@ -1,0 +1,2964 @@
+/**
+ * scope-gate.mjs — scope / pattern primitives.
+ *
+ * Split out of scripts/lib/hardening.mjs (concern B). Used by Wave 3 hooks on
+ * hot-paths — all sync. Re-exported by hardening.mjs as a barrel so existing
+ * importers keep working unchanged.
+ *
+ * Layering: hook-safe synchronous helpers; no I/O at import time. Guard
+ * context lookups read bounded filesystem state when called. Hooks (under
+ * `hooks/`) import this ESM-only lib; it MUST NOT reverse-import from hooks.
+ * Cross-cutting invariant for all exports below — see #554 A2.
+ */
+
+import { existsSync, readFileSync, realpathSync, lstatSync, fstatSync, readSync, closeSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { resolveSessionRoot, isolatedAgentCheckout, registeredWorktreeRoots } from './platform.mjs';
+import { openNoFollowSync } from './no-follow-open.mjs';
+
+import { tokenizeCommand, splitChainSegments, resolveSegmentVerb } from './command-blocker.mjs';
+
+/** The harness state dirs a `wave-scope.json` may live in, highest precedence first. */
+const SCOPE_FILE_DIRS = Object.freeze(['.pi', '.cursor', '.codex', '.claude']);
+
+/**
+ * Find the wave-scope.json file for the given project root.
+ *
+ * Precedence (mirrors find_scope_file in hardening.sh):
+ *   <root>/.pi/wave-scope.json
+ *   <root>/.cursor/wave-scope.json
+ *   <root>/.codex/wave-scope.json
+ *   <root>/.claude/wave-scope.json
+ *
+ * Returns the absolute path string, or null if none exist.
+ * Sync (uses fs.existsSync).
+ *
+ * @deprecated Use findOwnScopeFile because first-file selection ignores manifest ownership and can select a peer session's manifest.
+ * @param {string} projectRoot — absolute path to project root
+ * @returns {string|null}
+ */
+export function findScopeFile(projectRoot) {
+  for (const dir of SCOPE_FILE_DIRS) {
+    const candidate = path.join(projectRoot, dir, 'wave-scope.json');
+    if (existsSync(candidate)) {
+      return candidate;
+    }
+  }
+  return null;
+}
+
+/**
+ * The manifest that governs THIS session: walk the {@link findScopeFile}
+ * precedence (`.pi` > `.cursor` > `.codex` > `.claude`) and return the first
+ * candidate that is NOT provably bound to another session (#1504 point 6).
+ *
+ * `findScopeFile` stops at the first file that EXISTS. When that file is a
+ * peer's — another harness session's manifest in the same working copy — every
+ * guard that stands down on a foreign manifest stood down, and this session's
+ * own `.claude/wave-scope.json` one rung lower was never read: a peer's
+ * manifest switched this session's scope gates off.
+ *
+ * Disposition per candidate, decided INSIDE the loop (an identity check after
+ * the loop makes the first readable candidate the veto-holder —
+ * `.claude/rules/identity-and-locks.md`):
+ *   - `'own'` or `'unknown'` → return it. `'unknown'` covers an unbound/legacy
+ *     manifest, a corrupt or unreadable one (judged as `{}`), and an empty
+ *     `ownIds` (a harness that supplies no session id). Each means ENFORCE
+ *     under the binding contract, so each stays the decider exactly as under
+ *     `findScopeFile` — a truncated manifest cannot skip itself.
+ *   - `'foreign'` → remember the first one and `continue`.
+ *
+ * When EVERY existing candidate is foreign, `path` is null and `foreignPath`
+ * names the first of them, so the caller reaches its existing foreign
+ * disposition (allow + `orchestrator.scope.foreign_session_ignored`) unchanged.
+ *
+ * `classify` is injected, not imported: importing the identity module here
+ * would add it to the import closure of every hook that reaches this file
+ * through the `hardening.mjs` barrel, while only the guards that stand down on
+ * a foreign manifest need it — and each of them already binds it. Pass
+ * `classifyManifestSession` from `session-identity/own-session.mjs`.
+ *
+ * COST: identical to `findScopeFile` when no manifest exists (≤4 `existsSync`).
+ * With one, one extra sync read + parse of that small file. The caller still
+ * reads the returned file itself and classifies THAT read, so a rebind between
+ * the two reads is judged at the same decision point as before.
+ *
+ * Sync. Never throws (unless `classify` does).
+ *
+ * @param {string} projectRoot absolute path to the project root
+ * @param {Set<string>} ownIds process-local own ids (`readProcessLocalSessionIds`)
+ * @param {(scope: object, ownIds: Set<string>) => { verdict: string }} classify
+ * @returns {{ path: string|null, foreignPath: string|null }}
+ */
+export function findOwnScopeFile(projectRoot, ownIds, classify) {
+  let foreignPath = null;
+  for (const dir of SCOPE_FILE_DIRS) {
+    const candidate = path.join(projectRoot, dir, 'wave-scope.json');
+    if (!existsSync(candidate)) continue;
+    let scope = {};
+    try {
+      const parsed = JSON.parse(readFileSync(candidate, 'utf8'));
+      if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) scope = parsed;
+    } catch {
+      // unreadable / corrupt → `{}` → no binding → 'unknown' → this candidate decides
+    }
+    if (classify(scope, ownIds).verdict !== 'foreign') return { path: candidate, foreignPath };
+    foreignPath ??= candidate;
+  }
+  return { path: null, foreignPath };
+}
+
+/** Check whether the session root resolves to the plugin's own checkout. */
+export function isPluginProject({ projectRoot, pluginRoot }) {
+  try {
+    return realpathSync.native(projectRoot) === realpathSync.native(pluginRoot);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Guard context: control state belongs to the coordinator, relative grants to
+ * the actual isolated checkout. Remote adoption requires unique OWN identity;
+ * local unknown/corrupt/foreign/missing dispositions remain unchanged.
+ * Root-only discovery deliberately excludes arbitrary worktree subdirectories;
+ * revisit when the harness supplies a coordinator-root witness (#1504).
+ * @param {{cwd: string, ownIds: Set<string>, classify: Function}} options
+ * @returns {{manifestRoot: string, writeRoot: string, path: string|null,
+ *   foreignPath: string|null, isolated: boolean, error: string|null}}
+ */
+export function resolveScopeContext({ cwd, ownIds, classify }) {
+  let manifestRoot = resolveSessionRoot(cwd);
+  try { manifestRoot = realpathSync.native(manifestRoot); } catch { /* preserve non-existing-root fallback */ }
+  const local = findOwnScopeFile(manifestRoot, ownIds, classify);
+  const agent = isolatedAgentCheckout(cwd);
+  const context = { manifestRoot, writeRoot: agent?.writeRoot ?? manifestRoot,
+    ...local, isolated: agent !== null, error: null };
+  if (!agent || local.path || ownIds.size === 0) return context;
+  const candidates = registeredWorktreeRoots(agent.commonDir);
+  if (candidates.error) return { ...context, error: candidates.error };
+  const matches = new Map();
+  for (const root of candidates.roots) {
+    if (root === agent.writeRoot || root === manifestRoot || isolatedAgentCheckout(root)) continue;
+    // Inspect precedence candidates separately. An unsafe candidate has unknown
+    // ownership: it must never turn an isolated session into a no-scope ALLOW.
+    for (const dir of SCOPE_FILE_DIRS) {
+      const file = path.join(root, dir, 'wave-scope.json');
+      let fd;
+      let raw;
+      try {
+        const before = lstatSync(file);
+        if (!before.isFile() || before.size > 1024 * 1024) return { ...context, error: 'unsafe-coordinator-scope' };
+        // Refuse final symlinks: a redirected manifest must never supply coordinator authority (#1749).
+        fd = openNoFollowSync(file);
+        const opened = fstatSync(fd);
+        if (!opened.isFile() || opened.ino !== before.ino || opened.dev !== before.dev || opened.size > 1024 * 1024) return { ...context, error: 'unsafe-coordinator-scope' };
+        const buffer = Buffer.alloc(1024 * 1024 + 1);
+        let length = 0;
+        while (length < buffer.length) {
+          const n = readSync(fd, buffer, length, buffer.length - length, null);
+          if (n === 0) break;
+          length += n;
+        }
+        if (length > 1024 * 1024) return { ...context, error: 'unsafe-coordinator-scope' };
+        raw = buffer.toString('utf8', 0, length);
+      } catch (err) {
+        if (err?.code === 'ENOENT') continue;
+        return { ...context, error: 'unsafe-coordinator-scope' };
+      } finally { if (fd !== undefined) closeSync(fd); }
+      try {
+        const scope = JSON.parse(raw);
+        if (classify(scope, ownIds).verdict === 'own') {
+          matches.set(realpathSync(file), { root, path: file, foreignPath: null });
+          break; // highest-precedence positively owned manifest in this root
+        }
+      } catch { /* unbound/corrupt remote state is never authority */ }
+    }
+  }
+  if (matches.size > 1) return { ...context, error: 'ambiguous-coordinator-scope' };
+  const match = matches.values().next().value;
+  return match ? { ...context, manifestRoot: match.root, path: match.path, foreignPath: null } : context;
+}
+
+/**
+ * Read the enforcement level from a scope file.
+ * Defaults to "strict" (fail-closed) on parse error or missing field.
+ * Sync. Never throws.
+ *
+ * @param {string} scopeFilePath — absolute path to wave-scope.json
+ * @returns {string}
+ */
+export function getEnforcementLevel(scopeFilePath) {
+  try {
+    const data = JSON.parse(readFileSync(scopeFilePath, 'utf8'));
+    return data.enforcement ?? 'strict';
+  } catch {
+    return 'strict';
+  }
+}
+
+/**
+ * Check whether a named gate is enabled in the scope file.
+ * Returns true if the field is missing or true, false only if explicitly false.
+ * Sync. Never throws.
+ *
+ * @param {string} scopeFilePath — absolute path to wave-scope.json
+ * @param {string} gateName — key within .gates
+ * @returns {boolean}
+ */
+export function gateEnabled(scopeFilePath, gateName) {
+  try {
+    const data = JSON.parse(readFileSync(scopeFilePath, 'utf8'));
+    const gates = data.gates;
+    if (gates === undefined || gates === null) return true;
+    const value = gates[gateName];
+    if (value === undefined || value === null) return true;
+    return value !== false;
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * Test whether a relative file path matches a single glob-style pattern.
+ *
+ * Supported patterns:
+ *   - `prefix/`       — directory prefix: any file under prefix/ (including nested)
+ *   - `src/**\/*.ts`  — recursive glob: `**` = any depth (including zero dirs)
+ *   - `src/*.ts`      — single-segment glob: `*` = one segment (no slashes)
+ *   - `path/to/file`  — exact match
+ *
+ * Conversion order:
+ *   1. Escape all regex special chars EXCEPT `*` and `/`.
+ *   2. Replace `**` with `<<DBL>>` placeholder.
+ *   3. Replace remaining `*` with `[^/]*` (single segment).
+ *   4. Replace `<<DBL>>` with `.*` (any depth).
+ *   5. Anchor: `^...$`.
+ *
+ * Case-sensitive. Empty pattern returns false.
+ *
+ * Hook-safe: pure, deterministic, no I/O. Current importers (grep-verified
+ * #554 A2): hooks/wave-scope-commit-guard.mjs, hooks/enforce-scope.mjs,
+ * scripts/lib/worktree-freshness.mjs, scripts/lib/pre-dispatch-check.mjs.
+ *
+ * @param {string} relPath
+ * @param {string} pattern
+ * @returns {boolean}
+ */
+export function pathMatchesPattern(relPath, pattern) {
+  if (!pattern) return false;
+
+  // Directory prefix shortcut: pattern ends with '/'
+  if (pattern.endsWith('/')) {
+    return relPath.startsWith(pattern);
+  }
+
+  // Build a regex from the glob pattern.
+  // Step 1: Escape regex special chars (everything except * and /)
+  const specialChars = /[.+?|[\](){}\\^$]/g;
+  let regex = pattern.replace(specialChars, (ch) => `\\${ch}`);
+
+  // Step 2: Replace `**/` with placeholder (matches zero-or-more dir segments WITH trailing slash)
+  // `src/**/foo` must match `src/foo` (zero dirs) and `src/a/b/foo` (two dirs).
+  // Replacing `**/` → `(.*\/)?` captures "any number of segments + slash, or nothing".
+  regex = regex.replace(/\*\*\//g, '<<DBLS>>');
+
+  // Replace remaining `**` (not followed by /) with a second placeholder.
+  // MUST use a placeholder (not `.*` directly) — the single-* pass below would otherwise
+  // re-process the `*` quantifier in `.*`, yielding `.[^/]*` which blocks nested paths
+  // under `tests/**` etc. (issue #220).
+  regex = regex.replace(/\*\*/g, '<<DBLG>>');
+
+  // Step 3: Single * → one path segment (no slashes)
+  regex = regex.replace(/\*/g, '[^/]*');
+
+  // Step 4: Expand placeholders
+  regex = regex.replace(/<<DBLS>>/g, '(.*\\/)?');
+  regex = regex.replace(/<<DBLG>>/g, '.*');
+
+  // Step 5: Anchor
+  regex = `^${regex}$`;
+
+  return new RegExp(regex).test(relPath);
+}
+
+/**
+ * Is this fileScope entry a glob/prefix pattern (vs. a concrete file path)?
+ * A `*` metachar OR a trailing `/` (directory prefix) marks it as a glob.
+ * @param {string} entry
+ * @returns {boolean}
+ */
+function isGlobScopeEntry(entry) {
+  return entry.includes('*') || entry.endsWith('/');
+}
+
+/**
+ * Literal prefix of a glob entry — the segment before the first `*`
+ * metachar (or the whole entry when it has none). `src/**` → `src/`,
+ * `src/lib/*.mjs` → `src/lib/`, `tests/` → `tests/`.
+ * @param {string} entry
+ * @returns {string}
+ */
+function literalScopePrefix(entry) {
+  const star = entry.indexOf('*');
+  return star === -1 ? entry : entry.slice(0, star);
+}
+
+/**
+ * Assert that every entry of an agent's declared file scope is covered by the
+ * wave's `allowedPaths` union — the mechanical form of the "allowedPaths is the
+ * UNION of all agent file scopes" contract (wave-loop.md § Scope Manifest #3).
+ *
+ * Motivation (#796): `.claude/wave-scope.json` is GLOBAL per wave — one
+ * allowedPaths union gates every agent in the wave (hooks/enforce-scope.mjs
+ * Gate 7). A coordinator that (re)writes the union for only ONE agent of a
+ * multi-agent batch silently denies its siblings' legitimate writes (observed
+ * fix-pass incident). Running this assertion for EVERY agent before dispatch
+ * catches that class before an agent is blocked mid-run.
+ *
+ * Semantics:
+ *   - CONCRETE fileScope entry (no `*`, not a `dir/` prefix): covered iff it
+ *     matches ≥1 allowedPaths pattern via `pathMatchesPattern` (the same matcher
+ *     the enforcement hook uses at check time). `src/a.ts` ⊆ `src/**` → covered.
+ *   - GLOB fileScope entry (`*` present, or a `dir/` prefix): covered iff it is
+ *     present verbatim in allowedPaths, OR its literal prefix (the segment
+ *     before the first glob metachar) matches an allowedPaths pattern.
+ *
+ * GLOB-vs-GLOB LIMITATION (deliberate design boundary): this is NOT a full
+ * glob-⊆-glob subset calculus. For a glob fileScope entry the check reduces to
+ * verbatim presence + literal-prefix coverage; it does not prove that e.g.
+ * `src/**\/*.ts` ⊆ `src/**\/*.js` is false. The concrete-path branch above is
+ * exact and carries the incident-relevant load (the union the coordinator
+ * actually writes is the deduplicated agent scopes in canonical spelling, see
+ * {@link unionFileScopes}). Erring toward
+ * over-approximating coverage keeps a legitimate union from being rejected on a
+ * glob technicality rather than pretending to a precision this matcher lacks.
+ *
+ * Fail-closed & no-throw (module convention): a non-array `fileScope` or
+ * `allowedPaths` returns `{ ok: false, missing: [] }` — "cannot assert → treat
+ * as failure". An empty `fileScope` is a trivial subset → `{ ok: true }`.
+ * Non-string / empty-string entries are skipped (the CLI caller validates the
+ * array-of-strings shape upstream). Never throws.
+ *
+ * @param {string[]} fileScope — one agent's declared file scope entries
+ * @param {string[]} allowedPaths — the wave's allowedPaths union
+ * @returns {{ ok: boolean, missing: string[] }} missing = uncovered fileScope entries
+ */
+export function assertFileScopeSubset(fileScope, allowedPaths) {
+  if (!Array.isArray(fileScope) || !Array.isArray(allowedPaths)) {
+    return { ok: false, missing: [] };
+  }
+  const missing = [];
+  for (const entry of fileScope) {
+    if (typeof entry !== 'string' || entry.length === 0) continue;
+    // The AGENT side is compared in canonical spelling — the spelling the union
+    // emits and the write path Gate 7 matches. `allowedPaths` stays as written:
+    // a hand-written `./x` there is a pattern Gate 7 cannot match, and spelling
+    // it away here would report coverage the hook then denies.
+    const spelled = scopeEntrySpelling(entry);
+    let covered;
+    if (isGlobScopeEntry(spelled)) {
+      // GLOB entry: verbatim presence OR literal-prefix coverage.
+      const prefix = literalScopePrefix(spelled);
+      covered = allowedPaths.some((p) => p === spelled || pathMatchesPattern(prefix, p));
+    } else {
+      // CONCRETE entry: must match ≥1 allowedPaths pattern.
+      covered = allowedPaths.some((p) => pathMatchesPattern(spelled, p));
+    }
+    if (!covered) missing.push(entry); // as declared, so the plan entry is findable
+  }
+  return { ok: missing.length === 0, missing };
+}
+
+/**
+ * Default production→test sibling rules (#970). `source` is matched with
+ * {@link pathMatchesPattern}; `sibling` is a TEMPLATE expanded with `{basename}`
+ * (filename without its extension) and `{dir}` (dirname, no trailing slash).
+ *
+ * This repo's layout only. Consumer repos override via `opts.rules` — observed
+ * shapes there are `{ source: '**\/*.ts', sibling: '{dir}/{basename}.test.*' }`,
+ * `{ source: '**\/*.ts', sibling: '{dir}/__tests__/**' }` and
+ * `{ source: 'supabase/migrations/**', sibling: 'supabase/tests/**' }`.
+ *
+ * @type {ReadonlyArray<{source: string, sibling: string}>}
+ */
+export const DEFAULT_TEST_SIBLING_RULES = Object.freeze([
+  Object.freeze({ source: '**/*.mjs', sibling: 'tests/**/{basename}*.test.mjs' }),
+]);
+
+/**
+ * Patterns that identify an entry as ALREADY test-side. Used for the
+ * no-inverse-expansion rule and, transitively, for idempotency.
+ * @type {ReadonlyArray<string>}
+ */
+export const DEFAULT_TEST_PATH_PATTERNS = Object.freeze([
+  'tests/**',
+  'test/**',
+  '**/__tests__/**',
+  '**/*.test.*',
+  '**/*.spec.*',
+]);
+
+/**
+ * The wave roles for which test-sibling expansion (#970) fires. THE list — the
+ * prose in `skills/wave-executor/wave-loop.md` § Scope Manifest and
+ * `.cursor/rules/030-wave-execution.mdc` describes this constant; it does not
+ * restate it. Canonical casing; comparison is case-insensitive (see
+ * {@link testSiblingExpansionApplies}).
+ *
+ * Impl-Core / Impl-Polish are exactly where the incident occurred (an agent
+ * changes a production file and must update its test). Every other role is a
+ * documented non-expansion case: Discovery is deny-all `[]`, Quality phase 1
+ * (Simplification) MUST NOT gain test-write access, Quality phase 2 is already
+ * test-only (expansion is inert), Finalization writes no source.
+ *
+ * @type {ReadonlyArray<string>}
+ */
+export const TEST_SIBLING_EXPANSION_ROLES = Object.freeze(['Impl-Core', 'Impl-Polish']);
+
+/** Lower-cased lookup set for {@link testSiblingExpansionApplies}. @type {ReadonlySet<string>} */
+const EXPANSION_ROLE_KEYS = new Set(TEST_SIBLING_EXPANSION_ROLES.map((r) => r.toLowerCase()));
+
+/**
+ * Does test-sibling expansion (#970) apply for these options? The SINGLE
+ * predicate behind both {@link expandTestSiblings} (which grants the siblings)
+ * and {@link assertTestSiblingCoverage} (which requires them). They must agree:
+ * a check that demands coverage the expander never produced blocks a dispatch
+ * for a requirement nobody was told to satisfy.
+ *
+ * Precedence — `enabled` (explicit, BOTH directions) > `role` > fail-closed:
+ *   1. `enabled === false` → NO. The unconditional opt-out; nothing overrides it.
+ *   2. `enabled === true`  → YES. Explicit opt-in, for callers whose role
+ *      vocabulary is not this repo's (consumer repos) and for focused tests.
+ *   3. `role` present → YES iff it is in {@link TEST_SIBLING_EXPANSION_ROLES}
+ *      (trimmed, case-insensitive — plans and `wave-scope.json` are written by
+ *      LLM prose, and `impl-core` vs `Impl-Core` must not silently change
+ *      behaviour).
+ *   4. Otherwise (role ABSENT, non-string, or UNRECOGNISED) → NO.
+ *
+ * ## Why absent-role fails CLOSED (the load-bearing choice)
+ * The two failure directions are not symmetric. Expansion wrongly OMITTED
+ * blocks an agent's write: it fails loudly, at the tool boundary, and the agent
+ * reports `blocked` — recoverable in one re-union. Expansion wrongly APPLIED
+ * silently hands write access to the test suite; in a Quality phase-1
+ * Simplification wave that is the "delete a dead export, then edit the test to
+ * match" failure mode, which defeats the very gate the wave exists to run.
+ * Silent-permissive is strictly worse than loud-restrictive, and this module's
+ * convention is already "cannot assert → treat as failure"
+ * (see {@link assertFileScopeSubset}). So a caller must NAME a role (or opt in
+ * explicitly); forgetting is not a grant.
+ *
+ * @param {{enabled?: boolean, role?: string}} [opts]
+ * @returns {boolean}
+ */
+export function testSiblingExpansionApplies(opts = {}) {
+  if (opts === null || typeof opts !== 'object') return false;
+  if (opts.enabled === false) return false;
+  if (opts.enabled === true) return true;
+  if (typeof opts.role !== 'string') return false;
+  return EXPANSION_ROLE_KEYS.has(opts.role.trim().toLowerCase());
+}
+
+/**
+ * Expand a wave scope list with the TEST SIBLING of every concrete production
+ * file it grants (#970).
+ *
+ * ## The bug this closes
+ * An `allowedPaths` / agent `fileScope` entry that lists a production file
+ * WITHOUT its test sibling mechanically prevents the agent from updating that
+ * test. Observed three times in one consumer-repo session: a SQL regression test
+ * that could not be written, a cross-tenant security test left unwritable while
+ * its subject file stayed red, and a suite left red because the importing test
+ * lay outside every agent's scope. The scope guard enforced exactly the
+ * inconsistency the quality gate exists to catch.
+ *
+ * ## Why a GLOB and not a computed path
+ * The emitted sibling is `tests/**\/{basename}*.test.mjs`, never a concrete
+ * path: a same-basename test ANYWHERE under `tests/` resolves for far more
+ * production files than a naive 1:1 mirror (`scripts/lib/X.mjs →
+ * tests/lib/X.test.mjs`). The DATED figures — population, both ratios, the
+ * measuring command and the SHA — live in ONE place:
+ * skills/wave-executor/references/wave-loop-scope-manifest.md § Test-Sibling
+ * Expansion (#970), measured by `scripts/lib/test-sibling-coverage.mjs` (#1030 P3).
+ * Cite and re-measure them there, never restate them here: an
+ * undated copy drifted to a second, contradicting set of numbers (#1026.5,
+ * PSA-006 item 4). The glob's failure mode is HARMLESS — it grants write access
+ * to files that may not exist. A computed concrete path is wrong more often AND
+ * still denies the real test, which is the original bug wearing a new face.
+ *
+ * ## Required behaviours (each is a nameable regression)
+ *  1. `[]` → `[]` STRUCTURALLY. Discovery waves use an empty scope as a
+ *     deliberate deny-all contract (#256 NO-OP); expansion must never be able to
+ *     resurrect a write there.
+ *  2. IDEMPOTENT — `expand(expand(x))` deep-equals `expand(x)`. The #796
+ *     re-union path rewrites the manifest mid-wave and the scope MUST NEVER
+ *     shrink, so expansion has to compose with a re-run. Guaranteed by (4): every
+ *     synthesized entry is itself a test path and is therefore inert on re-entry.
+ *  3. ABSOLUTE entries pass through untouched — a Gate-5b out-of-repo grant
+ *     (`/Users/…/vault/**`) must not sprout a synthetic `tests/**` sibling
+ *     outside the repo.
+ *  4. NO INVERSE EXPANSION — a test path never causes a production path to be
+ *     added. Quality phase 2's scope is already test-only; expansion is inert there.
+ *  5. ROLE-GATED, fail-closed — the wave's `role` decides, via the shared
+ *     predicate {@link testSiblingExpansionApplies}, and `opts.enabled` overrides
+ *     it in both directions. Quality phase 1 (Simplification) must NOT expand, or
+ *     simplification agents gain write access to the suite (the "delete a dead
+ *     export, then edit the test to match" failure mode). An absent or
+ *     unrecognised role does not expand — see the predicate for why.
+ *
+ * Glob source entries (`src/**`, `src/`) are NOT expanded: they have no single
+ * basename, and the incident shape is a concrete production FILE.
+ *
+ * APPEND-ONLY: the returned array starts with the input entries in their original
+ * order (deduplicated), then the synthesized siblings in first-seen order.
+ *
+ * Pure: no I/O, no filesystem probing, never throws. A non-array input returns `[]`.
+ *
+ * @param {string[]} paths — a wave `allowedPaths` union OR one agent's `fileScope`
+ * @param {{enabled?: boolean, role?: string,
+ *          rules?: ReadonlyArray<{source: string, sibling: string}>,
+ *          testPathPatterns?: ReadonlyArray<string>}} [opts]
+ * @returns {string[]} the input entries followed by synthesized test-sibling globs
+ */
+export function expandTestSiblings(paths, opts = {}) {
+  if (!Array.isArray(paths) || paths.length === 0) return []; // behaviour 1
+  const entries = paths.filter((e) => typeof e === 'string' && e.length > 0);
+  const seen = new Set(entries);
+  const out = [...new Set(entries)];
+  if (!testSiblingExpansionApplies(opts)) return out; // behaviour 5
+
+  for (const sibling of testSiblingsFor(entries, opts)) {
+    if (seen.has(sibling)) continue;
+    seen.add(sibling);
+    out.push(sibling);
+  }
+  return out;
+}
+
+/**
+ * The synthesized test-sibling globs for a scope list, in first-seen order —
+ * WITHOUT the original entries. Shared by {@link expandTestSiblings} and the
+ * `--assert-subset` coverage check so both agree on what a sibling is.
+ *
+ * @param {string[]} entries — already-filtered non-empty string entries
+ * @param {{rules?: ReadonlyArray<{source: string, sibling: string}>,
+ *          testPathPatterns?: ReadonlyArray<string>}} [opts]
+ * @returns {string[]}
+ */
+export function testSiblingsFor(entries, opts = {}) {
+  const rules = Array.isArray(opts.rules) ? opts.rules : DEFAULT_TEST_SIBLING_RULES;
+  const testPatterns = Array.isArray(opts.testPathPatterns)
+    ? opts.testPathPatterns
+    : DEFAULT_TEST_PATH_PATTERNS;
+  const out = [];
+  const seen = new Set();
+  for (const declared of Array.isArray(entries) ? entries : []) {
+    if (typeof declared !== 'string' || declared.length === 0) continue;
+    // Canonical spelling, as the union carries it: a verbatim `./tests/x.mjs`
+    // misses `tests/**` and would be mirrored as if it were production code.
+    const entry = scopeEntrySpelling(declared);
+    if (path.isAbsolute(entry)) continue; // behaviour 3
+    if (isGlobScopeEntry(entry)) continue; // no single basename to mirror
+    if (isTestPathEntry(entry, testPatterns)) continue; // behaviours 2 + 4
+    for (const rule of rules) {
+      if (!rule || typeof rule.source !== 'string' || typeof rule.sibling !== 'string') continue;
+      if (!pathMatchesPattern(entry, rule.source)) continue;
+      const sibling = renderSiblingTemplate(rule.sibling, entry);
+      if (!sibling || seen.has(sibling)) continue;
+      seen.add(sibling);
+      out.push(sibling);
+    }
+  }
+  return out;
+}
+
+/**
+ * Is this entry already test-side? Behaviours 2 + 4 both reduce to this check.
+ * @param {string} entry
+ * @param {ReadonlyArray<string>} testPatterns
+ * @returns {boolean}
+ */
+function isTestPathEntry(entry, testPatterns) {
+  return testPatterns.some((p) => pathMatchesPattern(entry, p));
+}
+
+/**
+ * Expand `{basename}` / `{dir}` in a sibling template against a production path.
+ * `{basename}` is the filename with its final extension removed.
+ * @param {string} template
+ * @param {string} entry
+ * @returns {string}
+ */
+function renderSiblingTemplate(template, entry) {
+  const base = entry.slice(entry.lastIndexOf('/') + 1);
+  const dot = base.lastIndexOf('.');
+  const basename = dot > 0 ? base.slice(0, dot) : base;
+  const slash = entry.lastIndexOf('/');
+  const dir = slash === -1 ? '.' : entry.slice(0, slash);
+  return template.replaceAll('{basename}', basename).replaceAll('{dir}', dir);
+}
+
+/**
+ * Assert that the wave's `allowedPaths` union grants the TEST SIBLING of every
+ * concrete production file in an agent's declared `fileScope` (#970).
+ *
+ * Companion to {@link assertFileScopeSubset}, wired into
+ * `validate-wave-scope.mjs --assert-subset --expand-test-siblings`. That flag is
+ * the one mechanical, fail-closed enforcement point in the dispatch pipeline (it
+ * exits 1); a warn there would be decorative, since warnings in that script do
+ * not affect the exit code.
+ *
+ * DIRECTION MATTERS: this expands the AGENT'S fileScope and requires the union to
+ * cover the result. Expanding `allowedPaths` instead would WEAKEN
+ * `--assert-subset` — its value is that it is a conservative over-approximation,
+ * and growing the union makes more things trivially "covered". This only ever
+ * ADDS a requirement; a manifest that passed the plain subset check can now fail,
+ * never the reverse.
+ *
+ * A synthesized glob `G` counts as covered when ANY of:
+ *   1. `G` is present verbatim in allowedPaths;
+ *   2. some allowedPaths entry MATCHES `G` — the union already grants a concrete
+ *      file that IS a test sibling (`tests/lib/x.test.mjs` ⊨ `tests/**\/x*.test.mjs`);
+ *   3. `G`'s literal prefix is covered by an allowedPaths pattern — the same
+ *      glob rule {@link assertFileScopeSubset} uses (a broad `tests/**` grant).
+ *
+ * ROLE-GATED BY THE SAME PREDICATE as the expander
+ * ({@link testSiblingExpansionApplies}). This is not symmetry for its own sake:
+ * a Quality phase-1 union is production files with tests deliberately excluded,
+ * so an ungated assertion would demand coverage that phase must never grant and
+ * would hard-block its dispatch. When the gate is off the assertion adds NO
+ * requirement (`{ ok: true }`) rather than failing closed — "expansion did not
+ * fire here" and "the union is deficient" are different facts, and only the
+ * second is a dispatch blocker. Non-array inputs still fail closed
+ * (`{ ok: false }`), matching the module convention.
+ *
+ * @param {string[]} fileScope — one agent's declared file scope
+ * @param {string[]} allowedPaths — the wave's allowedPaths union
+ * @param {object} [opts] — same shape as {@link expandTestSiblings} (incl. `role`)
+ * @returns {{ok: boolean, missing: string[]}} missing = uncovered sibling globs
+ */
+export function assertTestSiblingCoverage(fileScope, allowedPaths, opts = {}) {
+  if (!Array.isArray(fileScope) || !Array.isArray(allowedPaths)) {
+    return { ok: false, missing: [] };
+  }
+  if (!testSiblingExpansionApplies(opts)) return { ok: true, missing: [] };
+  const missing = [];
+  for (const sibling of testSiblingsFor(fileScope, opts)) {
+    const prefix = literalScopePrefix(sibling);
+    const covered = allowedPaths.some(
+      (p) =>
+        typeof p === 'string' &&
+        p.length > 0 &&
+        (p === sibling || pathMatchesPattern(p, sibling) || pathMatchesPattern(prefix, p)),
+    );
+    if (!covered) missing.push(sibling);
+  }
+  return { ok: missing.length === 0, missing };
+}
+
+/**
+ * Extract likely file-write TARGETS from a Bash command string (#800).
+ *
+ * Motivation: `hooks/enforce-scope.mjs` Gate 1 only gates the Edit/Write/MultiEdit
+ * tools — Bash write channels (heredocs, `>`/`>>` redirects, `tee`, `sed -i`,
+ * `dd of=`) bypass the wave-scope gate structurally. This function is the parsing
+ * half of the opt-in, WARN-ONLY `bash-write-guard` (wired in enforce-commands.mjs).
+ *
+ * DESIGN POSTURE — conservative, under- rather than over-match (v1 is warn-only):
+ * a false NEGATIVE (missed write) is a silent no-warn; a false POSITIVE (spurious
+ * warn on a benign command) is operator noise that erodes trust in the guard. When
+ * in doubt we DROP the candidate. This is deliberately NOT a full shell parser.
+ *
+ * MATCHED write channels:
+ *   (a) redirects `> p`, `>> p`, `2> p`, `2>> p`, `&> p`, `&>> p` (fd/`&` prefix ok)
+ *   (b) `tee [-a] p [p2 …]` (all non-flag file args of a `tee` command-head)
+ *   (c) `sed -i[.bak] … p` (the LAST non-flag argument of a `sed` command-head
+ *       carrying an in-place `-i*` flag; the `sed` SCRIPT arg is not the target)
+ *   (d) `dd of=p` (the `of=` argument of a `dd` command-head)
+ *   (e) heredocs `cat > p <<EOF` — covered by the redirect part `(a)`; the `<<`
+ *       delimiter itself is an INPUT redirect, never a write target.
+ *
+ * Deliberately NOT matched (documented skip rules — each is a false-positive trap):
+ *   - targets beginning with `$` or `~`, or containing ANY `$` (variable /
+ *     expansion — the concrete path is unknowable at parse time; e.g. `> $LOG`,
+ *     `>> ${TMPDIR}/x`) — EXCEPT the two prefixes whose value IS knowable
+ *     (#1793), resolved by {@link expandKnownPathPrefix} before the skip rule:
+ *       · a leading `$PWD/` / `${PWD}/` (quoted or not) is the shell's working
+ *         directory. With `options.cwd` it resolves to `<cwd>/<rest>` (absolute).
+ *         WITHOUT a cwd it is returned as the relative `<rest>` — exactly the
+ *         meaning `$PWD/x` has (`./x` of the writing shell), and exactly how a
+ *         plain relative target is already treated. Fail direction: the write is
+ *         NEVER dropped for want of a cwd, so the scope gate stays closed.
+ *       · a leading `~/` (UNQUOTED token only) resolves against `options.home`
+ *         (default `os.homedir()`).
+ *     Both expansions fail toward "unknown" (skipped, the pre-#1793 behaviour)
+ *     whenever the shell's value is not provable (#1793 review F7) — never toward
+ *     a concrete path the shell would not write:
+ *       · `$PWD/` is not expanded from the first segment on that may move the cwd
+ *         or rebind PWD (`cd`, `pushd`, `popd`, `chdir`, `builtin cd`, `PWD=…`,
+ *         `export PWD`, a `source` / `.` / `eval` verb) — `cd / && echo x >
+ *         "$PWD/f"` writes `//f`, not `<cwd>/f`;
+ *       · `~/` is not expanded after `HOME=…` / `export HOME`;
+ *       · per-part quote context (#1795 `parts`) decides: `$PWD/` expands only
+ *         from an unquoted or double-quoted reference (`'$PWD/f'`, `\$PWD/f` are
+ *         literal), `~/` only as an unquoted leading part (`"~/x"` is a literal
+ *         `~` directory). Ceiling (BV-004) for a word without `parts`: the old
+ *         token-level rule — see {@link expandKnownPathPrefix}.
+ *     A bare `$PWD`, `~`, `~user/…` or any other variable stays skipped.
+ *   - `/dev/…`, `/tmp/…`, `/private/tmp/…` (device + temp sinks — never wave scope)
+ *   - process substitution `>(…)` (an operator, not a file; the `(` breaks it)
+ *   - fd duplication `>&2`, `2>&1`, `>&-` (dup / close, not a file target). The
+ *     FILENAME form `>& out.txt` / `>&out.txt` / `N>& out.txt` IS a write target
+ *     (#1793 review F6) — see {@link foldFdDupFilenameRedirects}.
+ *   - input redirects `<`, `<<` (reads, not writes)
+ *   - quoted targets containing a space (best-effort — a spaced path is far more
+ *     likely a quoting artefact than a real wave-scoped file)
+ *   - a `>` / `tee` / `sed` / `dd` that appears INSIDE quotes (e.g. `echo '>' x`)
+ *     — the tokenizer tracks quote state, so a quoted `>` is a word, not an op.
+ *
+ * Targets are returned VERBATIM (repo-relative where the command wrote them
+ * relatively, absolute where the command used an absolute path) and de-duplicated
+ * in first-seen order. The caller relativises + matches against allowedPaths.
+ *
+ * ## Lexing is DELEGATED to the shared tokenizer (#970)
+ *
+ * This function used to carry its OWN Bash lexer (`tokenizeShellForWrites`) —
+ * the third in this repo that had to know about quoting. It knew nothing about
+ * comments, here-doc BODIES or ANSI-C `$'…'` quotes, so it carried the exact
+ * quote-desync defect #965 fixed in `tokenizeCommand`: one apostrophe in an
+ * ordinary shell comment (`# don't`) wedged it in single-quote state and every
+ * later `>` became quoted text. Measured before the fix — `# don't\necho x >
+ * src/secret.ts` returned `[]`, i.e. an out-of-scope write was INVISIBLE to the
+ * wave-scope write guard. Two here-doc and ANSI-C variants did the same.
+ *
+ * It now delegates to `tokenizeCommand` from `./command-blocker.mjs`, which
+ * already emits the `>`/`>>`/`<<`/`;`/`|`/`&` operator tokens this pass needs
+ * and is the single place comment / here-doc / quote semantics live. Layering
+ * holds: `command-blocker.mjs` imports NOTHING (measured), so the edge
+ * scope-gate → command-blocker adds no cycle, and both stay pure/no-I/O-at-
+ * import for the hook hot path. The barrel `hardening.mjs` is not involved (a
+ * module importing the barrel WOULD cycle).
+ *
+ * Two deltas the shared token stream does not carry, handled locally below:
+ *   - `(`/`)`: since #1667 `tokenizeCommand` already emits a subshell's parens
+ *     as `;` separators and hoists `$( … )` / backtick bodies as their own
+ *     commands. What still reaches this pass glued is word text the lexer keeps
+ *     on purpose — a process substitution word (`>(cat)`), `f()`, `arr=(…)`,
+ *     case patterns. {@link peelSubshellParens} splits those so `> >(cat)`
+ *     still yields nothing (the peeled `cat` lands in command-head position).
+ *   - here-doc BODY tokens arrive as ordinary quoted words. They are DATA, and a
+ *     body is multi-line, so the whitespace skip rule in
+ *     {@link shouldSkipWriteTarget} drops them. (The delimiter word itself now
+ *     emits no token at all — an improvement: `tee out.txt <<EOF` used to report
+ *     the literal `EOF` as a second write target.)
+ *
+ * ## Segment-first, wrapper-aware verb resolution (#996.2)
+ *
+ * The interpretation is SEGMENT-first: the token stream is split on shell chain
+ * operators / newlines by {@link splitChainSegments} BEFORE it is interpreted,
+ * and each segment's real command verb is resolved through the shared
+ * {@link resolveSegmentVerb} wrapper table. A lone `expectCommand` flag used to
+ * read the FIRST word of a segment as the command head, so a transparent wrapper
+ * (`sudo`, `env FOO=1`, `timeout 5`, `nice -n 10`, `command`, `/usr/bin/time`)
+ * consumed the head slot and the REAL verb (`tee`/`sed`/`dd`) landed in argument
+ * position where it was never matched — measured `sudo tee src/x.ts` → `[]`, a
+ * DETECTION LOSS. This is the same fail-open class #991 closed in the ledger
+ * guard, in a warn-only (#800) consumer. `resolveSegmentVerb` unwraps the
+ * wrappers and returns a BASENAME-normalized verb, so an absolute `/usr/bin/tee`
+ * resolves to `tee` for free. It ALSO reports wrapper-written file operands
+ * (`writesFile: true`, the #992 discriminator) — `/usr/bin/time -o FILE npm test`
+ * truncates FILE while the verb is `npm`, a write with no redirect operator and
+ * no tee/sed/dd head; those are harvested exactly as {@link extractRedirectTargets}
+ * does.
+ *
+ * Hook-safe: pure, deterministic, no I/O. Never throws — a non-string / empty
+ * input returns `[]`.
+ *
+ * @param {string} command — the raw Bash command string
+ * @param {{ cwd?: string, home?: string }} [options] — `cwd`: the directory the
+ *   command runs in (hook input `cwd`), used to resolve a leading `$PWD`; absent →
+ *   the `$PWD/` prefix is stripped to a relative target (never dropped). `home`:
+ *   the directory a leading `~/` resolves against (default `os.homedir()`).
+ * @returns {string[]} de-duplicated list of likely write targets (may be empty)
+ */
+export function extractBashWriteTargets(command, options = {}) {
+  if (typeof command !== 'string' || command.length === 0) return [];
+  const { cwd, home } = options ?? {};
+
+  const out = [];
+  const seen = new Set();
+  // Expansion context (#1793 review F7). `pwdKnown` / `homeKnown` turn false
+  // from the first segment that may move the working directory / rebind HOME,
+  // and stay false for every later segment — see {@link segmentRebindsPwd}.
+  // A target word carries the lexer's per-part quote context (`parts`, #1795)
+  // and expandKnownPathPrefix decides from it. `noBackslash` / `noSingleQuote`
+  // are the FALLBACK for a word without `parts` (a copied or sliced token): the
+  // token-level `quoted` flag cannot tell `'$PWD/f'` from `"$PWD/f"`, and an
+  // unquoted backslash does not mark the token.
+  const expansion = {
+    cwd,
+    home,
+    pwdKnown: true,
+    homeKnown: true,
+    noBackslash: !command.includes('\\'),
+    noSingleQuote: !command.includes("'"),
+  };
+  const add = (raw, quoted = false, parts = undefined) => {
+    const value = expandKnownPathPrefix(raw, quoted, expansion, parts);
+    if (shouldSkipWriteTarget(value)) return;
+    const v = value.replace(/^\.\//, '');
+    if (!v || seen.has(v)) return;
+    seen.add(v);
+    out.push(v);
+  };
+
+  // Segment-first (#996.2): split on shell chain operators / newlines BEFORE
+  // interpreting, then resolve each segment's REAL verb through the shared
+  // wrapper table. `out`/`seen`/`add` stay outside the loop so de-duplication
+  // and first-seen ordering hold across segments (`echo a > x; echo b >> x`).
+  for (const segment of splitChainSegments(foldFdDupFilenameRedirects(tokenizeCommand(command)))) {
+    // F7: a segment that may move the cwd (or rebind HOME) disables the
+    // expansion for itself AND every later segment — never re-enabled, so a
+    // `$PWD/` target can never resolve against a directory the shell has left.
+    if (expansion.pwdKnown && segmentRebindsPwd(segment)) expansion.pwdKnown = false;
+    if (expansion.homeKnown && segmentRebindsHome(segment)) expansion.homeKnown = false;
+    // #996.2 namespace fix: resolve the verb in the SAME (paren-peeled,
+    // redirect-target-excluded) namespace the interpretation loop's `wordsSeen`
+    // counter walks below — see {@link verbResolutionSegment}. Passing the RAW
+    // segment mis-resolved a LEADING redirect (`> a.txt tee b.ts` → verb `>`) or a
+    // LEADING subshell paren (`(tee inner.ts)` → verb `(tee`): mode never became
+    // `tee`/`sed`/`dd` and the `index + 1` head-skip then swallowed the real
+    // write target. For A5's 10 wrapper forms (no leading redirect/paren) the view
+    // is a no-op, so verb/index/wrapperArgs — incl. the #992 `writesFile` marks —
+    // are byte-identical to the raw call.
+    const { verb, index, wrapperArgs } = resolveSegmentVerb(verbResolutionSegment(segment));
+    const tokens = classifyShellTokens(segment);
+
+    // A wrapper can WRITE a file through its OWN option, with no redirect and no
+    // tee/sed/dd verb: `/usr/bin/time -o src/report.txt npm test` truncates
+    // src/report.txt while the resolved verb is `npm`. `resolveSegmentVerb` marks
+    // exactly those operands `writesFile: true` (the #992 discriminator that
+    // keeps `nice -n 10` / `sudo -u root` operands OUT). Harvest them exactly as
+    // collectRedirectTargets does — the write is otherwise invisible to this pass.
+    for (const wa of wrapperArgs) {
+      // wrapperArgs carry no quote flag — treated as quoted (fail: never `~`).
+      if (wa.writesFile === true && typeof wa.value === 'string') add(wa.value, true);
+    }
+
+    // `mode` tracks a command-head that owns following args (tee/sed/dd). It is
+    // set ONCE per segment from the resolved verb, which `resolveSegmentVerb`
+    // returns basename-normalized — so an absolute `/usr/bin/tee` resolves to
+    // `tee` for free. `pendingRedirect` marks that the NEXT word is a redirect
+    // target; `heredocOpen` that a here-doc BODY word (DATA) follows.
+    const mode = verb === 'tee' || verb === 'sed' || verb === 'dd' ? verb : null;
+    let pendingRedirect = false;
+    let heredocOpen = false;
+    const sedArgs = []; // classified word tokens collected for a `sed -i` head
+    let sedInPlace = false;
+
+    // THE ONE CARE POINT of the #996.2 refactor: the first `index + 1` WORD
+    // tokens that REACH the `wordsSeen` counter are the wrapper chain + the verb
+    // itself, never file arguments. `index` now comes from
+    // {@link verbResolutionSegment}, which resolves the verb in the SAME namespace
+    // this loop walks — paren-peeled words with redirect targets removed — so
+    // `index` is 1:1 with the `word` tokens that reach the counter below (a
+    // leading redirect or subshell paren no longer shifts it out of alignment).
+    // `peelSubshellParens` emits AT MOST one `word` per raw token.
+    const headWordsToSkip = index + 1;
+    let wordsSeen = 0;
+
+    for (const tk of tokens) {
+      if (tk.type === 'redirect') {
+        pendingRedirect = true;
+        continue;
+      }
+      if (tk.type === 'heredoc') {
+        // here-doc: the delimiter emits no token; the BODY arrives later as data
+        pendingRedirect = false;
+        heredocOpen = true;
+        continue;
+      }
+      if (tk.type === 'in') {
+        // input redirect / here-string — not a write target
+        pendingRedirect = false;
+        continue;
+      }
+      if (tk.type === 'sep') {
+        // Within a segment the ONLY seps are peeled subshell parens — chain
+        // operators were already consumed by splitChainSegments. Reset only the
+        // pending redirect so `> >(cat)` stays inert (without it the peeled `cat`
+        // reads as the redirect target); mode/heredoc reset live at segment end.
+        pendingRedirect = false;
+        continue;
+      }
+      // word token
+      if (pendingRedirect) {
+        add(tk.value, tk.quoted, tk.parts);
+        pendingRedirect = false;
+        continue;
+      }
+      if (wordsSeen < headWordsToSkip) {
+        wordsSeen++; // wrapper chain + verb head — not a file argument
+        continue;
+      }
+      // subsequent argument words, interpreted per active command-head mode
+      if (heredocOpen) continue; // DATA, not a file argument
+      if (mode === 'tee') {
+        if (!isShellFlag(tk.value)) add(tk.value, tk.quoted, tk.parts);
+      } else if (mode === 'sed') {
+        if (/^-i/.test(tk.value)) sedInPlace = true;
+        sedArgs.push(tk);
+      } else if (mode === 'dd') {
+        if (tk.value.startsWith('of=')) add(tk.value.slice(3), tk.quoted);
+      }
+    }
+
+    // Segment end: flush a pending `sed -i` file argument (last non-flag arg).
+    // Only reached once per segment now that each segment carries a single verb,
+    // so the former sep-branch / defensive flushes are unnecessary.
+    if (mode === 'sed' && sedInPlace) {
+      for (let i = sedArgs.length - 1; i >= 0; i--) {
+        if (!isShellFlag(sedArgs[i].value)) {
+          add(sedArgs[i].value, sedArgs[i].quoted, sedArgs[i].parts);
+          break;
+        }
+      }
+    }
+  }
+
+  return out;
+}
+
+/** Leading `$PWD/` or `${PWD}/` — the one variable whose value the caller knows. */
+const PWD_PREFIX_RE = /^\$(?:PWD|\{PWD\})\/(.*)$/s;
+
+/**
+ * Resolve the two target prefixes whose value is knowable at parse time (#1793):
+ * `$PWD/` / `${PWD}/` and `~/`. Every other value is returned unchanged and meets
+ * the `$`/`~` skip rule. See the skip list on {@link extractBashWriteTargets} for
+ * the fail direction when `cwd` is absent (relative, never dropped).
+ *
+ * Fail direction (#1793 review F7): when the expansion is not PROVABLY what the
+ * shell does, the value is returned unexpanded so the `$`/`~` skip rule reports
+ * "unknown" — never a concrete path the shell would not write.
+ *   - `$PWD/` expands only while no earlier/same segment moved the cwd or rebound
+ *     PWD (`ctx.pwdKnown`), and only where the shell expands it: the whole
+ *     `$PWD` / `${PWD}` reference lies in ONE unquoted or double-quoted part
+ *     (#1795 `parts`) — `"$PWD"/f` and `$PWD/f` expand; `'$PWD'/f`, `$'$PWD'/f`,
+ *     `\$PWD/f`, `"\$PWD"/f` stay literal, and a quote boundary inside the
+ *     reference (`"$PW"D/f`, `"$"PWD/f`, `$"PWD"/f`) stays unresolved.
+ *   - `~/` expands only when the word's FIRST part is unquoted and starts with
+ *     `~/` (bash/zsh expand a tilde prefix only unquoted at the word start, up
+ *     to the first unquoted `/`) and while HOME was not rebound. `"~"/x`,
+ *     `\~/x` and `~"/x"` stay literal.
+ *   - Ceiling (BV-004), for a word WITHOUT `parts` (a token copied by a spread
+ *     or sliced, e.g. a `dd of=` operand): the token-level rule applies — ANY
+ *     backslash in the command disables both expansions, a quoted `$PWD/` token
+ *     expands only when the command holds no `'`, and a quoted `~` never
+ *     expands. Revisit if such a caller needs the precise reading.
+ *
+ * @param {string} value — unquoted target text
+ * @param {boolean} quoted — the lexer saw a quote or escape in this token
+ * @param {{ cwd?: string, home?: string, pwdKnown: boolean, homeKnown: boolean,
+ *   noBackslash: boolean, noSingleQuote: boolean }} ctx
+ * @param {Array<{ text: string, quote: string }>} [parts] — per-part quote
+ *   context of `value` from tokenizeCommand; ignored unless it spells `value`
+ * @returns {string}
+ */
+function expandKnownPathPrefix(value, quoted, ctx, parts) {
+  if (typeof value !== 'string') return value;
+  const exact = Array.isArray(parts) && parts.map((p) => p.text).join('') === value;
+  const pwd = PWD_PREFIX_RE.exec(value);
+  if (pwd) {
+    const rest = pwd[1];
+    const refLength = value.length - rest.length - 1; // `$PWD` / `${PWD}` before the `/`
+    // The WHOLE reference must sit in the word's FIRST part (C3, Codex review
+    // 2026-10-25): per-character categories alone accepted `"$PW"D/f` (variable
+    // `PW`, then `D/f`), `"$"PWD/f` (a literal `$`) and `$"PWD"/f` (a locale
+    // string) as `$PWD/f`. A quote boundary inside `$PWD` / `${PWD}` ends the
+    // reference there, so it is not provably PWD. The name's end is the `/`
+    // PWD_PREFIX_RE requires, so `$PWDX/f` never gets here.
+    // Leading zero-length parts (an empty `""` before the reference, which the
+    // lexer keeps since #1899) contribute no text, so `""$PWD/f` is `$PWD/f`
+    // to bash; skip only LEADING ones — an empty part inside the reference
+    // (`$""PWD/f`, a locale string) still ends it. The tilde check below keeps
+    // `parts[0]`: bash does not expand `~` after `""` (`""~/f` is literal).
+    const first = exact ? parts.find((p) => p.text.length > 0) : undefined;
+    const expands = exact
+      ? first !== undefined && (first.quote === 'none' || first.quote === 'double') && first.text.length >= refLength
+      : ctx.noBackslash && (!quoted || ctx.noSingleQuote);
+    if (!ctx.pwdKnown || !expands) return value;
+    if (rest.length === 0 || rest.includes('$')) return value; // dir only / nested expansion → skip
+    return typeof ctx.cwd === 'string' && ctx.cwd.length > 0 ? path.join(ctx.cwd, rest) : rest;
+  }
+  const tildeExpands = exact
+    ? parts[0].quote === 'none' && parts[0].text.startsWith('~/')
+    : !quoted && ctx.noBackslash;
+  if (tildeExpands && ctx.homeKnown && value.startsWith('~/') && value.length > 2) {
+    const base = typeof ctx.home === 'string' && ctx.home.length > 0 ? ctx.home : os.homedir();
+    return path.join(base, value.slice(2));
+  }
+  return value;
+}
+
+/**
+ * Words that move the shell's working directory, matched ANYWHERE in a segment
+ * (`builtin cd`, `if cd`, `command cd`, zsh `chdir`).
+ */
+const PWD_MOVING_WORDS = new Set(['cd', 'pushd', 'popd', 'chdir']);
+/**
+ * Verbs that run arbitrary shell text in THIS shell and so may move the cwd
+ * opaquely. Matched only as the resolved verb — a bare `.` argument
+ * (`find . …`) must not count.
+ */
+const OPAQUE_SHELL_VERBS = new Set(['source', '.', 'eval']);
+
+/**
+ * Does this chain segment possibly change the working directory or rebind
+ * `PWD` (F7)? Over-matching is the safe direction — it only withholds the
+ * `$PWD/` expansion (the pre-#1793 "unknown"); `echo cd > "$PWD/f"` therefore
+ * stays unexpanded, by design.
+ *
+ * Ceiling (BV-004): a shell FUNCTION or alias whose body runs `cd`, zsh
+ * AUTO_CD (a bare directory name as a command) and a script sourced through a
+ * wrapper are not recognised. Revisit if a guard needs to trust `$PWD/` after
+ * such a call.
+ *
+ * @param {Array<{ text: string, quoted: boolean }>} segment
+ * @returns {boolean}
+ */
+function segmentRebindsPwd(segment) {
+  if (OPAQUE_SHELL_VERBS.has(resolveSegmentVerb(verbResolutionSegment(segment)).verb)) return true;
+  return segment.some((tok) =>
+    PWD_MOVING_WORDS.has(tok.text.replace(/^.*\//, '').replace(/^\(+/, '')) || /^PWD(?:\+?=|$)/.test(tok.text));
+}
+
+/**
+ * Does this segment rebind `HOME` (`HOME=/x`, `export HOME`, `read HOME`)? A
+ * rebound HOME makes a later `~/` resolve elsewhere, so `~/` stays unexpanded.
+ * @param {Array<{ text: string, quoted: boolean }>} segment
+ * @returns {boolean}
+ */
+function segmentRebindsHome(segment) {
+  return segment.some((tok) => /^HOME(?:\+?=|$)/.test(tok.text));
+}
+
+/**
+ * Fold the `>&WORD` / `N>&WORD` forms back together (#1793 review F6).
+ *
+ * `tokenizeCommand` lexes `>&2` / `2>&1` as ONE dup token, but when the operand
+ * is not a digit run — `>& out.txt`, `>&out.txt`, `>&-`, `2>& out.txt` — it emits
+ * three: a truncate redirect (`>` / `2>`), a chain-operator `&` and the operand
+ * (measured 2026-10-24). The `&` then split the statement in
+ * `splitChainSegments`, so the operand became a new command and the write was
+ * invisible. In bash `>&WORD` with a non-numeric WORD writes stdout+stderr to the
+ * FILE WORD (= `&> WORD`).
+ *
+ * zsh's append form `>>& WORD` lexes as `>>` `&` `WORD` and folds the same way.
+ * An unquoted `&` straight after a `\d*>` / `\d*>>` redirect can never be a
+ * background operator (bash: syntax error), so the fold is safe:
+ *   - operand `^\d+$` or `-` → one dup token (`>&2`, `>&-`), still not a target;
+ *   - any other operand → the redirect followed by the operand, i.e. a target.
+ * `N>&file` with N ≠ 1 is an "ambiguous redirect" in bash 3.2/5 (no write) — it
+ * is still reported, the fail-closed over-report (zsh accepts more forms).
+ *
+ * Since #1832 `tokenizeCommand` resolves the glued `>&`/`>>&`/`<&` operand
+ * itself (resolveFdOperandRedirects) into exactly the pair this fold built, so
+ * no `\d*>` + chain `&` arrives from those forms and the fold is a no-op on
+ * them; it stays for the blank-separated `> & WORD` (a bash syntax error) and
+ * is idempotent on its own output (a dup token or `>` + word never re-folds).
+ * Parity of extractBashWriteTargets against the pre-#1832 lexer is pinned in
+ * tests/lib/scope-gate.test.mjs (`>& filename form`).
+ *
+ * @param {Array<{ text: string, quoted: boolean, redirect?: object }>} tokens
+ * @returns {Array<{ text: string, quoted: boolean, redirect?: object }>}
+ */
+function foldFdDupFilenameRedirects(tokens) {
+  const out = [];
+  for (let i = 0; i < tokens.length; i++) {
+    const tok = tokens[i];
+    const amp = tokens[i + 1];
+    const operand = tokens[i + 2];
+    if (
+      !tok.quoted && /^\d*>>?$/.test(tok.text) &&
+      amp !== undefined && !amp.quoted && amp.text === '&' &&
+      operand !== undefined
+    ) {
+      if (/^\d+$/.test(operand.text) || operand.text === '-') {
+        out.push({ text: `${tok.text}&${operand.text}`, quoted: false, redirect: { fd: tok.redirect?.fd ?? null, mode: 'dup' } });
+      } else {
+        out.push(tok, operand);
+      }
+      i += 2;
+      continue;
+    }
+    out.push(tok);
+  }
+  return out;
+}
+
+/**
+ * Is this token a CLI flag (starts with `-`)? Used to skip flags when picking
+ * file arguments for tee/sed. `-` alone (stdin) also counts as a flag.
+ * @param {string} v
+ * @returns {boolean}
+ */
+function isShellFlag(v) {
+  return typeof v === 'string' && v.startsWith('-');
+}
+
+/**
+ * Skip-rule gate for a candidate write target — see the documented skip list on
+ * {@link extractBashWriteTargets}. Returns true when the candidate must be dropped.
+ * @param {string} value — unquoted target text (quotes already stripped by the lexer)
+ * @returns {boolean}
+ */
+function shouldSkipWriteTarget(value) {
+  if (typeof value !== 'string' || value.length === 0) return true;
+  // Any embedded whitespace: a quoted-with-space path (best-effort — far more
+  // likely a quoting artefact than a real wave-scoped file) and, since #970, a
+  // multi-line here-doc BODY token that reached an argument slot as DATA.
+  if (/\s/.test(value)) return true;
+  if (value.startsWith('$') || value.startsWith('~')) return true; // variable / expansion
+  if (value.includes('$')) return true; // any embedded expansion (covers ${TMPDIR})
+  if (value.includes('(') || value.includes(')')) return true; // process-sub remnants
+  if (value.startsWith('/dev/')) return true; // device sink
+  if (value.startsWith('/tmp/') || value.startsWith('/private/tmp/')) return true; // temp sink
+  return false;
+}
+
+/** Unquoted `tokenizeCommand` operator texts that break the current command. */
+const SHELL_SEPARATOR_OPS = new Set([';', '|', '||', '&', '&&']);
+/**
+ * Write redirects: `>`, `>>`, `>|`, fd-prefixed forms (`2>`, `2>>`) and the
+ * both-streams forms `&>` / `&>>` (#1793 — `tokenizeCommand` emits those as ONE
+ * token; without the `&` alternative they matched nothing and the target was lost).
+ * Fd duplication (`>&2`, `2>&1`) arrives as one token too and still does not match;
+ * the split filename form `>` `&` `WORD` is folded first by {@link foldFdDupFilenameRedirects}.
+ */
+const WRITE_REDIRECT_OP_RE = /^(?:\d*|&)(?:>>|>\|?)$/;
+/** Here-doc operators `<<` / `<<-` — a DATA body token follows at the next newline. */
+const HEREDOC_OP_RE = /^\d*<<-?$/;
+/** Other input redirects `<` / `<<<` (here-string) — never a write target, no body. */
+const INPUT_REDIRECT_OP_RE = /^\d*(?:<<<|<)$/;
+
+/**
+ * Split leading `(` / trailing `)` off an UNQUOTED word token into standalone
+ * separator tokens.
+ *
+ * Since #1667 `tokenizeCommand` splits a word-start subshell `(` / `)` itself,
+ * so `(echo x > y)` arrives as `;` `echo` `x` `>` `y` `;`. What still arrives
+ * glued is paren text the lexer deliberately keeps inside a word — a process
+ * substitution word (`>(cat)`), `f()`, `arr=(…)`, case patterns, and openers
+ * past its nesting cap. Peeling keeps those from reading as a literal `y)`
+ * target, and `> >(cat)` still yields nothing because the peeled `cat` lands in
+ * command-head position rather than redirect-target position.
+ *
+ * Quoted tokens are never peeled: `echo '(' x` must keep its literal paren.
+ *
+ * @param {{text: string, quoted: boolean}} tok
+ * @returns {Array<{type: string, value?: string}>}
+ */
+function peelSubshellParens(tok) {
+  // `parts` (#1795, non-enumerable on the lexer token) rides along only while
+  // the word text is the token text unchanged; a peeled word gets none, and
+  // expandKnownPathPrefix then falls back to its token-level rule.
+  if (tok.quoted) return [{ type: 'word', value: tok.text, quoted: true, parts: tok.parts }];
+  let text = tok.text;
+  const out = [];
+  while (text.startsWith('(')) { out.push({ type: 'sep' }); text = text.slice(1); }
+  const trailing = [];
+  while (text.endsWith(')')) { trailing.push({ type: 'sep' }); text = text.slice(0, -1); }
+  if (text.length > 0 || (out.length === 0 && trailing.length === 0)) {
+    out.push({ type: 'word', value: text, quoted: false, parts: text === tok.text ? tok.parts : undefined });
+  }
+  return out.concat(trailing);
+}
+
+/**
+ * Re-shape the shared `tokenizeCommand` output into the redirect/in/sep/word
+ * stream {@link extractBashWriteTargets} interprets. Operator classification is
+ * applied ONLY to unquoted tokens, so `echo '>' x` keeps its `>` as literal text.
+ *
+ * `&>` / `&>>` arrive as ONE token from `tokenizeCommand` and are classified by
+ * {@link WRITE_REDIRECT_OP_RE} (#1793 — an older note here claimed they were lexed
+ * as `&` + `>`; measured 2026-10-24 they are not, and the target was lost).
+ * `2>&1` / `>&2` likewise arrive as one dup token and yield nothing (`>&-` and
+ * `>& 2` after {@link foldFdDupFilenameRedirects}).
+ *
+ * Token shapes: { type: 'redirect' } | { type: 'in' } | { type: 'sep' }
+ *             | { type: 'word', value: string }
+ *
+ * @param {Array<{text: string, quoted: boolean}>} tokens
+ * @returns {Array<{type: string, value?: string}>}
+ */
+function classifyShellTokens(tokens) {
+  const out = [];
+  for (const tok of tokens) {
+    if (!tok.quoted) {
+      if (SHELL_SEPARATOR_OPS.has(tok.text)) { out.push({ type: 'sep' }); continue; }
+      if (WRITE_REDIRECT_OP_RE.test(tok.text)) { out.push({ type: 'redirect' }); continue; }
+      if (HEREDOC_OP_RE.test(tok.text)) { out.push({ type: 'heredoc' }); continue; }
+      if (INPUT_REDIRECT_OP_RE.test(tok.text)) { out.push({ type: 'in' }); continue; }
+    }
+    out.push(...peelSubshellParens(tok));
+  }
+  return out;
+}
+
+/**
+ * Project a raw chain segment into the token list used for VERB resolution,
+ * in the SAME namespace {@link extractBashWriteTargets}'s interpretation loop
+ * walks with its `wordsSeen` counter (#996.2 namespace fix).
+ *
+ * {@link resolveSegmentVerb} resolves argv[0] from RAW tokens. Two segment shapes
+ * put a NON-verb token in raw position 0 and so mis-resolve the command head,
+ * losing the write target the pre-#996.2 pass had detected:
+ *   - a LEADING write-redirect — `> a.txt tee b.ts` resolves the `>` operator as
+ *     the "verb" (mode never becomes `tee`), and the loop's `index + 1` head-skip
+ *     then swallows `tee`, dropping `b.ts`.
+ *   - a LEADING subshell paren — `(tee inner.ts)` keeps the raw token `(tee`
+ *     (`.replace(/^.*\//,'')` leaves it untouched, no `/`), so the wrapper table
+ *     never matches: verb is the literal `(tee`, again mode-less. The classified
+ *     stream peels the paren AFTER, so the raw verb index and the peeled word
+ *     stream diverge.
+ *
+ * The projection makes both namespaces agree: peel leading/trailing parens off
+ * each unquoted token (matching {@link peelSubshellParens}' WORD output) and drop
+ * every write-redirect operator together with its target word — exactly the
+ * tokens the interpretation loop keeps OUT of `wordsSeen` (redirect operators are
+ * not `word`s; their targets are consumed by the `pendingRedirect` branch before
+ * the counter). The resulting segment's verb INDEX is then 1:1 with `wordsSeen`,
+ * so `index + 1` skips the wrapper chain + verb and no more.
+ *
+ * A5's 10 transparent-wrapper forms carry neither a leading redirect nor a paren,
+ * so this is a NO-OP for them: `resolveSegmentVerb`'s verb/index/wrapperArgs (incl.
+ * the #992 `writesFile` operand marks) are byte-identical to the raw-segment call.
+ *
+ * @param {Array<{ text: string, quoted: boolean }>} segment
+ * @returns {Array<{ text: string, quoted: boolean }>}
+ */
+function verbResolutionSegment(segment) {
+  const out = [];
+  let pendingRedirectTarget = false;
+  for (const tok of segment) {
+    if (!tok.quoted) {
+      // A write redirect consumes the NEXT token as its target — neither the
+      // operator nor its target reaches `wordsSeen`, so both must be absent here
+      // to keep the verb index aligned.
+      if (WRITE_REDIRECT_OP_RE.test(tok.text)) {
+        pendingRedirectTarget = true;
+        continue;
+      }
+      // heredoc / input-redirect operators carry no immediate target token that
+      // reaches `wordsSeen` (the here-doc delimiter emits nothing; an input target
+      // DOES reach the counter and so is kept) — drop only the operator itself.
+      if (HEREDOC_OP_RE.test(tok.text) || INPUT_REDIRECT_OP_RE.test(tok.text)) {
+        pendingRedirectTarget = false;
+        continue;
+      }
+      // Within a segment the only separator that can appear is an fd-dup `&`
+      // (e.g. `2>&1`), which classifyShellTokens also treats as a `sep` that
+      // resets the pending redirect — mirror that so the target after it stays.
+      if (SHELL_SEPARATOR_OPS.has(tok.text)) {
+        pendingRedirectTarget = false;
+        continue;
+      }
+    }
+    if (pendingRedirectTarget) {
+      pendingRedirectTarget = false;
+      continue; // this token is the dropped write-redirect target
+    }
+    if (tok.quoted) {
+      out.push(tok);
+      continue;
+    }
+    let text = tok.text;
+    while (text.startsWith('(')) text = text.slice(1);
+    while (text.endsWith(')')) text = text.slice(0, -1);
+    if (text.length === 0) continue; // pure paren = a separator, not a word
+    out.push({ text, quoted: false });
+  }
+  return out;
+}
+
+/**
+ * Build an actionable suggestion string for a scope violation.
+ *
+ * @param {string} relPath — the relative path that was blocked
+ * @param {string} allowedCsv — comma-separated list of allowed paths (may be empty)
+ * @returns {string}
+ */
+export function suggestForScopeViolation(relPath, allowedCsv) {
+  if (!allowedCsv) {
+    return (
+      `No paths are currently allowed for this wave. ` +
+      `If '${relPath}' is in-scope, update the session plan and restart the wave.`
+    );
+  }
+  return (
+    `Allowed paths: [${allowedCsv}]. ` +
+    `If '${relPath}' belongs to this wave, add its directory to the plan's wave scope and restart.`
+  );
+}
+
+/**
+ * Prefix that marks an aggregate-sidecar record as a PEER SESSION's declared
+ * scope rather than one of this wave's own agents (#1195).
+ *
+ * SSOT: this constant lives here — in the module both the `--union` helper and
+ * `hooks/post-bash-write-verify.mjs` already import — so the union exclusion
+ * below and the hook's peer-write notice can never disagree about what a peer
+ * record IS.
+ */
+export const PEER_RECORD_PREFIX = 'peer-session-';
+
+/**
+ * Is this record id a PEER SESSION's record (see {@link PEER_RECORD_PREFIX})?
+ * Fail-closed: a non-string id is not a peer record.
+ *
+ * @param {unknown} id
+ * @returns {boolean}
+ */
+export function isPeerRecordId(id) {
+  return typeof id === 'string' && id.startsWith(PEER_RECORD_PREFIX);
+}
+
+/**
+ * Record id of the COORDINATOR's own planned direct edits (#1020): one
+ * `{id: 'coordinator', files}` record in a wave's aggregate sidecar, and
+ * `<state-dir>/filescopes/wave-<N>/coordinator.json` in the per-agent shape.
+ * Exactly lowercase — `materialize-wave-scope.mjs` rejects any other casing.
+ *
+ * The coordinator is a declarant but never a DISPATCH: no `FILE-SCOPE` block is
+ * injected for it, no digest is echoed back, no agent is counted for it. Every
+ * consumer that joins scope files against dispatches must skip it, or it reports
+ * the coordinator's own scope as an omitted injection (#1493.2). SSOT beside
+ * {@link PEER_RECORD_PREFIX} for the same reason that one lives here.
+ */
+export const COORDINATOR_RECORD_ID = 'coordinator';
+
+/**
+ * Is this record id the coordinator's (see {@link COORDINATOR_RECORD_ID})?
+ * Exact match; a non-string id is not the coordinator.
+ *
+ * @param {unknown} id
+ * @returns {boolean}
+ */
+export function isCoordinatorRecordId(id) {
+  return id === COORDINATOR_RECORD_ID;
+}
+
+/**
+ * Is this repo-relative path inside a wave's per-agent scope declarations,
+ * `<state-dir>/filescopes/` (shape (a) and the aggregate sidecar, #1020)?
+ *
+ * Those files are coordinator CONTROL STATE like `wave-scope.json` itself,
+ * written by `materialize-wave-scope.mjs` once per wave — never a wave
+ * territory, so a write there is not a scope violation (#1027 Pkt 5). The
+ * caller passes the manifest's own repo-relative path, so the state dir is the
+ * one THIS manifest lives in, never a guessed `.claude/`.
+ *
+ * @param {string} relPath repo-relative, forward slashes
+ * @param {string} scopeRelPath repo-relative path of the active `wave-scope.json`
+ * @returns {boolean}
+ */
+export function isScopeDeclarationPath(relPath, scopeRelPath) {
+  if (typeof relPath !== 'string' || typeof scopeRelPath !== 'string') return false;
+  const scopeRel = scopeRelPath.replace(/\\/g, '/');
+  const cut = scopeRel.lastIndexOf('/');
+  if (cut <= 0) return false;
+  return relPath.startsWith(`${scopeRel.slice(0, cut)}/filescopes/`);
+}
+
+/**
+ * Merge many agents' declared file scopes into ONE deduplicated, order-stable
+ * list — the mechanical form of "allowedPaths is the UNION of all agent file
+ * scopes" (#1020, wave-loop.md § Scope Manifest #3).
+ *
+ * Motivation: today the coordinator writes `wave-scope.json` `allowedPaths` from
+ * one hand-kept list and the agent briefs from a SECOND, separately formulated
+ * list. Nothing couples them; they diverged five times in one session (#1020).
+ * Deriving the union FROM the per-agent declarations makes that divergence
+ * structurally impossible instead of discipline-dependent.
+ *
+ * Accepts BOTH input shapes, because the two call sites differ:
+ *   - `[['a.mjs','b.mjs'], ['c.mjs']]`                 — bare scope arrays
+ *   - `[{id:'W1-D1', files:['a.mjs']}, {id:'W1-D2', …}]` — the CLI/plan record
+ *     shape, which is also {@link findScopeCollisions}' input (one source object
+ *     feeding both consumers is the whole point of #1020).
+ *
+ * Order is INSERTION order (first-seen wins), never sorted: the union is written
+ * into a manifest that a human reads next to the plan, and a stable order keeps
+ * its diff readable across re-unions (#796 rewrites it mid-wave).
+ *
+ * Fail-closed & no-throw (module convention): a non-array input returns `[]`;
+ * non-array / non-object members and non-string, empty entries are skipped.
+ * Pure, sync, no I/O — hook-safe per the module header.
+ *
+ * ENTRIES ARE EMITTED IN CANONICAL SPELLING ({@link scopeEntrySpelling}) and
+ * deduplicated on it. Gate 7 matches the repo-relative WRITE path against each
+ * entry, so a verbatim `./scripts/lib/foo.mjs` was a pattern no write could
+ * ever match — the declaring agent's own write was denied — and kept a second
+ * spelling of `scripts/lib/foo.mjs` beside it. The agent-side checks
+ * ({@link assertFileScopeSubset}, {@link testSiblingsFor}) compare the same
+ * spelling, so a per-agent file that keeps the plan's `./x` still passes.
+ *
+ * PEER RECORDS ARE EXCLUDED (#1195 follow-through). A record whose id starts
+ * with `peer-session-` declares a territory NO agent of this wave may write —
+ * it exists so a peer's paths take part in the DISJOINTNESS check and so
+ * `hooks/post-bash-write-verify.mjs` can name a peer write instead of alarming
+ * about it. Unioning it into `allowedPaths` would do the exact inverse: Gate 7
+ * (`hooks/enforce-scope.mjs`) would GRANT every agent of the wave write access
+ * to the peer's files, and the hook's peer branch would become dead code (a
+ * peer path can only reach it while it is OUTSIDE `allowedPaths`). The
+ * exclusion lives HERE — the one helper `--union` runs — rather than in the
+ * CLI, so every consumer of the union inherits it.
+ * `findScopeCollisions` deliberately does NOT filter: a peer/agent path
+ * collision is a real collision and must surface.
+ *
+ * @param {Array<string[]|{id?: string, files?: string[]}>} scopes
+ * @returns {string[]} deduplicated union in first-seen order
+ */
+export function unionFileScopes(scopes) {
+  if (!Array.isArray(scopes)) return [];
+  const out = [];
+  const seen = new Set();
+  for (const scope of scopes) {
+    let files = null;
+    if (Array.isArray(scope)) files = scope;
+    else if (scope !== null && typeof scope === 'object' && Array.isArray(scope.files)) {
+      if (isPeerRecordId(scope.id)) continue;
+      files = scope.files;
+    }
+    if (files === null) continue;
+    for (const entry of files) {
+      if (typeof entry !== 'string' || entry.length === 0) continue;
+      const spelled = scopeEntrySpelling(entry);
+      if (seen.has(spelled)) continue;
+      seen.add(spelled);
+      out.push(spelled);
+    }
+  }
+  return out;
+}
+
+/**
+ * Is this scope entry RECURSIVE — does it grant everything below a directory?
+ * `**` is the explicit form; a trailing `/` is the implicit one, because
+ * {@link pathMatchesPattern} matches a `dir/` prefix with `startsWith`, i.e. at
+ * ANY depth. Both must count, or `tests/` vs `tests/lib/*.mjs` reads as disjoint.
+ * @param {string} entry
+ * @returns {boolean}
+ */
+function isRecursiveScopeEntry(entry) {
+  return entry.includes('**') || entry.endsWith('/');
+}
+
+/**
+ * Literal SUFFIX of a glob entry — the text after its last `*` metachar
+ * (`src/**\/*.mjs` → `.mjs`, `src/**` → `''`). Returns `null` for an entry with
+ * no `*` at all (a `dir/` prefix), where the concept does not apply: such an
+ * entry constrains only the head of a path, never its tail.
+ * @param {string} entry
+ * @returns {string|null}
+ */
+function literalScopeSuffix(entry) {
+  const star = entry.lastIndexOf('*');
+  return star === -1 ? null : entry.slice(star + 1);
+}
+
+/**
+ * Segments of a scope entry, with the implicit recursion of a trailing `/` made
+ * EXPLICIT as a `**` segment (`tests/` → `['tests', '**']`).
+ *
+ * Load-bearing: {@link pathMatchesPattern} matches a `dir/` prefix with
+ * `startsWith`, i.e. at ANY depth. Splitting `tests/` naively yields a trailing
+ * EMPTY segment, which {@link globsDisagreeOnLiteralSegment} would then compare
+ * against `lib` as if the entry ended there — turning `tests/` vs
+ * `tests/lib/*.mjs` into a false "disjoint".
+ *
+ * @param {string} entry
+ * @returns {string[]}
+ */
+function scopeEntrySegments(entry) {
+  const segs = entry.split('/');
+  if (segs.length > 1 && segs[segs.length - 1] === '') segs[segs.length - 1] = '**';
+  return segs;
+}
+
+/**
+ * Is this segment a PLAIN literal — one that can only match the byte-identical
+ * path segment? Deliberately conservative: `*`, `**`, `?`, `{a,b}` and `[...]`
+ * all count as "could match anything", and an empty segment does too.
+ * @param {string} seg
+ * @returns {boolean}
+ */
+function isPlainLiteralSegment(seg) {
+  return seg.length > 0 && !/[*?{}[\]]/.test(seg);
+}
+
+/**
+ * Do two glob entries carry PLAIN LITERAL segments that DISAGREE at an aligned
+ * position? If so no path can satisfy both, and the pair is disjoint however
+ * much literal prefix and suffix they share (#1130).
+ *
+ * Alignment is exact — and only within the two scans below. Every segment that
+ * is not `**` consumes EXACTLY ONE path segment (`*` compiles to `[^/]*`, which
+ * never crosses `/`; `?`/`{}`/`[]` are regex-ESCAPED by
+ * {@link pathMatchesPattern}, so they are literal text). `**` is the only
+ * variable-width segment, so each scan walks inward from one end and STOPS at
+ * the first `**` on either side — past that wall, positions no longer
+ * correspond. That is why the #1130 pair is decided from the TAIL:
+ * `scripts/**\/reconcile/*.mjs` vs `scripts/**\/learnings/*.mjs` share the
+ * `scripts` head and the `*.mjs` tail, and `reconcile` vs `learnings` is the
+ * first aligned position inward from the tail.
+ *
+ * CEILING (BV-004) — literal-vs-literal ONLY. A `{a,b}`, `?` or `[...]` segment
+ * is treated as "could match anything" and proves nothing, so
+ * `scripts/**\/{reconcile,x}/*.mjs` vs `scripts/**\/learnings/*.mjs` still
+ * reports a collision even though this dialect escapes braces into literal
+ * text. That over-approximation is the SAFE direction for a collision gate (a
+ * reported non-collision costs a coordinator one re-plan; a missed one is the
+ * #1020 incident). Revisit only if {@link pathMatchesPattern} gains real brace
+ * or char-class expansion — then those segments become enumerable and can be
+ * compared set-wise instead of being waved through.
+ *
+ * @param {string} x
+ * @param {string} y
+ * @returns {boolean} true when the two entries provably cannot match one path
+ */
+function globsDisagreeOnLiteralSegment(x, y) {
+  const xs = scopeEntrySegments(x);
+  const ys = scopeEntrySegments(y);
+  const isWall = (seg) => seg.includes('**');
+  const disagree = (a, b) =>
+    isPlainLiteralSegment(a) && isPlainLiteralSegment(b) && a !== b;
+
+  // Scan inward from the HEAD, stopping at the first `**` wall.
+  for (let k = 0; k < xs.length && k < ys.length; k++) {
+    if (isWall(xs[k]) || isWall(ys[k])) break;
+    if (disagree(xs[k], ys[k])) return true;
+  }
+  // Scan inward from the TAIL, same wall rule. Independent of the head scan:
+  // either end can carry the deciding literal, and #1130's does not sit at the
+  // head (both entries begin `scripts/**`).
+  for (let k = 0; k < xs.length && k < ys.length; k++) {
+    const xv = xs[xs.length - 1 - k];
+    const yv = ys[ys.length - 1 - k];
+    if (isWall(xv) || isWall(yv)) break;
+    if (disagree(xv, yv)) return true;
+  }
+  return false;
+}
+
+/**
+ * Normalize the `agentScopes` input of {@link findScopeCollisions} into
+ * `{id, declaredId, files}` records. Never throws; malformed members are
+ * repaired rather than dropped.
+ *
+ * A member with NO usable `id` keeps its files in the check under a synthetic
+ * `<unnamed#i>` id (i = its index). Dropping it instead would be a FALSE
+ * NEGATIVE — the whole point of this function is that an unreviewed scope is
+ * exactly the one that collides.
+ *
+ * `files` holds each entry's comparison SPELLING ({@link scopeEntrySpelling});
+ * `declared` holds the entry as written, index-aligned, for the evidence report.
+ *
+ * @param {Array<{id?: string, files?: string[]}>} agentScopes
+ * @returns {Array<{id: string, declaredId: string|null, files: string[], declared: string[]}>}
+ */
+function normalizeAgentScopes(agentScopes) {
+  const out = [];
+  for (let i = 0; i < agentScopes.length; i++) {
+    const raw = agentScopes[i];
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) continue;
+    const declaredId = typeof raw.id === 'string' && raw.id.length > 0 ? raw.id : null;
+    const declared = Array.isArray(raw.files)
+      ? raw.files.filter((f) => typeof f === 'string' && f.length > 0)
+      : [];
+    const files = declared.map(scopeEntrySpelling);
+    out.push({ id: declaredId ?? `<unnamed#${i}>`, declaredId, files, declared });
+  }
+  return out;
+}
+
+/**
+ * One scope entry's canonical SPELLING — THE spelling rule of this module.
+ * Used by the collision comparison (#1026.3), by {@link unionFileScopes} (whose
+ * output IS `allowedPaths`, so Gate 7 sees this spelling), and on the agent side
+ * of {@link assertFileScopeSubset} / {@link testSiblingsFor}, so a per-agent file
+ * that keeps the plan's declaration verbatim still agrees with the union.
+ * Equal-meaning spellings compared unequal before: `./scripts/lib/foo.mjs` vs
+ * `scripts/lib/foo.mjs` was reported disjoint (measured 2026-10-03 @ 8292050e).
+ * It changes no grant's MEANING — only how one is spelled.
+ *
+ * Collapses runs of `/` and drops `.` segments (`./a`, `a/./b`). A leading `/`
+ * (absolute entry) and a trailing `/` survive: the trailing slash is meaning,
+ * not spelling — `scripts/lib/` is a prefix grant, while `scripts/lib` grants
+ * only the literal path `scripts/lib` (`pathMatchesPattern('scripts/lib/foo.mjs',
+ * 'scripts/lib') === false`), so those two stay disjoint.
+ *
+ * NAMED CEILING: `..` segments are left alone — `a/../b` is not provably `b`
+ * when `a` is a glob segment. Revisit if a plan ever declares a `..` entry.
+ *
+ * EXPORTED as the ONE spelling rule (#1510 g): `hooks/pre-task-scope-disjoint.mjs`
+ * applies it (late-bound) before its own dedupe and dir-promotion, instead of a
+ * hand-copied twin that had already drifted (`a/././b` kept a `./` segment).
+ * Whitespace is NOT trimmed here: no writer of a scope entry produces padding
+ * (the hook's prose cleaner trims before this rule runs; sidecar entries are
+ * JSON strings the plan writes), and trimming would rewrite a declared path.
+ *
+ * @param {string} entry - a non-empty scope entry
+ * @returns {string}
+ */
+export function scopeEntrySpelling(entry) {
+  const spelled = entry.replace(/\/{2,}/g, '/').replace(/(^|\/)(?:\.\/)+/g, '$1');
+  // `./` alone would spell as '' — keep the entry rather than invent a meaning.
+  return spelled.length > 0 ? spelled : entry;
+}
+
+/**
+ * Classify a SINGLE cross-agent entry pair, in the binding three-stage order.
+ * Returns the collision `kind`, or `null` when the two entries are disjoint.
+ *
+ * Stage order is not cosmetic — see {@link findScopeCollisions} for why the two
+ * exact stages must run BEFORE the approximate one.
+ *
+ * @param {string} x — an entry from agent A
+ * @param {string} y — an entry from agent B
+ * @param {(glob: string) => Set<string>} expand — memoized KNOWN-set expander
+ * @returns {'concrete'|'glob-expanded'|'glob-prefix'|null}
+ */
+function classifyEntryCollision(x, y, expand) {
+  // Stage 1 — exact string equality. The commonest real case (#1020 Vorfall 3),
+  // and the ONLY stage that works for a file that does not exist yet.
+  if (x === y) return 'concrete';
+
+  const xIsGlob = isGlobScopeEntry(x);
+  const yIsGlob = isGlobScopeEntry(y);
+
+  // Stage 2 — concrete vs glob. `pathMatchesPattern` is DIRECTED (arg 1 is a
+  // literal path, arg 2 becomes the regex); used in that one correct direction
+  // it is exact and needs no filesystem witness.
+  if (!xIsGlob && yIsGlob) return pathMatchesPattern(x, y) ? 'concrete' : null;
+  if (xIsGlob && !yIsGlob) return pathMatchesPattern(y, x) ? 'concrete' : null;
+  if (!xIsGlob && !yIsGlob) return null; // two distinct concrete paths: disjoint
+
+  // Stage 3a — glob ∩ glob, decided by a shared WITNESS from the KNOWN set.
+  const xHits = expand(x);
+  for (const witness of expand(y)) {
+    if (xHits.has(witness)) return 'glob-expanded';
+  }
+
+  // Stage 3b — prefix fallback, for the intersection that exists only in files
+  // NOT YET on disk (the KNOWN set cannot witness those).
+  const xPrefix = literalScopePrefix(x);
+  const yPrefix = literalScopePrefix(y);
+  if (!(xPrefix.startsWith(yPrefix) || yPrefix.startsWith(xPrefix))) return null;
+  if (!(isRecursiveScopeEntry(x) || isRecursiveScopeEntry(y))) return null;
+  // Suffix compatibility is a NECESSARY condition, so filtering on it adds no
+  // false negative: a string ending in both `sx` and `sy` forces the shorter to
+  // be a suffix of the longer. It removes the obvious false positive
+  // `scripts/**\/*.ts` vs `scripts/**\/*.mjs`, which share a prefix and are both
+  // recursive yet can never match the same path.
+  const xSuffix = literalScopeSuffix(x);
+  const ySuffix = literalScopeSuffix(y);
+  if (
+    xSuffix !== null &&
+    ySuffix !== null &&
+    !(xSuffix.endsWith(ySuffix) || ySuffix.endsWith(xSuffix))
+  ) {
+    return null;
+  }
+  // Prefix + suffix say nothing about the MIDDLE, so `scripts/**\/reconcile/
+  // *.mjs` vs `scripts/**\/learnings/*.mjs` passed every check above and was
+  // reported as a collision (#1130, reproduced 2026-08-24 @ f0766e1). One
+  // aligned pair of DISAGREEING plain literals settles it — see the ceiling
+  // note on the helper for what it deliberately does not decide.
+  if (globsDisagreeOnLiteralSegment(x, y)) return null;
+  return 'glob-prefix';
+}
+
+/**
+ * Detect files claimed by TWO agents of the SAME wave, BEFORE dispatch (#1020).
+ *
+ * ## The bug this closes
+ * `tests/scripts/sweep-expired-learnings-cli.test.mjs` was handed to two agents
+ * of one wave (#1020 Vorfall 3). Nothing caught it up front: the pre-dispatch
+ * assertion {@link assertFileScopeSubset} checks each agent against the union
+ * (a SUBSET relation, which two overlapping agents both satisfy), and the
+ * commit-time `wave-scope-commit-guard` only sees the union as well. It surfaced
+ * afterwards, from an agent's own PSA-002 report. Per
+ * `.claude/rules/parallel-sessions.md` § Decision Tree a file inside two
+ * declared scopes of one dispatch round is never a benign sibling signal — it is
+ * a deconfliction gap, and that round ended well by luck, not construction.
+ *
+ * ## The three stages, and why the order is binding
+ *  1. **Exact string equality** → `concrete`. Covers the commonest real case AND
+ *     every file that does not exist yet (no filesystem witness required).
+ *  2. **Concrete vs glob** via {@link pathMatchesPattern} → `concrete`. Exact and
+ *     I/O-free, because the matcher is used in its one correct direction.
+ *  3. **Glob vs glob** — expand both against
+ *     `KNOWN = opts.knownFiles ∪ {every concrete entry of every agent}`;
+ *     a non-empty intersection is `glob-expanded`. As a fallback for files not
+ *     yet on disk, a literal-prefix containment plus at least one recursive
+ *     entry is `glob-prefix`.
+ *
+ * Stage 3 must come LAST because {@link pathMatchesPattern} is DIRECTED and
+ * therefore useless for glob∩glob: it compiles argument 2 into a regex and tests
+ * argument 1 as a literal string. Measured:
+ * `pathMatchesPattern('scripts/**\/*.mjs', 'scripts/lib/*.mjs') === false`, even
+ * though both match `scripts/lib/x.mjs`. {@link assertFileScopeSubset} documents
+ * that boundary at its own glob branch and OVER-approximates coverage, which is
+ * the safe direction for a subset check. For a COLLISION check the sign flips:
+ * the same over-approximation becomes a FALSE NEGATIVE — a missed collision,
+ * i.e. exactly the incident. Hence stages 1 and 2 decide first, and stage 3 is
+ * reached only for pairs neither of them can settle.
+ *
+ * ## Duplicate ids are a SEPARATE finding, not a collision
+ * Two records carrying the same `id` are a malformed plan, not two agents
+ * fighting over a file; reporting them as a self-collision (`a === b`) would be
+ * noise. They are listed in `duplicateIds` and such pairs are skipped in the
+ * pairwise scan. `duplicateIds` is always present (empty when clean) so
+ * consumers need no conditional-key handling.
+ *
+ * ## `knownFiles` is INJECTED, never discovered
+ * The module header's hook-safe invariant (pure, sync, no I/O, no process spawn)
+ * is binding: `hooks/enforce-scope.mjs` reaches this module on a hot path, and
+ * under the exit-0/stdout-JSON protocol a throw here reads as "no decision" =
+ * ALLOW. So `git ls-files` belongs to the CLI layer and its result arrives as a
+ * parameter. An absent/invalid `knownFiles` is not an error — stage 3a simply
+ * has fewer witnesses and stage 3b carries the load.
+ *
+ * Fail-closed & no-throw: a non-array `agentScopes` returns
+ * `{ ok: false, collisions: [], duplicateIds: [] }` ("cannot assert → treat as
+ * failure", the same convention as {@link assertFileScopeSubset}).
+ *
+ * Output ordering is deterministic: agent pairs in input order, then kinds in
+ * stage order (`concrete` → `glob-expanded` → `glob-prefix`); `evidence` holds
+ * the involved entries of that kind, deduplicated in first-seen order.
+ *
+ * @param {Array<{id?: string, files?: string[]}>} agentScopes — one wave's agents
+ * @param {{knownFiles?: string[]}} [opts] — existing repo files (injected)
+ * @returns {{ok: boolean,
+ *            collisions: Array<{a: string, b: string, evidence: string[],
+ *                               kind: 'concrete'|'glob-expanded'|'glob-prefix'}>,
+ *            duplicateIds: string[]}}
+ */
+export function findScopeCollisions(agentScopes, opts = {}) {
+  if (!Array.isArray(agentScopes)) return { ok: false, collisions: [], duplicateIds: [] };
+  const options = opts !== null && typeof opts === 'object' ? opts : {};
+  const agents = normalizeAgentScopes(agentScopes);
+
+  // Duplicate DECLARED ids (synthetic `<unnamed#i>` ids are unique by index).
+  const seenIds = new Set();
+  const dupIds = new Set(); // Set preserves insertion order → stable report
+  for (const agent of agents) {
+    if (agent.declaredId === null) continue;
+    if (seenIds.has(agent.declaredId)) dupIds.add(agent.declaredId);
+    else seenIds.add(agent.declaredId);
+  }
+  const duplicateIds = [...dupIds];
+
+  // KNOWN = injected repo files ∪ every concrete entry of every agent. The
+  // second half matters: a file the wave is about to CREATE is not in
+  // `git ls-files`, but if one agent names it concretely it can still witness
+  // another agent's glob.
+  const known = [];
+  const knownSeen = new Set();
+  const addKnown = (f) => {
+    if (typeof f !== 'string' || f.length === 0 || knownSeen.has(f)) return;
+    knownSeen.add(f);
+    known.push(f);
+  };
+  if (Array.isArray(options.knownFiles)) options.knownFiles.forEach(addKnown);
+  for (const agent of agents) {
+    for (const entry of agent.files) if (!isGlobScopeEntry(entry)) addKnown(entry);
+  }
+
+  const expansions = new Map();
+  const expand = (glob) => {
+    let hits = expansions.get(glob);
+    if (hits === undefined) {
+      hits = new Set(known.filter((f) => pathMatchesPattern(f, glob)));
+      expansions.set(glob, hits);
+    }
+    return hits;
+  };
+
+  const KIND_ORDER = ['concrete', 'glob-expanded', 'glob-prefix'];
+  const collisions = [];
+  for (let i = 0; i < agents.length; i++) {
+    for (let j = i + 1; j < agents.length; j++) {
+      const a = agents[i];
+      const b = agents[j];
+      if (a.id === b.id) continue; // duplicate-id record: reported separately
+      const buckets = new Map();
+      // Classify on the comparison spelling; report the entry AS DECLARED, so
+      // the operator can find it in the plan (#1026.3).
+      for (let xi = 0; xi < a.files.length; xi++) {
+        for (let yi = 0; yi < b.files.length; yi++) {
+          const kind = classifyEntryCollision(a.files[xi], b.files[yi], expand);
+          if (kind === null) continue;
+          let evidence = buckets.get(kind);
+          if (evidence === undefined) {
+            evidence = new Set();
+            buckets.set(kind, evidence);
+          }
+          evidence.add(a.declared[xi]);
+          evidence.add(b.declared[yi]);
+        }
+      }
+      for (const kind of KIND_ORDER) {
+        const evidence = buckets.get(kind);
+        if (evidence !== undefined) {
+          collisions.push({ a: a.id, b: b.id, evidence: [...evidence], kind });
+        }
+      }
+    }
+  }
+
+  return { ok: collisions.length === 0 && duplicateIds.length === 0, collisions, duplicateIds };
+}
+
+// ---------------------------------------------------------------------------
+// Empty-`allowedPaths` classification (#1057)
+// ---------------------------------------------------------------------------
+//
+// ## The bug this fixes — and the one it deliberately does NOT
+//
+// FIVE distinct repository states produce `allowedPaths.length === 0`, and the
+// DENY VERDICT IS CORRECT IN ALL FIVE. What collapses is the REASON: every one
+// of them printed the single sentence {@link suggestForScopeViolation} emits for
+// an empty allowlist — "update the session plan and restart the wave".
+//
+//   1. A Discovery wave, where `[]` is the deliberate read-only contract
+//      (`skills/session-plan/SKILL.md`, `wave-loop.md` § Scope Manifest #5, and
+//      the #256 NO-OP regression lock in tests/hooks/enforce-scope.test.mjs).
+//      There the sentence is CORRECT but misleading — nothing is broken.
+//   2. Corrupt JSON, which `hooks/enforce-scope.mjs` folds onto `scope = {}`
+//      (#794 GAP-5), and malformed `allowedPaths` shapes, which `Array.isArray`
+//      folds onto `[]` (#558). There the sentence is USELESS — the plan is fine,
+//      the file is not.
+//   3. A leftover manifest from a session that crashed before deleting it.
+//      There the sentence is ACTIVELY WRONG: restarting the wave does not remove
+//      a file the previous session left behind — only the coordinator can clear
+//      it, and the branch says so WITHOUT handing over the command (see "The
+//      channel belongs to the AGENT" below, which is why).
+//   4. A writable role whose union came out empty because the coordinator's
+//      `--union` step did not complete. There the operator must re-run `--union`,
+//      not restart.
+//
+// The classifier below is the discriminator. It changes NO verdict — see
+// {@link suggestForEmptyScope}, which only ever selects a different sentence.
+//
+// ## The channel belongs to the AGENT — no branch may carry a runnable command
+//
+// Every string {@link suggestForEmptyScope} returns travels in
+// `permissionDecisionReason`, which the harness feeds to the CLAUDE whose Edit
+// was just denied. A remediation command placed there is an instruction the
+// DENIED AGENT can run — and for this guard the remediation IS the disarm:
+// removing `wave-scope.json` drops `hooks/enforce-scope.mjs` at Gate 3
+// (`if (!scopePath) return emitAllow()`), which takes out project-root
+// containment (Gate 6) as well as the allowlist check (Gate 7), for the rest of
+// the session. Measured 2026-08-19 against HEAD 55279a2: `rm -f <manifest>`
+// exits 0 with no envelope from `hooks/pre-bash-destructive-guard.mjs` (its
+// only rm rule is `rm-rf-destructive`, which needs `-r`), and with the manifest
+// gone a `Write` to `/etc` is ALLOWED. The first shape of this branch shipped
+// exactly that command, so the guard was handing the agent the key to itself.
+//
+// The rule this leaves behind: a branch may DIAGNOSE without limit and may name
+// the manifest as the SUBJECT of its diagnosis; it may never carry a runnable
+// command, and never present the manifest as a removal TARGET. Operator
+// remediation stays where the operator already looks —
+// `skills/session-end/SKILL.md` § 3.0 Defensive Cleanup and
+// `skills/wave-executor/wave-loop.md` steps 5/7 — not in a channel whose reader
+// is the denied agent.
+//
+// `emitDeny`'s `opts.systemMessage` is NOT the escape hatch this wants: the repo
+// documents its audience two ways that contradict each other — `scripts/lib/io.mjs`
+// § "Emitted payload" calls it "what the operator sees";
+// `skills/hook-development/SKILL.md` § "PreToolUse output schema" calls it
+// "Explanation shown to Claude". A session-wide guard disarm is not the payload
+// to bet on whichever of the two is right. Locked by
+// tests/lib/scope-gate.test.mjs § "no branch carries a runnable shell command".
+//
+// ## …and the reader may not be the OWNER (measured 2026-08-19)
+//
+// The staleness comparison is per-WORKING-COPY, not per-session. Both clocks
+// `sessionAgeMs` reads — `.orchestrator/current-session.json` `timestamp` and
+// `.orchestrator/session.lock` `started_at` — are shared by every session in the
+// checkout, and it takes the MINIMUM AGE, i.e. the NEWEST of the two. So a second
+// session starting at 18:51 moves the clock forward for EVERYONE, and every
+// manifest written before 18:51 — including the live one the first session is
+// using right now — classifies as `stale-manifest` for every subsequent reader.
+//
+// Measured in this repo at HEAD 55279a2: `session.lock` `started_at`
+// 2026-08-19T12:02:57Z (the running deep session) vs. `current-session.json`
+// `timestamp` 2026-08-19T18:51:54Z (a parallel session) — 6h49m apart, effective
+// `sessionStartMs` 18:51:54. Every wave manifest that session wrote between 12:02
+// and 18:51 is `mtime < sessionStartMs`. It is not hypothetical either: a
+// parallel session in this working copy was shown this very branch for the
+// coordinator's LIVE wave-4 manifest and told to delete it; it declined because
+// the operator works carefully, which is not a control.
+//
+// That is why the branch says "either a leftover or a parallel session's live
+// manifest" and routes to `blocked` instead of to a repair: the classifier cannot
+// distinguish the two, and the reader is frequently not the owner. PSA-001's
+// question — "Did I create this file? If not, it is not mine to touch" — is the
+// only safe posture a string in this channel can carry.
+//
+// Revisit trigger: a manifest that records its OWNING session id, which would let
+// this compare ownership instead of clocks. Until then the ambiguity is stated in
+// the text rather than resolved by a guess.
+//
+// ## Named ceiling (BV-004)
+//
+//   - This buys a CORRECT DIAGNOSIS, never an unlock and never a command. A
+//     writable wave with a broken union still denies every write; the reader is
+//     told WHICH of the five states it is in, and who owns the repair.
+//   - It cannot see a union that is NON-EMPTY but WRONG. That is
+//     `--assert-subset`'s job and stays there.
+//   - `stale-manifest` degrades to `'unknown'` when no session clock is
+//     readable — never to an allow. Absence is preserved, never guessed.
+//   - There is NO age threshold and no TTL. The comparison is a PROVENANCE
+//     subtraction (manifest mtime vs. this session's start), so a legitimate
+//     14-hour deep session never ages into a blind spot. Deliberately NOT
+//     `IN_FLIGHT_TTL_MS` — see `hooks/post-bash-write-verify.mjs` § "Why the
+//     minimum, and why NOT a staleness cap" for the argument this inherits.
+//   - Revisit trigger: a second read-only wave role, or a manifest written by a
+//     process whose clock is not this repo's `.orchestrator/` pair.
+// ---------------------------------------------------------------------------
+
+/**
+ * The closed set of {@link classifyEmptyScope} verdicts. Shaped after
+ * `DEGRADED_REASONS` in `scripts/lib/mirror-issues-banner.mjs`: a frozen array
+ * so a consumer can enumerate the states rather than re-listing them in prose.
+ *
+ * `'unknown'` is a first-class member, not an error — it is what the classifier
+ * returns when the inputs do not DECIDE, and it maps to the pre-#1057 generic
+ * sentence. Absence-preserving by construction.
+ *
+ * @type {ReadonlyArray<'unreadable'|'read-only-role'|'stale-manifest'|'writer-defect'|'unknown'>}
+ */
+export const EMPTY_SCOPE_REASONS = Object.freeze([
+  'unreadable',
+  'read-only-role',
+  'stale-manifest',
+  'writer-defect',
+  'unknown',
+]);
+
+/**
+ * Wave roles for which an EMPTY `allowedPaths` is the intended contract rather
+ * than a defect. THE list — `skills/session-plan/SKILL.md` § Discovery and
+ * `skills/wave-executor/wave-loop.md` § Scope Manifest #5 describe it; they do
+ * not restate it.
+ *
+ * Canonical casing; comparison is trimmed + case-insensitive (see
+ * {@link isReadOnlyWaveRole}) for the same reason
+ * {@link TEST_SIBLING_EXPANSION_ROLES} is: the manifest on disk is written by
+ * LLM prose and by hand, and `"discovery"` vs `Discovery` must not silently
+ * change which sentence the operator reads.
+ *
+ * @type {ReadonlyArray<string>}
+ */
+export const READ_ONLY_WAVE_ROLES = Object.freeze(['Discovery']);
+
+/** Lower-cased lookup for {@link isReadOnlyWaveRole}. @type {ReadonlyMap<string, string>} */
+const READ_ONLY_ROLE_KEYS = new Map(READ_ONLY_WAVE_ROLES.map((r) => [r.toLowerCase(), r]));
+
+/**
+ * Is this wave role one for which `allowedPaths: []` is BY DESIGN?
+ *
+ * Trimmed + case-insensitive; a non-string role is never read-only (fail-closed
+ * in the direction that produces a MORE alarming message, never a quieter one).
+ *
+ * @param {unknown} role
+ * @returns {boolean}
+ */
+export function isReadOnlyWaveRole(role) {
+  if (typeof role !== 'string') return false;
+  return READ_ONLY_ROLE_KEYS.has(role.trim().toLowerCase());
+}
+
+/**
+ * Classify WHY a wave manifest grants zero paths. Pure, sync, no I/O — every
+ * observation is passed in, exactly like {@link testSiblingExpansionApplies}.
+ * Never throws.
+ *
+ * Modelled on `readLockDetailed` (`scripts/lib/session-lock.mjs`): a small
+ * closed status union, where "cannot tell" is its own member instead of being
+ * folded into the most alarming one.
+ *
+ * ## Precedence (each rung is load-bearing)
+ *
+ *   1. `parseOk === false` → `'unreadable'`. FIRST, because a manifest that did
+ *      not parse has no trustworthy `role` either — reading `role` off `{}` and
+ *      reporting "writer defect" would blame the coordinator for a corrupt file.
+ *      Only an EXPLICIT `false` classifies; `undefined` means "caller did not
+ *      observe it" and falls through.
+ *   2. `role` ∈ {@link READ_ONLY_WAVE_ROLES} → `'read-only-role'`. Before the
+ *      clock comparison ON PURPOSE: for a Discovery wave the empty scope is the
+ *      contract whether the manifest is one second or one day old, so a stale
+ *      Discovery leftover reports the read-only sentence. The cost is named
+ *      rather than hidden — it is the one state where a leftover manifest is
+ *      described by its role instead of by its age.
+ *   3. `scopeMtimeMs < sessionStartMs` → `'stale-manifest'`. Requires BOTH
+ *      clocks to be finite numbers; either one absent ⇒ `'unknown'`, never a
+ *      guess in either direction.
+ *   4. A writable role with a manifest at least as new as this session ⇒
+ *      `'writer-defect'`.
+ *   5. Everything else ⇒ `'unknown'`.
+ *
+ * @param {{role?: unknown, parseOk?: unknown, scopeMtimeMs?: unknown, sessionStartMs?: unknown}} [input]
+ * @returns {'unreadable'|'read-only-role'|'stale-manifest'|'writer-defect'|'unknown'}
+ */
+export function classifyEmptyScope(input = {}) {
+  if (input === null || typeof input !== 'object') return 'unknown';
+
+  if (input.parseOk === false) return 'unreadable';
+  if (isReadOnlyWaveRole(input.role)) return 'read-only-role';
+
+  const mtime = typeof input.scopeMtimeMs === 'number' && Number.isFinite(input.scopeMtimeMs)
+    ? input.scopeMtimeMs
+    : null;
+  const started = typeof input.sessionStartMs === 'number' && Number.isFinite(input.sessionStartMs)
+    ? input.sessionStartMs
+    : null;
+  if (mtime === null || started === null) return 'unknown';
+
+  if (mtime < started) return 'stale-manifest';
+  return typeof input.role === 'string' && input.role.trim().length > 0
+    ? 'writer-defect'
+    : 'unknown';
+}
+
+/**
+ * The suggestion half of a scope-violation deny, when `allowedPaths` is EMPTY.
+ *
+ * A strict superset of {@link suggestForScopeViolation}'s empty-allowlist
+ * branch: `'unknown'` delegates to it verbatim, so the pre-#1057 sentence has
+ * exactly one copy and every other branch is an ADDITION. Pure, sync, never
+ * throws.
+ *
+ * @param {string} relPath — the project-relative path that was blocked
+ * @param {string} reason — a {@link EMPTY_SCOPE_REASONS} member; anything else
+ *   is treated as `'unknown'` (fail-safe toward the generic text)
+ * @param {{role?: unknown, scopePath?: unknown}} [opts]
+ *   `scopePath` is the manifest's location, project-relative where possible. It
+ *   is named as the SUBJECT of a diagnosis ("this file is a leftover") and never
+ *   as the target of a removal — see the module block above, § "The channel
+ *   belongs to the AGENT".
+ * @returns {string}
+ */
+export function suggestForEmptyScope(relPath, reason, opts = {}) {
+  const bag = opts !== null && typeof opts === 'object' ? opts : {};
+  const scopeHint = typeof bag.scopePath === 'string' && bag.scopePath.length > 0
+    ? bag.scopePath
+    : '<state-dir>/wave-scope.json';
+  const rawRole = typeof bag.role === 'string' ? bag.role.trim() : '';
+
+  switch (reason) {
+    case 'unreadable':
+      return (
+        `wave-scope.json is unreadable — failing closed. ` +
+        `The manifest exists but did not parse into a usable scope record, so NO path can be granted. ` +
+        `Inspect '${scopeHint}'; a truncated or half-written manifest is repaired by re-running the ` +
+        `coordinator's scope-manifest step, not by editing the plan — report \`blocked\` and leave the ` +
+        `manifest to the coordinator.`
+      );
+
+    case 'read-only-role': {
+      // Canonical casing from the list, so ' DISCOVERY ' and 'discovery' both
+      // render the documented sentence.
+      const canonical = READ_ONLY_ROLE_KEYS.get(rawRole.toLowerCase()) ?? rawRole;
+      return (
+        `${canonical} wave is read-only — no writes permitted. ` +
+        `An empty allowedPaths is this role's deliberate contract (#256), not a misconfiguration: ` +
+        `report '${relPath}' as a finding instead of editing it.`
+      );
+    }
+
+    case 'stale-manifest':
+      // NO COMMAND, and the manifest is never a removal TARGET here. Two reasons,
+      // both measured (module block, § "The channel belongs to the AGENT" and
+      // § "…and the reader may not be the owner"): the string is read by the agent
+      // whose Edit was just denied, and clearing the manifest disarms the whole
+      // gate — and the file may belong to a PARALLEL session in this working copy
+      // that is still using it. The diagnosis, which is what #1057 bought, stays.
+      return (
+        `'${scopeHint}' was written before the most recent session-start clock in this working copy — ` +
+        `either a leftover from a crashed session, or the live manifest of a PARALLEL session that is ` +
+        `still using it. This guard cannot tell which, and restarting the wave clears neither. ` +
+        `Treat the file as not yours (PSA-001): report \`blocked\` to your coordinator and name it. ` +
+        `Do NOT remove, move or edit it yourself (PSA-003/PSA-007).`
+      );
+
+    case 'writer-defect':
+      return (
+        `the wave's allowedPaths union is empty for role \`${rawRole}\` — ` +
+        `the coordinator's \`--union\` step did not complete. Re-run it; do not hand-edit.`
+      );
+
+    default:
+      return suggestForScopeViolation(relPath, '');
+  }
+}
+
+/**
+ * Milliseconds since one of this session's clocks was written, or `null` when
+ * none is readable — the MINIMUM over `.orchestrator/current-session.json`
+ * `timestamp` and `.orchestrator/session.lock` `started_at`.
+ *
+ * MOVED here from `hooks/post-bash-write-verify.mjs` (#1057) so both consumers
+ * share ONE implementation: a lib module may be imported by a hook, but a hook
+ * must never be imported by another hook or by this lib (module header, #554
+ * A2). Behaviour is byte-identical to the original — including the `Math.min`
+ * choice and the dropping of NEGATIVE (future-dated) ages, both of which that
+ * hook's docblock argues at length under "Why the minimum, and why NOT a
+ * staleness cap". That argument is the reason this repo has no TTL here either.
+ *
+ * Sync fs reads at CALL time only (same shape as {@link getEnforcementLevel});
+ * no I/O at import time. Never throws — an unreadable or malformed clock is
+ * simply absent.
+ *
+ * @param {string} repoRoot
+ * @param {number} [now]
+ * @returns {number|null}
+ */
+export function sessionAgeMs(repoRoot, now = Date.now()) {
+  const dir = path.join(repoRoot, '.orchestrator');
+  const ages = [
+    clockAgeMs(path.join(dir, 'current-session.json'), 'timestamp', now),
+    clockAgeMs(path.join(dir, 'session.lock'), 'started_at', now),
+  ].filter((age) => age !== null);
+  return ages.length > 0 ? Math.min(...ages) : null;
+}
+
+/**
+ * Age in ms of one JSON clock file's ISO timestamp field, or `null` when the
+ * file is missing, unparseable, carries no parseable timestamp, or is dated in
+ * the FUTURE. Private helper of {@link sessionAgeMs}; moved verbatim with it.
+ *
+ * @param {string} file
+ * @param {string} field
+ * @param {number} now
+ * @returns {number|null}
+ */
+function clockAgeMs(file, field, now) {
+  try {
+    const parsed = JSON.parse(readFileSync(file, 'utf8'));
+    const startedAt = Date.parse(parsed?.[field]);
+    if (!Number.isFinite(startedAt)) return null;
+    const age = now - startedAt;
+    return age >= 0 ? age : null;
+  } catch {
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Absolute-grant grading (#1398 cond. 4, #1405, #1406)
+// ---------------------------------------------------------------------------
+//
+// ONE grading predicate, TWO consumers (BV-003). It lived in
+// `scripts/validate-wave-scope.mjs` as four module-local helpers, where only the
+// pre-dispatch CLI could reach it — so `hooks/enforce-scope.mjs` Gate 5b honoured
+// grants the validator would have refused, and a manifest that never went through
+// the CLI was never graded at all. Both now call {@link gradeScopeEntry}:
+//
+//   - the VALIDATOR turns an `error` verdict into exit 1 (pre-dispatch refusal),
+//     passing an fs-backed `resolve` so the canonicalisation below is real;
+//   - the HOOK keeps ALLOWING exactly what it allows today and emits ONE WARN
+//     when the grant it just matched grades `error`. It passes NO resolver — see
+//     the ceiling on `opts.resolve`.
+//
+// ## Why canonicalisation is the ROOT fix, not two more denylist strings (#1405)
+//
+// Gate 5b matches the REALPATH-RESOLVED write candidate (enforce-scope.mjs
+// SECURITY-REQ-03) against the raw allowedPaths entry. So the set of files a
+// grant reaches is decided by the CANONICAL spelling, while the validator graded
+// the LITERAL one. Measured on this host 2026-09-20 (`fs.realpathSync`):
+// `/etc` → `/private/etc`, `/var` → `/private/var`, `/tmp` → `/private/tmp`.
+// Two opposite defects followed from that one gap:
+//
+//   - `/private/etc/**` and `/private/var/**` passed with a WARN although they
+//     grant exactly what the denylisted `/etc/**` and `/var/**` grant, because
+//     the denylist only ever saw the top segment `private`;
+//   - `/tmp/x/**` passed and was advertised as "honoured by Gate 5b" although the
+//     hook can never match it — the candidate arrives as `/private/tmp/x/a.md`
+//     and `pathMatchesPattern('/private/tmp/x/a.md', '/tmp/x/**') === false`. A
+//     grant that matches nothing is not a safe grant, it is a silent no-op that
+//     reads as permission.
+//
+// Adding `private/etc` and `private/var` to the denylist would have fixed the
+// first pair on macOS only, and nothing at all of the second. Resolving the
+// grant's literal prefix the same direction the hook resolves candidates fixes
+// both, and degrades to today's behaviour wherever a prefix does not exist.
+//
+// ## Named ceilings (BV-004)
+//
+//   - HOME grants (`/Users/…`, `/home/…`) are graded by SHAPE and RETURN before
+//     the canonical DENYLIST pass. Deliberate: that is the one root where a
+//     legitimate out-of-repo grant is routine, and the shape rule must not become
+//     platform-dependent (on macOS `fs.realpathSync('/home')` is
+//     `/System/Volumes/Data/home`, whose top segment is denylisted — grading a
+//     Linux-home grant against that would refuse it on a macOS coordinator and
+//     accept it on a Linux one). Since #1861 an honoured home grant IS checked
+//     for a non-canonical spelling BELOW the home root (junction, symlink or
+//     letter case under the user folder — measured on Windows 11: both graded
+//     `warn` while Gate 5b matched neither); the home ROOT itself keeps its
+//     literal spelling, alias or case variant (`/users/<u>/p/**` on macOS
+//     still grades `warn` although Gate 5b's native realpath answers `/Users`).
+//     Revisit trigger: the first home grant Gate 5b provably never matches
+//     because of the spelling of the home ROOT.
+//   - With NO `resolve` the grader is PURE and grades the literal spelling only.
+//     NO PRODUCTION CALLER IS IN THAT SHAPE ANY MORE (#1398 cond. 4, closed
+//     2026-09-21): `hooks/enforce-scope.mjs` Gate 5b was the one resolver-free
+//     caller, and it now passes {@link canonicalizeGrantPrefix} — the same
+//     function `scripts/validate-wave-scope.mjs` passes — because the revisit
+//     trigger below was MET. Measured A/B in one process, 200 repetitions,
+//     median: the hook grades ONE grant per Gate 5b hit, +0.067 ms and 15
+//     `realpathSync` calls, against a 5 ms decision threshold; the live 64-entry
+//     manifest cost 0 syscalls (0 absolute entries — only an absolute grant
+//     reaches the resolver at all). That closed the last verdict divergence,
+//     `/tmp/x/**` (1 of the 9 #1398 probes), which no literal list could reach.
+//     The resolver-free shape remains SUPPORTED and tested — it is what a
+//     caller with no filesystem gets — and it keeps every literal-spelling
+//     verdict (`/etc/**`, `/Users/<u>/.ssh/**`, `/Users/<u>/**`). Since #1418 it
+//     ALSO reaches the first canonical-alias class, because the two spellings
+//     macOS actually mints (`/private/etc`, `/private/var`) are on
+//     DENIED_ABSOLUTE_ALIAS_ROOTS as literals. Those entries STAY: they cost
+//     zero syscalls and they are the only thing standing between a
+//     hypothetical future resolver-free caller and a hole on this platform
+//     (measured 2026-09-20 @ 7e110a2a). What such a caller still cannot reach is
+//     the SECOND class, `non-canonical` (`/tmp/x/**`) — no literal list
+//     substitutes for the realpath call — which is why the hook now makes it.
+//     Revisit trigger: a caller that CANNOT supply a resolver (no filesystem, or
+//     a hot path measured expensive on its own host) — it is back to the
+//     residual above, one missing NOTICE, never a wider allow.
+// ---------------------------------------------------------------------------
+
+/**
+ * Well-known top-level system directories a wave scope may never grant.
+ *
+ * A FIXED DENYLIST, not a segment-count threshold: the #792 legitimate grant
+ * (`/private/tmp/<session>/scratchpad/**`) is itself a shallow grant under an
+ * unusual root ("private"), so any depth heuristic tight enough to catch
+ * `/etc/**` would catch that too.
+ *
+ * `Users` and `home` are deliberately ABSENT (#1398/#1402): they are the only two
+ * roots under which a legitimate grant is routine, and denying them flat made the
+ * validator contradict the hook it validates for. {@link classifyHomeGrant}
+ * grades them by shape instead.
+ * @type {ReadonlyArray<string>}
+ */
+const DENIED_ABSOLUTE_TOP_SEGMENTS = Object.freeze([
+  'etc',
+  'root',
+  'bin',
+  'sbin',
+  'usr',
+  'System',
+  'var',
+  'boot',
+  'dev',
+  'proc',
+  'sys',
+  'Library',
+  'Applications',
+  'Windows',
+  // Windows machine-wide program and data roots (#1612, Opus review M3): the
+  // drive-less spelling of C:/ProgramData/** and C:/Program Files/** lands here.
+  'ProgramData',
+  'Program Files',
+  'Program Files (x86)',
+]);
+
+/**
+ * macOS symlink ALIASES of the denylisted roots above, spelled literally.
+ *
+ * `fs.realpathSync('/etc')` is `/private/etc` and `/var` → `/private/var` on
+ * this platform, and Gate 5b matches the REALPATH-RESOLVED write candidate — so
+ * `/private/etc/**` is the spelling that actually reaches everything under
+ * `/etc`, while `/etc/**` reaches nothing there. {@link gradeScopeEntry}'s
+ * canonical rung catches both, but ONLY when a resolver is passed, and
+ * `hooks/enforce-scope.mjs` passes none (PreToolUse hot path). Listing the two
+ * aliases literally gives the resolver-free caller the same verdict at ZERO
+ * syscalls. Measured 2026-09-20 @ 7e110a2a, before: hook `warn/absolute` vs.
+ * validator `error/denied-system-dir` for both entries — the feature was inert
+ * on the only platform that mints these spellings.
+ *
+ * `private/tmp` is deliberately ABSENT, and the omission is load-bearing: `tmp`
+ * is not on the denylist either, because `/private/tmp/<session>/scratchpad/**`
+ * is the #792 SANCTIONED grant. Aliasing it would refuse the one out-of-repo
+ * grant this file exists to permit.
+ *
+ * Named ceiling (BV-004): a literal list covers the two aliases this platform
+ * mints and nothing else — a host whose `/usr` is a symlink still needs the
+ * resolver to be graded. Revisit trigger: the first denylisted root that gains
+ * a symlink alias on any platform the fleet runs on.
+ * @type {ReadonlyArray<string>}
+ */
+const DENIED_ABSOLUTE_ALIAS_ROOTS = Object.freeze(['private/etc', 'private/var']);
+
+/**
+ * Case-fold a path or path segment for comparison against the sets below.
+ *
+ * Every comparison here MUST go through this: the classification is a proxy for
+ * what the FILESYSTEM will resolve, and the two default filesystems this repo
+ * runs on (APFS on macOS, NTFS on Windows) are case-INSENSITIVE while neither
+ * `path.posix.normalize` nor `fs.realpath()` corrects the spelling. Measured
+ * 2026-09-19: `/Users/<u>/.ssh` and `/users/<u>/.ssh` report the SAME inode, as
+ * do `/Users/<u>/Library/Keychains` and `/users/<u>/library/Keychains`.
+ *
+ * `'en-US'` is pinned explicitly: the host locale must not decide a security
+ * verdict (a Turkish default locale folds `I` to `ı`, taking `LIBRARY` out of
+ * the match).
+ *
+ * Named ceiling (BV-004): folding is strictly STRICTER on a case-SENSITIVE
+ * filesystem, where `/library` really is a different directory from `/Library`.
+ * Revisit trigger: the first legitimate grant refused for that reason.
+ *
+ * @param {string} value
+ * @returns {string}
+ */
+function foldPath(value) {
+  return value.toLocaleLowerCase('en-US');
+}
+
+/**
+ * A root followed by a separator, used to split a root-wide grant from its tail.
+ * The optional drive designator is what makes this independent of
+ * `path.isAbsolute()`, which is platform-native: on a POSIX host it never
+ * reports `C:\…` as absolute, so a Windows root grant would slip past ungraded.
+ */
+const FILESYSTEM_ROOT_PREFIX_RE = /^(?:[A-Za-z]:)?[\\/]+/;
+
+/**
+ * Does this entry grant the WHOLE filesystem — the bare root, or any spelling
+ * that differs from it only by wildcard segments?
+ *
+ * The literal-only predecessor was the wrong way round (measured 2026-09-20 @
+ * 7e110a2a): `gradeScopeEntry('/')` → `error/filesystem-root` and `/etc/**` →
+ * `error/denied-system-dir`, while `/**` — which `pathMatchesPattern` matches
+ * for EVERY path at Gate 5b, i.e. strictly wider than both — graded
+ * `warn/absolute`. The check that refused the root was literal; the thing that
+ * granted the root was a glob.
+ *
+ * NOT root-wide, and deliberately so: any entry naming a literal segment after
+ * the root (`/etc/**`, `/Users/<u>/**`, or a leading `**` followed by a literal
+ * segment). Those are deep globs and keep their own, narrower verdicts.
+ *
+ * @param {string} entry
+ * @returns {boolean}
+ */
+function isFilesystemRootGrant(entry) {
+  const root = FILESYSTEM_ROOT_PREFIX_RE.exec(entry);
+  if (root === null) return false;
+  const tail = entry.slice(root[0].length);
+  if (tail.length === 0) return true;
+  // An empty segment comes from a doubled or trailing separator ("//**", "/**/"),
+  // which widens nothing; any other non-wildcard segment narrows the grant.
+  return tail.split(/[\\/]+/).every((seg) => seg === '' || seg === '*' || seg === '**');
+}
+
+/**
+ * Top-level segments that open a HOME directory rather than a system one —
+ * macOS (`/Users/<user>`) and Linux (`/home/<user>`). Stored FOLDED.
+ * @type {ReadonlySet<string>}
+ */
+const HOME_TOP_SEGMENTS = new Set(['users', 'home']);
+
+/**
+ * How many LITERAL segments a home grant must name before its first wildcard:
+ * `<home-root>` / `<user>` / `<one directory>` = 3. Two is the bare home itself,
+ * and a wildcard inside those three widens the grant to a whole home.
+ */
+const HOME_MIN_LITERAL_SEGMENTS = 3;
+
+/**
+ * The ONE dot-directory carve-out (#1406) and the depth that buys it.
+ *
+ * `~/.cache/<project>/…` is where a study contract keeps its data and where the
+ * hook honours the path today; `~/.cache/**` itself is not — it is every tool's
+ * cache on the host, including credential caches. Four literal segments
+ * (`/Users` / `<user>` / `.cache` / `<project>`) is the narrowest rule that
+ * separates the two. Every OTHER dot-directory and `Library` stay refused at any
+ * depth: `.ssh`, `.aws`, `.gnupg`, `.config`, `.claude`, `.codex` carry
+ * credentials or the agent guards themselves at their FIRST level, so no depth
+ * makes them safe.
+ */
+const CACHE_CARVEOUT_SEGMENT = '.cache';
+const CACHE_CARVEOUT_MIN_LITERAL_SEGMENTS = 4;
+
+/**
+ * Home subdirectories that carry credentials, tokens, or the agent guards
+ * themselves. ONE predicate rather than a list, because the list is open-ended
+ * and every omission is a live credential store: any dot-prefixed directory
+ * (`.ssh`, `.aws`, `.gnupg`, `.config` — which holds tokens AND `owner.yaml` —
+ * `.claude`, `.codex`, `.cursor`, `.docker`, `.npmrc`, `.netrc`) plus macOS
+ * `Library` (whose `Keychains` subtree carries no leading dot).
+ * @param {string} segment
+ * @returns {boolean}
+ */
+function isSensitiveHomeSegment(segment) {
+  // AppData is Windows' counterpart of ~/Library: gh/glab tokens, browser
+  // profiles, credential caches (#1612, Opus review M3).
+  const folded = foldPath(segment);
+  return segment.startsWith('.') || folded === 'library' || folded === 'appdata';
+}
+
+/**
+ * Is `candidate` the directory `root` itself, or below it? Fold-compared, and
+ * anchored on a `/` boundary so `/system-backup` is not read as being under
+ * `/system`.
+ * @param {string} candidate
+ * @param {string} root
+ * @returns {boolean}
+ */
+function isUnderRoot(candidate, root) {
+  const c = foldPath(candidate);
+  const r = foldPath(root);
+  if (r === '/') return c.startsWith('/');
+  return c === r || c.startsWith(`${r}/`);
+}
+
+/**
+ * The denylisted system directory this prefix sits under, or `null`.
+ *
+ * `resolveRoot` is applied to each denied root before the comparison, so the
+ * CANONICAL pass catches `/private/etc` (= `realpath('/etc')`) without the
+ * denylist having to spell out a second, platform-specific alias for every
+ * entry. With the identity resolver this is the plain literal check.
+ *
+ * The {@link DENIED_ABSOLUTE_ALIAS_ROOTS} pass is NOT routed through
+ * `resolveRoot`: those entries are already the canonical spelling, so resolving
+ * them buys nothing and would spend the syscall the resolver-free caller exists
+ * to avoid.
+ *
+ * @param {string} prefix — an absolute, `.`-normalized literal path prefix
+ * @param {(p: string) => string} resolveRoot
+ * @returns {string|null} the denylisted root (canonical casing, no leading `/`)
+ *   that matched
+ */
+function deniedRootFor(prefix, resolveRoot) {
+  for (const segment of DENIED_ABSOLUTE_TOP_SEGMENTS) {
+    if (isUnderRoot(prefix, resolveRoot(`/${segment}`))) return segment;
+  }
+  for (const alias of DENIED_ABSOLUTE_ALIAS_ROOTS) {
+    if (isUnderRoot(prefix, `/${alias}`)) return alias;
+  }
+  return null;
+}
+
+/**
+ * The LITERAL prefix of an absolute grant — everything before its first segment
+ * carrying a `*` (`/private/tmp/x/**` → `/private/tmp/x`, `/Users/*\/p/**` →
+ * `/Users`, `/etc/passwd` → `/etc/passwd`). `/` when the first segment already
+ * globs. This, never the raw entry, is what gets canonicalised: the wildcard
+ * part has no filesystem identity.
+ * @param {string} normalizedEntry
+ * @returns {string}
+ */
+function literalGrantPrefix(normalizedEntry) {
+  const kept = [];
+  for (const segment of normalizedEntry.split('/')) {
+    if (segment.includes('*')) break;
+    kept.push(segment);
+  }
+  const prefix = kept.join('/');
+  return prefix.length === 0 ? '/' : prefix;
+}
+
+/**
+ * Grade an absolute entry whose top-level segment is a home root.
+ *
+ * The rule is SHAPE-based, not identity-based, because the hook grants by shape:
+ * Gate 5b feeds the entry straight to {@link pathMatchesPattern}, where a
+ * wildcard in an early segment silently widens the grant. Measured 2026-09-19:
+ * `/Users/alice/**` matches `/Users/alice/.ssh/authorized_keys`, and a bare `*`
+ * as the third segment matches `/Users/alice/.ssh/id` — a wildcard there reaches
+ * dot-directories. So the depth is counted over the LITERAL prefix, never over
+ * the raw segment count.
+ *
+ * Named ceiling (BV-004): only the FIRST directory below the home is checked for
+ * sensitivity. A dot-directory DEEPER in the tree (`…/vault/.git/hooks/**`) stays
+ * ungated, because at that depth the grant is already scoped to one project the
+ * operator named explicitly. Revisit trigger: the first time a wave legitimately
+ * needs a grant INTO a foreign repo.
+ *
+ * @param {string} normalizedEntry — the entry with `.` segments collapsed, so a
+ *   `/Users/./alice/.ssh` cannot shift the literal prefix and hide a
+ *   dot-directory at index 2.
+ * @returns {{verdict: 'error'|'warn', reason: string}|null} null when the entry
+ *   is not a home grant at all.
+ */
+function classifyHomeGrant(normalizedEntry) {
+  const segments = normalizedEntry.split('/').filter(Boolean);
+  if (segments.length === 0 || !HOME_TOP_SEGMENTS.has(foldPath(segments[0]))) return null;
+
+  /** Literal prefix: the segments before the first one carrying a wildcard. */
+  const literal = [];
+  for (const segment of segments) {
+    if (segment.includes('*')) break;
+    literal.push(segment);
+  }
+
+  if (literal.length < HOME_MIN_LITERAL_SEGMENTS) {
+    return {
+      verdict: 'error',
+      reason:
+        `grants a home directory at or above the user level — a home grant must name at least ` +
+        `${HOME_MIN_LITERAL_SEGMENTS} literal path segments before its first wildcard ` +
+        `(e.g. /Users/<user>/<project>/**); this one names ${literal.length}, so Gate 5b would ` +
+        `honour it across the whole home (measured: /Users/<user>/** matches ~/.ssh/authorized_keys)`,
+    };
+  }
+
+  const firstBelowHome = literal[HOME_MIN_LITERAL_SEGMENTS - 1];
+  // #1406 — the one carve-out, and it is a DEPTH rule, not a name on a list:
+  // `~/.cache/**` stays refused, `~/.cache/<project>/…` is honoured.
+  const cacheCarveout =
+    foldPath(firstBelowHome) === CACHE_CARVEOUT_SEGMENT &&
+    literal.length >= CACHE_CARVEOUT_MIN_LITERAL_SEGMENTS;
+  // #1612 — Windows' os.tmpdir() is ~/AppData/Local/Temp, where worktrees and
+  // fixtures live. Same DEPTH rule as ~/.cache: the Temp root stays refused,
+  // a named directory below it is honoured.
+  const below = HOME_MIN_LITERAL_SEGMENTS - 1;
+  const windowsTempCarveout =
+    foldPath(firstBelowHome) === 'appdata' &&
+    literal.length >= below + 4 &&
+    foldPath(literal[below + 1]) === 'local' &&
+    foldPath(literal[below + 2]) === 'temp';
+  if (!cacheCarveout && !windowsTempCarveout && isSensitiveHomeSegment(firstBelowHome)) {
+    return {
+      verdict: 'error',
+      reason:
+        `grants a sensitive home subdirectory ("${firstBelowHome}") — dot-directories, Library and AppData ` +
+        `hold credentials, tokens, owner.yaml and the agent guards themselves; scope a project ` +
+        `directory instead (the exceptions are ~/.cache/<project>/…, which must name at least ` +
+        `${CACHE_CARVEOUT_MIN_LITERAL_SEGMENTS} literal segments — #1406, and a named directory ` +
+        `below Windows' temp root ~/AppData/Local/Temp — #1612)`,
+    };
+  }
+
+  return { verdict: 'warn', reason: 'home-directory grant honoured by Gate 5b' };
+}
+
+/**
+ * One process resolves the same ~14 denylist roots for every absolute grant it
+ * grades; the cache keeps that at one `realpathSync` per distinct path.
+ *
+ * Named ceiling (BV-004): process-lifetime, never invalidated. Both real callers
+ * are one-shot processes (a PreToolUse hook, a CLI run), where a mount changing
+ * mid-process is not a case. Revisit trigger: the first long-running consumer —
+ * it needs a fresh map per call, not this one.
+ * @type {Map<string, string>}
+ */
+const CANONICAL_PREFIX_CACHE = new Map();
+
+/**
+ * Memoized canonicaliser for the LITERAL prefix of an absolute grant — the
+ * `resolve` injection {@link gradeScopeEntry} needs (#1405).
+ *
+ * THE DIRECTION MATTERS: `hooks/enforce-scope.mjs` Gate 5b matches the
+ * REALPATH-RESOLVED write candidate (SECURITY-REQ-03) against the raw
+ * allowedPaths entry, so the files a grant actually reaches are decided by the
+ * canonical spelling. Grading the literal one let `/private/etc/**` pass while
+ * `/etc/**` was refused (same directory on macOS — `realpath('/etc')` is
+ * `/private/etc`), and let `/tmp/x/**` pass while the hook could never match it.
+ * Resolving HERE, the same direction the hook resolves candidates, is the root
+ * fix; adding two more denylist strings would have been neither.
+ *
+ * WHY IT LIVES IN THE HOOK-SAFE MODULE (#1398 cond. 4). It was kept in the CLI
+ * layer on the assumption that ~14 `realpathSync` calls are too expensive for a
+ * PreToolUse hot path. Measured 2026-09-21 on this host (A/B in one process, 200
+ * repetitions, median) that assumption does not hold, and the split it bought
+ * was a live verdict divergence:
+ *   - the hook grades exactly ONE grant per Gate 5b hit (the entry that matched
+ *     the write candidate), not the whole manifest: **+0.067 ms**, 15
+ *     `realpathSync` calls — 75× under the 5 ms decision threshold;
+ *   - the whole 9-grant probe set of #1398: **+0.154 ms**;
+ *   - the live 64-entry manifest of this session: **0** `realpathSync` calls,
+ *     because 0 of its entries are absolute. Only an absolute grant reaches the
+ *     resolver at all, and Gate 5b only runs for an out-of-repo write.
+ * The module header's "no I/O at import time" is untouched: this is I/O inside a
+ * function, exactly as {@link findScopeFile} already does with `existsSync`.
+ *
+ * NATIVE REALPATH, because Gate 5b's is native (#1861 / GH#82). The hook
+ * resolves the candidate with `fs.promises.realpath`, which is the libuv
+ * realpath: it resolves Windows junctions and restores the ON-DISK letter case.
+ * The JS `fs.realpathSync` keeps the caller's spelling. Measured 2026-10-28 on
+ * macOS (APFS, case-insensitive), dir `REAL_TARGET`: `realpathSync('…/real_target')`
+ * → `…/real_target`, `realpathSync.native` and `fs.promises.realpath` → both
+ * `…/REAL_TARGET`. With the JS variant a grant spelled in another case was
+ * graded canonical although the case-sensitive {@link pathMatchesPattern} in
+ * Gate 5b never matches it. Symlink aliases (`/tmp` → `/private/tmp`) resolve
+ * identically in both variants.
+ *
+ * PURE ENOUGH FOR LINUX CI: a prefix that does not exist never throws — the walk
+ * climbs to the nearest existing ancestor and re-attaches the missing suffix (the
+ * same strategy `hooks/enforce-scope.mjs` uses for a Write to a not-yet-existing
+ * file), and a wholly unresolvable path returns the input unchanged. On Linux
+ * `/etc` and `/var` are not symlinks, so the canonical pass is a no-op there and
+ * the literal verdicts carry the whole load.
+ *
+ * DRIVE ROOTS (#1742). The walk climbs with the NATIVE `dirname`, which stops at
+ * `C:\` / `C:/`; `path.posix.dirname` climbed past it to the drive-relative
+ * `C:`, whose realpath is the drive's CURRENT directory, not its root. A
+ * resolved root that already ends in `/` (`/`, `C:/`) takes the suffix without
+ * a second slash — the `real === '/'` test missed `C:/` and produced `C://…`.
+ *
+ * @param {string} absPath
+ * @param {{realpath?: (p: string) => string, pathApi?: {dirname: Function, basename: Function, sep: string}}} [io]
+ *   test seam for the win32 walk on a POSIX host; an injected call bypasses the cache
+ * @returns {string}
+ */
+export function canonicalizeGrantPrefix(absPath, io) {
+  const realpath = io?.realpath ?? realpathSync.native;
+  const pathApi = io?.pathApi ?? path;
+  const cacheable = io === undefined;
+  const cached = cacheable ? CANONICAL_PREFIX_CACHE.get(absPath) : undefined;
+  if (cached !== undefined) return cached;
+
+  // Assigned on BOTH loop exits (resolved, or nothing on this branch resolves);
+  // an initializer here would be dead — see the eslint `no-useless-assignment`
+  // rule, which is on in this repo.
+  let result;
+  let current = absPath;
+  const missing = [];
+  for (;;) {
+    try {
+      const real = realpath(current).split(pathApi.sep).join('/');
+      const suffix = [...missing].reverse().join('/');
+      result = suffix.length === 0 ? real : `${real.endsWith('/') ? real.slice(0, -1) : real}/${suffix}`;
+      break;
+    } catch {
+      const parent = pathApi.dirname(current);
+      if (parent === current) {
+        result = absPath; // nothing on this branch resolves — keep the literal
+        break;
+      }
+      missing.push(pathApi.basename(current));
+      current = parent;
+    }
+  }
+
+  if (cacheable) CANONICAL_PREFIX_CACHE.set(absPath, result);
+  return result;
+}
+
+/**
+ * Spell an ABSOLUTE scope grant the way an absolute target is spelled before
+ * `pathMatchesPattern`: the platform's own separator becomes `/` (#2066).
+ *
+ * The one normalisation both the PreToolUse gate (`hooks/enforce-scope.mjs`
+ * `matchedAbsoluteGrant`) and the PostToolUse report (`hooks/post-bash-write-verify.mjs`
+ * `isInScope`) apply, so a win32 grant `C:\work\src\**` matches the `/`-form
+ * target `C:/work/src/a.mjs` in both hooks — the post hook used the raw grant
+ * and reported an allowed write as out of scope.
+ *
+ * Only `pathApi.sep` is replaced, never a literal `\`: on POSIX `\` is an
+ * ordinary file-name character, so there this is the identity. Relative grants
+ * are deliberately NOT routed through here (#1742), and no drive-letter case
+ * folding happens.
+ *
+ * @param {string} pattern — an absolute allowedPaths entry
+ * @param {{sep: string}} [pathApi] — test seam for the win32 spelling on a POSIX host
+ * @returns {string}
+ */
+export function absoluteGrantPattern(pattern, pathApi = path) {
+  return pattern.split(pathApi.sep).join('/');
+}
+
+/**
+ * Grade ONE `allowedPaths` / fileScope entry as a Gate 5b grant.
+ *
+ * The single grading predicate shared by `scripts/validate-wave-scope.mjs`
+ * (refuses `error` before dispatch) and `hooks/enforce-scope.mjs` Gate 5b (WARNs
+ * on `error`, never denies). See the section block above for the design.
+ *
+ * Verdict order — each rung is load-bearing:
+ *   1. a tilde entry (`~/…`) — NOTHING in the scope chain expands it (#1405.3),
+ *      so it grants nothing while reading like a grant;
+ *   2. a filesystem-root grant — the bare root, where `pathMatchesPattern(p, '/')`
+ *      is `true` for every path (the `dir/` prefix branch), AND every spelling
+ *      that adds only wildcards to it (`/**`, `/*`, `C:\**`), which reaches the
+ *      same set through the glob branch;
+ *   3. non-absolute entries are not ours to grade → `null`;
+ *   4. the denylisted system roots, LITERAL spelling;
+ *   5. home grants, by shape — these RETURN, see the ceiling above: a refused
+ *      shape returns its `error`; an honoured shape first passes the rung-7
+ *      check BELOW the home root (#1861 — a junction, symlink or case variant
+ *      under the user folder is `error / non-canonical`, not `warn`), then
+ *      returns `warn / home-grant`. Rung 6 is skipped for home grants;
+ *   6. the denylisted system roots, CANONICAL spelling (#1405.1);
+ *   7. a literal prefix that is not canonical — Gate 5b can never match it
+ *      (#1405.2);
+ *   8. otherwise a WARN, split only so the narrowest shape (a concrete absolute
+ *      file) says so.
+ *
+ * Pure with no `opts.resolve`; never throws (a throwing resolver degrades to the
+ * literal spelling). Returns `null` for every ordinary relative entry.
+ *
+ * @param {string} entry
+ * @param {{resolve?: (absPath: string) => string, platform?: string}} [opts] —
+ *   `resolve`: canonicaliser for an absolute path; MUST tolerate a non-existent
+ *   path (resolve the nearest existing ancestor, or return the input unchanged).
+ *   `platform`: the `process.platform` value deciding the UNC exemption
+ *   (default: the running platform).
+ * @returns {{verdict: 'error'|'warn', code: string, message: string}|null}
+ */
+export function gradeScopeEntry(entry, opts = {}) {
+  if (typeof entry !== 'string' || entry.length === 0) return null;
+  // Windows drive-absolute grants (#1612): every check below speaks POSIX
+  // separators and Gate 5b matches the realpath candidate in its forward-slash
+  // form ("C:/Users/..."). Graded verbatim, `C:\a\b\**` had no "/" prefix at
+  // all ("/" resolves to "C:/") and a clean grant was reported non-canonical,
+  // so scripts/validate-wave-scope.mjs refused it (measured on Windows 11).
+  const windowsDrive = /^[A-Za-z]:[\\/]/.test(entry);
+  if (windowsDrive) entry = entry.replace(/\\/g, '/');
+  const bag = opts !== null && typeof opts === 'object' ? opts : {};
+  const resolver = typeof bag.resolve === 'function' ? bag.resolve : null;
+  const platform = typeof bag.platform === 'string' ? bag.platform : process.platform;
+  /** @param {string} p @returns {string} */
+  const canonicalize = (p) => {
+    if (resolver === null) return p;
+    try {
+      const resolved = resolver(p);
+      return typeof resolved === 'string' && resolved.length > 0 ? resolved : p;
+    } catch {
+      return p;
+    }
+  };
+
+  if (entry === '~' || entry.startsWith('~/')) {
+    return {
+      verdict: 'error',
+      code: 'tilde',
+      message:
+        `contains a tilde path: ${entry} — the tilde is NOT expanded by hooks/enforce-scope.mjs ` +
+        `Gate 5b, nor anywhere else in the scope chain, so this entry matches nothing while ` +
+        `reading like a grant; write the expanded absolute path instead`,
+    };
+  }
+
+  if (isFilesystemRootGrant(entry)) {
+    return {
+      verdict: 'error',
+      code: 'filesystem-root',
+      message:
+        `grants the entire filesystem root: ${entry} — refused unconditionally, this can never ` +
+        `be a valid wave scope (a root followed only by wildcards reaches every path Gate 5b ` +
+        `can see, exactly as the bare root does)`,
+    };
+  }
+
+  if (!windowsDrive && !path.isAbsolute(entry)) return null;
+
+  // `.` segments are collapsed BEFORE any classification (#1398): without it,
+  // `/Users/./alice/.ssh/**` has a literal prefix whose third element is
+  // "alice", so the dot-directory sits at index 3 and the sensitivity check
+  // misses it. `..` needs no handling — the caller's traversal check rejects
+  // any entry containing `../`, whatever else it is.
+  const normalized = path.posix.normalize(entry);
+  const literalPrefix = literalGrantPrefix(normalized);
+  // The system-directory and home-root rules are written for POSIX roots; a
+  // drive-less spelling makes `C:/Users/<name>/**` as strict as `/Users/<name>/**`
+  // (before #1612 a Windows home grant was never classified at all).
+  const rootless = windowsDrive ? normalized.replace(/^[A-Za-z]:/, '') : normalized;
+
+  const deniedLiteral = deniedRootFor(literalGrantPrefix(rootless), (p) => p);
+  if (deniedLiteral !== null) {
+    return {
+      verdict: 'error',
+      code: 'denied-system-dir',
+      message:
+        `contains a well-known system/home directory grant: ${entry} ` +
+        `(denylisted system root "/${deniedLiteral}") — refused, scope a narrower path instead`,
+    };
+  }
+
+  // Windows: realpath answers in forward slashes with an upper-case drive letter.
+  const comparable = (p) => (windowsDrive
+    ? p.replace(/\\/g, '/').replace(/^([a-z]):/, (_, d) => `${d.toUpperCase()}:`)
+    : p);
+  /**
+   * Trailing separators are not a spelling (Codex MED-1, #1861 home rung; #1867
+   * Rung 7): realpath drops the `/` of a directory-prefix grant, which Gate 5b
+   * honours as a subtree, so both sides are compared without it. A bare root
+   * (`/`, `C:/`) keeps its separator.
+   * @param {string} p @returns {string}
+   */
+  const trimTrailing = (p) => {
+    const trimmed = p.replace(/\/+$/, '');
+    return trimmed === '' || /^[A-Za-z]:$/.test(trimmed) ? p : trimmed;
+  };
+  /**
+   * Rung 7's verdict, shared with the home rung (#1861). `comparedLength` is the
+   * length of the literal prefix that was compared; everything after it is
+   * re-attached to the suggestion, so a trailing `/` (the directory-prefix form
+   * {@link pathMatchesPattern} honours) survives into the suggested spelling.
+   */
+  const nonCanonical = (canonical, comparedLength = literalPrefix.length) => ({
+    verdict: 'error',
+    code: 'non-canonical',
+    message:
+      `contains a non-canonical absolute path: ${entry} — hooks/enforce-scope.mjs Gate 5b ` +
+      `matches the REALPATH-resolved write candidate, which never carries this spelling ` +
+      `("${literalPrefix}" resolves to "${canonical}"), so this grant can match NOTHING; ` +
+      `write ${canonical}${normalized.slice(comparedLength)} instead`,
+  });
+  /**
+   * #1916: every check above compares `normalized`, but Gate 5b feeds the RAW
+   * entry to {@link pathMatchesPattern} (`startsWith` / glob), which never
+   * collapses `.` segments or doubled separators — `/private/tmp//x/` and
+   * `/private/tmp/./x/**` match nothing there while grading `warn` here.
+   * `path.posix.normalize` keeps a trailing `/`, so the subtree form survives
+   * into the suggestion. Placed after the refusal rungs (denylist, refused home
+   * shape, canonical denylist) so their message wins; before every honoured one.
+   *
+   * UNC exemption: `path.posix.normalize` folds a leading `//` to `/`, but on
+   * Windows Gate 5b keeps it — measured 2026-11-02 (node, path.win32):
+   * `\\srv\share\x` resolves to `//srv/share/x` after the separator split, and
+   * pathMatchesPattern matches both `//srv/share/` and `//srv/share/**` there.
+   * So exactly two leading `/` followed by a server name are a UNC prefix, not
+   * a doubled separator; any `//` or `.` after it is still non-normalized.
+   * Bound to the platform (LOW-2): on POSIX the realpath candidate never
+   * starts with `//` and pathMatchesPattern returns false for such a grant, so
+   * there a leading `//` is a doubled separator like any other
+   * (`//private/tmp/x/**` → `error / non-normalized`, suggestion
+   * `/private/tmp/x/**`), not `warn … honoured by Gate 5b` (#1916).
+   * @returns {{verdict: 'error', code: string, message: string}|null}
+   */
+  const expectedSpelling = platform === 'win32' && /^\/\/[^/]/.test(entry) ? `/${normalized}` : normalized;
+  const nonNormalized = () => (expectedSpelling === entry ? null : {
+    verdict: 'error',
+    code: 'non-normalized',
+    message:
+      `contains a non-normalized absolute path: ${entry} — hooks/enforce-scope.mjs Gate 5b ` +
+      `matches the grant as written and never collapses "." segments or doubled "/", so this ` +
+      `grant can match NOTHING; write ${expectedSpelling} instead`,
+  });
+
+  const home = classifyHomeGrant(rootless);
+  if (home !== null) {
+    if (home.verdict === 'error') {
+      return { verdict: 'error', code: 'home-grant', message: `${home.reason}: ${entry}` };
+    }
+    const unnormalizedHome = nonNormalized();
+    if (unnormalizedHome !== null) return unnormalizedHome;
+    // #1861 (GH#82): this rung used to return `warn` unchecked, so a grant
+    // written through a junction under the user folder, or in another letter
+    // case, read as "honoured by Gate 5b" while Gate 5b (native realpath,
+    // case-sensitive match) never matched it. Compared BELOW the home root
+    // only — the named ceiling above: the home ROOT keeps its literal spelling,
+    // whether it is an alias (macOS `/home` → `/System/Volumes/Data/home`) or a
+    // case variant (`/users` → `/Users`), so the verdict on the root stays
+    // shape-based and platform-independent (pinned by
+    // tests/scripts/validate-wave-scope.test.mjs "keeps a legitimate project
+    // grant at WARN under the fold").
+    // Trailing separators are not a spelling (Codex MED-1): realpath drops the
+    // `/` of a directory-prefix grant (`~/Projects/`), which Gate 5b honours as
+    // a subtree, so both sides are compared without it and the suggestion
+    // re-attaches it. A home grant always has ≥3 segments, so trimming never
+    // reaches the root.
+    const literalHome = trimTrailing(literalPrefix);
+    const homeRoot = literalHome.split('/').slice(0, 2).join('/');
+    const canonicalRoot = comparable(canonicalize(homeRoot));
+    const canonicalHome = trimTrailing(comparable(canonicalize(literalHome)));
+    const seen = canonicalHome.startsWith(`${canonicalRoot}/`)
+      ? `${homeRoot}${canonicalHome.slice(canonicalRoot.length)}`
+      : canonicalHome;
+    if (comparable(seen) !== comparable(literalHome)) return nonCanonical(seen, literalHome.length);
+    return {
+      verdict: 'warn',
+      code: 'home-grant',
+      message:
+        `contains an absolute (out-of-repo) path: ${entry} — ${home.reason}; ` +
+        `verify this grant is intentional`,
+    };
+  }
+
+  const canonicalPrefix = canonicalize(literalPrefix);
+
+  const deniedCanonical = deniedRootFor(canonicalPrefix, canonicalize);
+  if (deniedCanonical !== null) {
+    return {
+      verdict: 'error',
+      code: 'denied-system-dir',
+      message:
+        `contains a well-known system/home directory grant: ${entry} — its literal prefix ` +
+        `"${literalPrefix}" resolves to "${canonicalPrefix}", inside the denylisted system ` +
+        `directory "${deniedCanonical}"; Gate 5b matches the REALPATH-resolved write candidate, ` +
+        `so this spelling grants exactly what "/${deniedCanonical}/**" grants — refused, scope a ` +
+        `narrower path instead`,
+    };
+  }
+
+  const unnormalized = nonNormalized();
+  if (unnormalized !== null) return unnormalized;
+
+  // #1867: compared without trailing separators, like the home rung — a literal
+  // `/data/real/` whose realpath is `/data/real` is canonical, and a symlinked
+  // `/data/link/` is suggested as `/data/real/` (the subtree form survives).
+  const literalTrimmed = trimTrailing(literalPrefix);
+  const canonicalTrimmed = trimTrailing(comparable(canonicalPrefix));
+  if (canonicalTrimmed !== comparable(literalTrimmed)) {
+    return nonCanonical(canonicalTrimmed, literalTrimmed.length);
+  }
+
+  // KNOWN DIVERGENCE, carried over from #1402 and still message-only: `*` is the
+  // sole wildcard this check knows, while {@link isGlobScopeEntry} ALSO counts a
+  // trailing `/` and {@link pathMatchesPattern} honours that directory-prefix
+  // form. So `/private/tmp/x/` reads as "no wildcard" here and is described as an
+  // exact-path match although it grants a whole subtree. Both branches only WARN,
+  // so the cost is one wrong sentence on stderr and no verdict — which is why it
+  // is reported rather than patched. Revisit if either branch ever hard-rejects.
+  if (!entry.includes('*')) {
+    return {
+      verdict: 'warn',
+      code: 'bare-absolute-file',
+      message:
+        `contains a bare absolute file grant with no wildcard: ${entry} — honoured by ` +
+        `hooks/enforce-scope.mjs Gate 5b as an exact-path match (the narrowest possible grant); ` +
+        `verify this grant is intentional`,
+    };
+  }
+
+  return {
+    verdict: 'warn',
+    code: 'absolute',
+    message:
+      `contains an absolute (out-of-repo) path: ${entry} — honoured by hooks/enforce-scope.mjs ` +
+      `Gate 5b; verify this grant is intentional`,
+  };
+}
+
+/**
+ * Absolute epoch-ms at which this session started, or `null` when no clock is
+ * readable — the value {@link classifyEmptyScope} compares a manifest's mtime
+ * against.
+ *
+ * Derived from {@link sessionAgeMs} rather than re-reading the files, so there
+ * is ONE clock policy: `now - min(ages)` is the LATEST of the two recorded start
+ * times, which is exactly the freshness `Math.min` was chosen to express (a
+ * leftover `current-session.json` from a previous session is outvoted by a
+ * freshly-acquired `session.lock`). `now` is threaded through so both halves see
+ * the same instant.
+ *
+ * Never throws. No clock ⇒ `null` ⇒ the caller cannot decide staleness and must
+ * fall back to `'unknown'`.
+ *
+ * @param {string} repoRoot
+ * @param {number} [now]
+ * @returns {number|null}
+ */
+export function sessionStartedAtMs(repoRoot, now = Date.now()) {
+  const age = sessionAgeMs(repoRoot, now);
+  return age === null ? null : now - age;
+}

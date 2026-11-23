@@ -1,0 +1,30 @@
+{
+  "name": "session-orchestrator",
+  "version": "5.21.2",
+  "description": "A repeatable Plan, Go, Close workflow for AI coding sessions: /session reads your repo and agrees the scope, /go runs the work in waves with a quality gate between each, /close verifies and commits. Runs on Claude Code, Codex CLI, Cursor and Pi.",
+  "author": {
+    "name": "Bernhard Goetzendorfer"
+  },
+  "homepage": "https://session-orchestrator.com",
+  "repository": "https://github.com/Kanevry/session-orchestrator",
+  "license": "MIT",
+  "keywords": [
+    "session",
+    "orchestration",
+    "waves",
+    "gitlab",
+    "github",
+    "quality-gates",
+    "verification-gates",
+    "multi-agent",
+    "codex",
+    "cursor",
+    "pi"
+  ],
+  "skills": "./skills/",
+  "rules": [],
+  "agents": [],
+  "commands": [],
+  "hooks": { "hooks": {} },
+  "mcpServers": "./mcp/servers.json"
+}

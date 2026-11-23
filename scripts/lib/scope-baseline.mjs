@@ -1,0 +1,829 @@
+/**
+ * scope-baseline.mjs — Scope Governor: baseline-freeze + drift-tripwire module.
+ *
+ * Freezes a per-session "scope baseline" into STATE.md frontmatter (five
+ * flat keys) exactly once per session, reads it back, and computes a
+ * warn-only drift ratio against it. This is the mechanical half of the
+ * Scope Governor's session-scoping self-validation (PRD "Scope Governor —
+ * Loop-Termination über Scope statt über Retry-Cap",
+ * docs/prd/2026-07-25-scope-governor.md, Epic #894).
+ *
+ * SCOPE: this module implements `writeBaseline()`, `readBaseline()`, the
+ * shared `DRIFT_EXCLUDE_PATTERNS` constant (issue #895 / S1), and
+ * `computeDrift()` — the 2x-tripwire drift calculation that consumes
+ * `DRIFT_EXCLUDE_PATTERNS` from both sides of the ratio (issue #896 / S2,
+ * delivered in this revision). The two distinguishable non-baseline
+ * `readBaseline()` return shapes (`null` vs `{ stale: true, ... }`) exist
+ * specifically so `computeDrift()` can pick its skip-reason additively
+ * without re-parsing STATE.md a second time: both functions share the
+ * internal `readFrontmatterOrReason()` + `classifyBaselineFromFrontmatter()`
+ * helpers below, so a single `computeDrift()` call performs exactly ONE
+ * `readFileSync`/`parseStateMd` pass over STATE.md.
+ *
+ * ---------------------------------------------------------------------
+ * Session-scoping semantics (the load-bearing part).
+ * ---------------------------------------------------------------------
+ * The canonical frontmatter key is `session` — NOT `session-id`. See
+ * skills/_shared/state-ownership.md:28 ("optional... writers SHOULD
+ * populate these fields but readers MUST tolerate their absence"). This
+ * module reads `frontmatter.session` directly; it does NOT call
+ * `parseSessionId(repoRoot)` — that function takes a session-ID STRING and
+ * performs no I/O (scripts/lib/session-id.mjs:21/200, "pure synchronous
+ * function — no I/O, no side effects"). The frontmatter read lives in that
+ * module's PRIVATE, unexported `readSessionIdFromStateMd()` helper, not in
+ * `parseSessionId()` itself.
+ *
+ * Three rules govern `scope-baseline-session` vs. the current `session`:
+ *   1. No `scope-baseline-session` key present at all → this STATE.md has
+ *      never had a baseline frozen. Write unconditionally — even when the
+ *      current `session` field is itself absent (freezes `null`).
+ *   2. A `scope-baseline-session` key IS present (its stored value may
+ *      itself be `null`, from rule 1) → compare it against the current
+ *      `session` value via plain equality on normalised values:
+ *        - equal (this also covers BOTH sides being `null` — a missing
+ *          optional `session` field must never render the tripwire
+ *          permanently inert by making every comparison look "stale") →
+ *          MATCH → `{ written: false, reason: 'already-frozen' }`, no
+ *          mutation.
+ *        - different → the stored baseline belongs to an earlier session →
+ *          STALE → fully overwritten, `{ written: true }`.
+ *
+ * ---------------------------------------------------------------------
+ * Fail-open asymmetry — deliberate exception to a documented module
+ * convention (naming it explicitly so a future reader does not "fix" it
+ * away as an oversight).
+ * ---------------------------------------------------------------------
+ * `getEnforcementLevel()` and `gateEnabled()` (scope-gate.mjs:50-57 / :68-79)
+ * both fall toward ENFORCEMENT on unreadable data, and
+ * `assertFileScopeSubset()` documents "Fail-closed & no-throw (module
+ * convention)" at scope-gate.mjs:195-197. THIS module inverts that: on
+ * unreadable or missing STATE.md, both `writeBaseline()` and
+ * `readBaseline()` fail OPEN (a skip-ish result, never a throw, never a
+ * denial). Rationale: a *blocking* gate must be suspicious of unreadable
+ * data and fail toward the restrictive side; a *warning* signal — this
+ * module feeds the S2 warn-only drift tripwire, never a Deny — must stay
+ * SILENT on unreadable data instead, because a WARN fired from
+ * corrupt/missing input is noise that erodes the guard's credibility faster
+ * than a missed drift warning ever would. Do not unify this back to
+ * fail-closed. `computeDrift()` follows the SAME asymmetry: every
+ * unreadable/missing/stale/unresolvable condition is a silent `skipped`
+ * result, never a WARN and never a thrown error.
+ *
+ * ---------------------------------------------------------------------
+ * Sync/async rule.
+ * ---------------------------------------------------------------------
+ * `readBaseline()` and `computeDrift()` are SYNC (`readFileSync` +, for
+ * `computeDrift()`, `execFileSync('git', ...)` only) — pure read paths, kept
+ * consistent with the scope-gate.mjs all-sync hook-hot-path convention.
+ * `writeBaseline()` is the ONLY async export in this module, and ONLY
+ * because `writeStateMd()` (scripts/lib/state-md/frontmatter-mutators.mjs:348,
+ * re-exported from scripts/lib/state-md.mjs) is itself async — it takes the
+ * STATE.md lock (`withStateMdLock()`) INTERNALLY, so `writeBaseline()` MUST
+ * NOT wrap its own call in a second `withStateMdLock()` (that would deadlock
+ * on the lockfile). Routing through `writeStateMd()` instead of a private
+ * lock+read+write sequence also gets `writeBaseline()` two guards for free:
+ * a size-ceiling check and a frontmatter-round-trip-safety check (both
+ * documented at frontmatter-mutators.mjs:307-328) — a breach of either
+ * REFUSES the write (leaves STATE.md untouched) and surfaces as
+ * `{ written: false, reason: 'size-ceiling' | 'frontmatter-unsafe' | 'foreign-state-md' }`
+ * instead of silently bypassing the guard the way the old private
+ * `writeStateMdAtomic()` helper did.
+ *
+ * `writeStateMd()` never throws by contract EXCEPT a `TypeError` when its
+ * transformer returns a non-string/non-null/non-undefined value — this
+ * module's transformer always returns a string or `null`. As of issue #903
+ * the `plannedFiles` argument is validated BEFORE `writeStateMd()` is ever
+ * called (see `writeBaseline()`'s param doc) — an invalid shape now short-
+ * circuits with `{ written: false, reason: 'invalid-planned-files' }`
+ * without reading STATE.md or taking the lock at all, so the transformer
+ * itself no longer has a `plannedFiles`-shape failure mode to throw from.
+ * The underlying `withStateMdLock()` THROWS a labelled Error on acquire
+ * failure BY DESIGN (state-md-lock.mjs:265-270: "throws a labelled Error so
+ * callers see the failure as an exception rather than a silent {ok:false}
+ * return", throw site :328, tagging `err.code` as `STATE_LOCK_TIMEOUT` or
+ * `STATE_LOCK_FS_ERROR`). This module's contract is "never throw" —
+ * `writeBaseline()` therefore wraps the `writeStateMd()` call in try/catch
+ * and maps the escaping error's `err.code` HONESTLY instead of collapsing
+ * every failure into one reason (#894 review finding F4 — a disk-full /
+ * permission failure on the lock directory must not misdirect the operator
+ * toward "retry, it's contention"):
+ * `STATE_LOCK_TIMEOUT` → `'lock-timeout'`, `STATE_LOCK_FS_ERROR` →
+ * `'lock-fs-error'`, anything else → `'unexpected-error'` (this branch has
+ * no currently-reachable trigger post-#903 but stays as a defensive
+ * catch-all).
+ *
+ * `branch` and `session-start-ref` are READ from the existing frontmatter —
+ * this module never writes or duplicates them (they are already session-
+ * pinned values STATE.md carries independently of this feature).
+ *
+ * No I/O at import time. Node 20+ stdlib only.
+ */
+
+import { readFileSync, realpathSync } from 'node:fs';
+import path from 'node:path';
+
+import { parseStateMd, serializeStateMd, writeStateMd } from './state-md.mjs';
+import { resolveStateMdWriteTarget } from './state-md/frontmatter-mutators.mjs';
+import { pathMatchesPattern } from './scope-gate.mjs';
+import { resolveBaselineRange, isQueryFailure } from './vcs-repo-spec.mjs';
+import { readProcessLocalSessionIds } from './session-identity/own-session.mjs';
+import { readSessionWorkTrees, sessionCommitFiles } from './session-work-trees.mjs';
+import { execFileSync } from './native-command.mjs';
+
+// ---------------------------------------------------------------------------
+// DRIFT_EXCLUDE_PATTERNS — the SINGLE filter source for both the denominator
+// and the numerator, applied through the SAME internal `filterExcluded()`
+// helper below (#894 review finding F1 — the denominator used to be filtered
+// only in PROSE, by the coordinator, before calling `writeBaseline()`; a
+// prose instruction is not a code path, so a coordinator that forgot to
+// filter silently broke the ratio). `writeBaseline()` now filters the
+// denominator itself, in code, whenever its `plannedFiles` argument is the
+// RAW array of planned file paths (`countPlannedFiles()`, exported below —
+// the ONLY accepted call shape as of issue #903, which REMOVED the
+// previously-accepted "already counted, store verbatim" plain-number
+// back-compat shape: it was an unverified re-entry vector for exactly the
+// F1 bug this filter exists to prevent — a caller could hand
+// `writeBaseline()` an unfiltered count with no `filterExcluded()` pass at
+// all). `computeDrift()` filters the numerator at measure time by running
+// the live change set (committed range ∪ working tree ∪ untracked, see its
+// JSDoc) through the same `filterExcluded()` helper. One classification sits
+// OUTSIDE this list on purpose: untracked paths under `.orchestrator/` (see
+// `isUntrackedRuntimeWrite()` below) — it keys on tracked status, which only
+// the live numerator has, so a pattern here could not express it.
+// Deliberately narrows skills/session-end/plan-verification.md:42-45's
+// per-session-state exclusion from "the whole .claude/ directory" down to
+// just the session ARTEFACTS — `.claude/rules/**` stays COUNTED because a
+// rule file is a deliverable of this very epic, not a session artefact.
+// plan-verification.md:43 (test-file reclassification) is a bucket
+// RECLASSIFY — the file stays counted, never excluded — so it is NOT
+// mirrored here; :44 (generated/lock) and :45 (per-session state, narrowed)
+// are true exclusions and ARE mirrored below.
+// ---------------------------------------------------------------------------
+export const DRIFT_EXCLUDE_PATTERNS = [
+  // Tests — excluded on BOTH sides (deliberately NOT "reclassified" the way
+  // plan-verification.md:43 does).
+  '**/*.test.*', '**/*.spec.*', '**/__tests__/**',
+  // Generated / lock (covers plan-verification.md:44).
+  'package-lock.json', 'pnpm-lock.yaml', '*.lock', 'dist/**', 'node_modules/**',
+  // Per-session state — deliberately NARROWS plan-verification.md:45 to the
+  // ARTEFACTS instead of the whole directory. `.claude/rules/**` stays
+  // COUNTED: a rule file is a deliverable, not a session artefact.
+  '.claude/STATE.md', '.claude/wave-scope.json', '.claude/metrics/**',
+  '.codex/STATE.md', '.codex/wave-scope.json', '.codex/metrics/**',
+  '.cursor/STATE.md', '.cursor/wave-scope.json', '.cursor/metrics/**',
+  '.pi/STATE.md', '.pi/wave-scope.json', '.pi/metrics/**',
+  // The plugin's OWN mid-session writes. They only became visible to the
+  // numerator when it started reading the working tree and untracked files
+  // (#1027). Two classes are excluded HERE, whatever their tracked status:
+  //   - `.orchestrator/metrics/**` — a consumer repo keeps its `*.jsonl`
+  //     TRACKED by design (skills/bootstrap/standard-template.md "Gitignore
+  //     guidance") and hooks append to it all session.
+  //   - `<state-dir>/filescopes/**` and `<state-dir>/worktrees/**` — bootstrap
+  //     writes no ignore line for either. An agent worktree is a nested repo,
+  //     so `ls-files --others` lists each as ONE `.claude/worktrees/<id>/`
+  //     entry (measured 2026-10-02): one false file per isolated agent.
+  // Every OTHER plugin write under `.orchestrator/` (runtime/, tmp/, debug/,
+  // session.lock, current-session.json, ...) is excluded by
+  // `isUntrackedRuntimeWrite()` while untracked, which is how a consumer repo
+  // holds them. Its deliverables (`steering/`, `policy/`, `bootstrap.lock`)
+  // are tracked and count.
+  '.claude/filescopes/**', '.codex/filescopes/**', '.cursor/filescopes/**', '.pi/filescopes/**',
+  '.claude/worktrees/**', '.codex/worktrees/**', '.cursor/worktrees/**', '.pi/worktrees/**',
+  '.orchestrator/metrics/**',
+];
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Current time as an ISO-8601 UTC string.
+ * @returns {string}
+ */
+function nowIso() {
+  return new Date().toISOString();
+}
+
+/**
+ * Normalise a raw frontmatter session value for comparison: a non-empty
+ * string is kept as-is; anything else (undefined, `null`, or any
+ * non-string scalar the YAML parser could in principle produce) collapses
+ * to `null`. This is what makes "both sides absent" compare equal via a
+ * plain `===` at the call sites — no special-casing needed there.
+ * @param {unknown} v
+ * @returns {string|null}
+ */
+function normalizeSessionValue(v) {
+  return typeof v === 'string' && v.length > 0 ? v : null;
+}
+
+/**
+ * Round to 2 decimal places. Plain `Math.round` scaling — good enough for a
+ * human-facing ratio, not a precision-sensitive computation.
+ * @param {number} n
+ * @returns {number}
+ */
+function round2(n) {
+  return Math.round(n * 100) / 100;
+}
+
+/**
+ * Filter a raw file-path list through `DRIFT_EXCLUDE_PATTERNS`. THE shared
+ * filter primitive (#894 review finding F1) — both `computeDrift()`'s
+ * numerator (below) and `writeBaseline()`'s denominator (via
+ * `countPlannedFiles()`/`filterPlannedFiles()`, exported below) call this
+ * SAME function. No other code path in this module is allowed to
+ * re-implement the `DRIFT_EXCLUDE_PATTERNS` filter loop.
+ * @param {string[]} files
+ * @returns {string[]}
+ */
+function filterExcluded(files) {
+  return files.filter(
+    (f) => !DRIFT_EXCLUDE_PATTERNS.some((pattern) => pathMatchesPattern(f, pattern))
+  );
+}
+
+/**
+ * Is this UNTRACKED path the plugin's own runtime output? Same rule as
+ * `isOwnRuntimeArtifact()` in scripts/lib/project-hygiene.mjs (untracked
+ * under `.orchestrator/` = ours), mirrored rather than imported: it is not
+ * exported, and importing that module would pull js-yaml and the command
+ * blocker into this one for a one-line prefix test. Applied to the
+ * `ls-files --others` source only — a tracked `.orchestrator/` file is a
+ * deliverable or a ledger, and `DRIFT_EXCLUDE_PATTERNS` decides which.
+ *
+ * Ceiling (BV-004): a runtime file a consumer has COMMITTED (e.g. a
+ * `session.lock` swept in by `git add -A`) counts whenever the plugin
+ * rewrites it, and a NEW `steering/`/`policy/` file counts only once it is
+ * tracked. Revisit if a drift WARN traces to a tracked runtime file, or a
+ * missed WARN to an uncommitted steering/policy deliverable.
+ *
+ * @param {string} file repo-root-relative path from `git ls-files --others`
+ * @returns {boolean}
+ */
+function isUntrackedRuntimeWrite(file) {
+  return file.startsWith('.orchestrator/');
+}
+
+/** Split git `--name-only`/`ls-files` stdout into trimmed non-empty paths. */
+function outputPaths(stdout) {
+  return stdout.split('\n').map((line) => line.trim()).filter((line) => line.length > 0);
+}
+
+// Per-query bound for the three numerator git calls — the same 10 s that
+// scripts/lib/project-hygiene.mjs gives its read-only git queries. A timeout
+// throws like any other failure and lands in the same skip.
+const DRIFT_GIT_TIMEOUT_MS = 10_000;
+
+/** realpath, or the resolved spelling when the path cannot be resolved. */
+function realOrResolved(p) {
+  try { return realpathSync(p); } catch { return path.resolve(p); }
+}
+
+/**
+ * Committed files from the session's OTHER own work trees (#1659).
+ *
+ * `session-start-ref` names one sha in the coordinator's own checkout; commits
+ * the same session made in its other worktrees are recorded as
+ * `orchestrator.session.work_tree` events (hooks/pre-bash-staging-fence.mjs).
+ * This reads them for the PROCESS-LOCAL raw session id
+ * (`readProcessLocalSessionIds`, never a repo-global file) and diffs each tree
+ * inside itself (`sessionCommitFiles`) — never across trees.
+ *
+ * Excluded before diffing: the own tree (realpath-equal to `ownTop`; the
+ * STATE.md ref stays authoritative there) and trees of a DIFFERENT repository
+ * (other `--git-common-dir`; their paths live in another path space). A tree
+ * whose common dir cannot be queried is passed through, so
+ * `sessionCommitFiles` names why it is unusable (`tree-missing`, …).
+ *
+ * Never throws: any failure yields `null` (no other-tree data), so the
+ * existing own-tree measurement is never turned into a skip by this source.
+ * That includes the own-tree identity queries (`--show-toplevel`,
+ * `--path-format=absolute` needs git >= 2.31): they run HERE, only once a
+ * session id exists, never inside computeDrift()'s numerator `try`.
+ *
+ * @param {{ repoRoot: string|undefined, gitOpts: object, env: object,
+ *           eventsFile?: string }} args
+ * @returns {{ files: string[], counted: number, skipped: number, otherRepo: number,
+ *             malformed: number, invalid: number } | null}
+ *   `null` when no other own tree is recorded. `malformed` / `invalid` carry
+ *   the reader's unreadable lines and own events without a usable tree/ref.
+ */
+function otherWorkTreeFiles({ repoRoot, gitOpts, env, eventsFile }) {
+  try {
+    const [sessionId] = readProcessLocalSessionIds({ env });
+    if (!sessionId) return null;
+    const read = readSessionWorkTrees({ sessionId, repoRoot, eventsFile });
+    if (read.trees.length === 0) return null;
+    const ownTop = realOrResolved(execFileSync('git', ['rev-parse', '--show-toplevel'], gitOpts).trim());
+    const ownCommonDir = realOrResolved(
+      execFileSync('git', ['rev-parse', '--path-format=absolute', '--git-common-dir'], gitOpts).trim(),
+    );
+    const others = read.trees.filter((t) => realOrResolved(t.tree) !== ownTop);
+    if (others.length === 0) return null;
+    const sameRepo = [];
+    let otherRepo = 0;
+    for (const t of others) {
+      let common = null;
+      try {
+        common = execFileSync('git', ['-C', t.tree, 'rev-parse', '--path-format=absolute', '--git-common-dir'], {
+          encoding: 'utf8', timeout: DRIFT_GIT_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'ignore'],
+        }).trim();
+      } catch { /* unusable tree: sessionCommitFiles reports the reason */ }
+      if (common !== null && realOrResolved(common) !== ownCommonDir) { otherRepo += 1; continue; }
+      sameRepo.push(t);
+    }
+    const res = sessionCommitFiles({ trees: sameRepo });
+    return {
+      files: res.union,
+      counted: res.perTree.length,
+      skipped: res.skipped.length,
+      otherRepo,
+      malformed: read.malformed,
+      invalid: read.invalid,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Internal: read + parse STATE.md's frontmatter exactly once. Shared by
+ * `readBaseline()` and `computeDrift()` so a single `computeDrift()` call
+ * never re-parses the same file twice (see module docstring § SCOPE).
+ *
+ * @param {string|undefined} repoRoot
+ * @returns {{ ok: true, fm: object } | { ok: false, reason: 'no-state-md'|'unreadable-state-md' }}
+ */
+function readFrontmatterOrReason(repoRoot) {
+  // #1636: the write side's ownership rule — another platform's STATE.md not
+  // proven to be this process's would lend its baseline and session-start-ref
+  // to THIS session's drift tripwire. It counts as absent (`no-state-md`,
+  // silent like every skip here; writeBaseline() already refuses it).
+  const { path: statePath, rejected } = resolveStateMdWriteTarget(repoRoot);
+  if (rejected) return { ok: false, reason: 'no-state-md' };
+  let raw;
+  try {
+    raw = readFileSync(statePath, 'utf8');
+  } catch {
+    // No STATE.md at all (e.g. persistence: false, or never yet written).
+    return { ok: false, reason: 'no-state-md' };
+  }
+
+  const parsed = parseStateMd(raw);
+  if (parsed === null) {
+    // Malformed/unparseable frontmatter — fail-open (see module docstring).
+    return { ok: false, reason: 'unreadable-state-md' };
+  }
+
+  return { ok: true, fm: parsed.frontmatter };
+}
+
+/**
+ * Internal: classify a scope baseline from ALREADY-PARSED frontmatter.
+ * Mirrors `readBaseline()`'s public contract exactly (same three shapes) —
+ * extracted so `computeDrift()` can reuse the identical classification
+ * logic against the SAME parsed frontmatter object `readFrontmatterOrReason()`
+ * already produced, instead of re-parsing STATE.md a second time.
+ *
+ * @param {object} fm — already-parsed STATE.md frontmatter
+ * @returns {null
+ *   | { stale: true, baselineSession: string|null, currentSession: string|null }
+ *   | { intent: unknown, ownerBoundary: unknown, plannedFiles: unknown,
+ *       session: string|null, frozenAt: unknown, branch: unknown,
+ *       sessionStartRef: unknown }}
+ */
+function classifyBaselineFromFrontmatter(fm) {
+  if (!Object.prototype.hasOwnProperty.call(fm, 'scope-baseline-session')) {
+    return null; // no baseline has ever been frozen
+  }
+
+  const baselineSession = normalizeSessionValue(fm['scope-baseline-session']);
+  const currentSession = normalizeSessionValue(fm.session);
+
+  if (baselineSession !== currentSession) {
+    return { stale: true, baselineSession, currentSession };
+  }
+
+  return {
+    intent: fm['scope-baseline-intent'] ?? null,
+    ownerBoundary: fm['scope-baseline-owner-boundary'] ?? null,
+    plannedFiles: fm['scope-baseline-planned-files'] ?? null,
+    session: baselineSession,
+    frozenAt: fm['scope-baseline-frozen-at'] ?? null,
+    branch: fm.branch ?? null,
+    sessionStartRef: fm['session-start-ref'] ?? null,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+/**
+ * Filter a RAW file-path list (e.g. the union of declared agent file scopes
+ * for a session) through `DRIFT_EXCLUDE_PATTERNS`, returning the surviving
+ * paths. This is the denominator half of the #894 review finding F1 fix —
+ * `writeBaseline()` calls `countPlannedFiles()` (below), which wraps this
+ * function, whenever its `plannedFiles` argument is an array. Exported
+ * directly for callers that want the filtered LIST rather than just the
+ * count (e.g. for logging which planned files were excluded).
+ * @param {string[]} files
+ * @returns {string[]}
+ */
+export function filterPlannedFiles(files) {
+  return filterExcluded(files);
+}
+
+/**
+ * Filter a RAW file-path list through `DRIFT_EXCLUDE_PATTERNS` and return
+ * the surviving count — the preferred way to compute `writeBaseline()`'s
+ * `plannedFiles` denominator. Calls the exact same `filterExcluded()`
+ * primitive `computeDrift()`'s numerator uses, so both sides of the S2
+ * drift ratio are provably produced by one function (#894 review finding
+ * F1).
+ * @param {string[]} files
+ * @returns {number}
+ */
+export function countPlannedFiles(files) {
+  return filterPlannedFiles(files).length;
+}
+
+/**
+ * Read the scope baseline from STATE.md frontmatter, without mutating
+ * anything. Sync, never throws.
+ *
+ * @param {string|undefined} repoRoot
+ * @returns {null
+ *   | { stale: true, baselineSession: string|null, currentSession: string|null }
+ *   | { intent: unknown, ownerBoundary: unknown, plannedFiles: unknown,
+ *       session: string|null, frozenAt: unknown, branch: unknown,
+ *       sessionStartRef: unknown }}
+ *   `null` — no STATE.md, unreadable/malformed frontmatter, or no baseline
+ *   has ever been frozen. `{ stale: true, ... }` — a baseline exists but
+ *   belongs to a different session than the current `session` field.
+ *   Otherwise the baseline object itself.
+ */
+export function readBaseline(repoRoot) {
+  const result = readFrontmatterOrReason(repoRoot);
+  if (!result.ok) return null;
+  return classifyBaselineFromFrontmatter(result.fm);
+}
+
+/**
+ * Freeze (or refresh, when the stored baseline is stale) the scope baseline
+ * into STATE.md frontmatter. Writes exactly five flat keys:
+ * `scope-baseline-intent`, `scope-baseline-owner-boundary`,
+ * `scope-baseline-planned-files`, `scope-baseline-session`,
+ * `scope-baseline-frozen-at`. `branch` and `session-start-ref` are read
+ * from the existing frontmatter, never written by this function.
+ *
+ * Routes its write through `writeStateMd()` (scripts/lib/state-md.mjs) —
+ * see module docstring § Sync/async rule for why this is the ONLY async
+ * export and why it must NOT nest its own `withStateMdLock()` call.
+ * Never throws.
+ *
+ * @param {object} args
+ * @param {string|undefined} args.repoRoot
+ * @param {string} args.intent
+ * @param {string} args.ownerBoundary
+ * @param {string[]} args.plannedFiles — the RAW array of planned file paths
+ *   (e.g. the union of declared agent file scopes for the session) —
+ *   filtered internally via `countPlannedFiles()`, which calls the SAME
+ *   `filterExcluded()` helper `computeDrift()`'s numerator uses (see the
+ *   `DRIFT_EXCLUDE_PATTERNS` doc comment above and #894 review finding F1).
+ *   MUST be an array. Issue #903 REMOVED the previously-accepted
+ *   "already-counted plain number" back-compat shape: it was an unverified
+ *   re-entry vector for exactly the F1 bug the filtering above exists to
+ *   prevent (a caller could hand this function an unfiltered count with no
+ *   `filterExcluded()` pass at all). Anything that is not an array is
+ *   rejected UP FRONT — before STATE.md is read or the lock is taken —
+ *   as `{ written: false, reason: 'invalid-planned-files' }`.
+ * @returns {Promise<{ written: boolean, reason?: 'invalid-planned-files'|'already-frozen'|'no-state-md'|'unreadable-state-md'|'lock-timeout'|'lock-fs-error'|'unexpected-error'|'size-ceiling'|'frontmatter-unsafe'|'foreign-state-md' }>}
+ */
+export async function writeBaseline({ repoRoot, intent, ownerBoundary, plannedFiles } = {}) {
+  if (!Array.isArray(plannedFiles)) {
+    // #903 — the plain-number back-compat shape is REMOVED, not merely
+    // undocumented: it let a caller bypass `filterExcluded()` entirely by
+    // pre-counting (possibly unfiltered) and storing verbatim. Reject up
+    // front — no STATE.md read, no lock ever taken.
+    return { written: false, reason: 'invalid-planned-files' };
+  }
+
+  let skipReason;
+
+  try {
+    const result = await writeStateMd(repoRoot, (before) => {
+      // `writeStateMd()` passes an empty string when STATE.md does not
+      // exist on disk (frontmatter-mutators.mjs:304-305) — that IS the
+      // "no-state-md" signal at this layer.
+      if (before === '') {
+        skipReason = 'no-state-md';
+        return null;
+      }
+
+      const parsed = parseStateMd(before);
+      if (parsed === null) {
+        skipReason = 'unreadable-state-md';
+        return null;
+      }
+
+      const fm = parsed.frontmatter;
+      const currentSession = normalizeSessionValue(fm.session);
+      const hasBaseline = Object.prototype.hasOwnProperty.call(fm, 'scope-baseline-session');
+
+      if (hasBaseline) {
+        const baselineSession = normalizeSessionValue(fm['scope-baseline-session']);
+        if (baselineSession === currentSession) {
+          // Same session already froze a baseline (or both are absent,
+          // which counts as a match per rule 2 above) — reject, no mutation.
+          skipReason = 'already-frozen';
+          return null;
+        }
+        // Different session — the stored baseline is stale. Fall through
+        // and overwrite all five keys below.
+      }
+
+      // Resolve the denominator (#894 review finding F1, tightened by
+      // #903): `plannedFiles` is GUARANTEED to be an array here — the outer
+      // `writeBaseline()` already rejected anything else (see the
+      // `Array.isArray()` guard above) before this transformer ever ran.
+      // Filter it via `countPlannedFiles()` — the SAME `filterExcluded()`
+      // primitive `computeDrift()`'s numerator uses below, so both sides of
+      // the ratio are provably produced by one function.
+      const resolvedPlannedFiles = countPlannedFiles(plannedFiles);
+
+      fm['scope-baseline-intent'] = intent;
+      fm['scope-baseline-owner-boundary'] = ownerBoundary;
+      fm['scope-baseline-planned-files'] = resolvedPlannedFiles;
+      fm['scope-baseline-session'] = currentSession;
+      fm['scope-baseline-frozen-at'] = nowIso();
+
+      return serializeStateMd(parsed);
+    });
+
+    if (result.written) {
+      return { written: true };
+    }
+    // `writeStateMd()` itself refused the write (size-ceiling or
+    // frontmatter-unsafe breach) — surface that reason rather than falling
+    // back to the transformer's closure-captured reason, which was never
+    // set on this path.
+    // `foreign-state-md` (#1640): the target belongs to another session.
+    if (result.reason === 'size-ceiling' || result.reason === 'frontmatter-unsafe' || result.reason === 'foreign-state-md') {
+      return { written: false, reason: result.reason };
+    }
+    return { written: false, reason: skipReason ?? 'unreadable-state-md' };
+  } catch (err) {
+    // `writeStateMd()` throws a `TypeError` only if the transformer returns
+    // a non-string/non-null/non-undefined value (never happens here), and
+    // the `withStateMdLock()` it takes internally THROWS a labelled Error on
+    // acquire failure BY DESIGN (state-md-lock.mjs:265-270 / :328), tagging
+    // `err.code` as `STATE_LOCK_TIMEOUT` or `STATE_LOCK_FS_ERROR`. This
+    // module's contract is "never throw" — map the escaping error's
+    // `err.code` HONESTLY (#894 review finding F4) instead of collapsing
+    // every failure into `'lock-timeout'`: a disk-full / permission failure
+    // on the lock directory must not misdirect the operator toward "retry,
+    // it's contention". (The invalid-`plannedFiles` case that used to throw
+    // from inside this transformer is gone as of #903 — it is rejected by
+    // the `Array.isArray()` guard before `writeStateMd()` is ever called,
+    // so it never reaches this catch block.)
+    if (err?.code === 'STATE_LOCK_TIMEOUT') {
+      return { written: false, reason: 'lock-timeout' };
+    }
+    if (err?.code === 'STATE_LOCK_FS_ERROR') {
+      return { written: false, reason: 'lock-fs-error' };
+    }
+    return { written: false, reason: 'unexpected-error' };
+  }
+}
+
+/**
+ * Compute the S2 warn-only scope-drift ratio: how many files differ in this
+ * checkout — committed since the session's frozen `session-start-ref`, plus
+ * whatever is uncommitted or untracked right now — filtered through
+ * `DRIFT_EXCLUDE_PATTERNS`, against the `plannedFiles` count frozen by
+ * `writeBaseline()`. Sync (`readFileSync` + `execFileSync('git', ...)`
+ * only). Never throws, never denies — this is a WARN-only tripwire; the
+ * CALLER decides whether/how to surface `breached`.
+ *
+ * Numerator (#1027): the deduplicated union of three git queries — the
+ * committed range diff, the working tree against HEAD (staged + unstaged),
+ * and untracked files (`ls-files --others --exclude-standard`, minus the
+ * plugin's own untracked `.orchestrator/` writes, see
+ * `isUntrackedRuntimeWrite()`). Until #1027 only the first was read, so
+ * uncommitted edits and every NEW module — the typical shape of an
+ * overshoot — were invisible until someone committed them. All three must
+ * succeed: if any fails (including ENOBUFS and the per-query timeout) the
+ * result is the `unresolvable-ref` skip, never a ratio over a partial
+ * numerator. That reason is deliberately not split by cause: its readers
+ * (skills/wave-executor/references/wave-loop-review.md step 7a,
+ * skills/session-end/plan-verification.md step 5) render every skip
+ * silently or verbatim and none branches on it.
+ *
+ * Named ceiling (BV-004) — over-report: only the committed source is tied to
+ * `session-start-ref`. The working-tree and untracked sources read the
+ * checkout as it is NOW, so a file that was already dirty when the session
+ * started, and a same-checkout peer session's files, count as this session's
+ * drift. Fixing it means persisting a start-dirty snapshot at freeze time and
+ * subtracting it — a storage change, out of scope for this warn-only
+ * tripwire. Revisit if a drift WARN traces to pre-session dirt or to a
+ * peer's files (`git status` at session start shows the former,
+ * PSA-001 signals the latter).
+ *
+ * Skip precedence (first match wins, so `reason` is deterministic):
+ *   `no-state-md` → `unreadable-state-md` → `no-baseline` →
+ *   `stale-baseline` → (`no-baseline-ref` | `unresolvable-ref`)
+ *
+ * `session-start-ref` handling — THREE outcomes, deliberately distinct.
+ * `skills/_shared/state-ownership.md:28` declares the field OPTIONAL
+ * ("readers MUST tolerate their absence"), so the absent-field branch is a
+ * REACHABLE production path, not a defensive corner:
+ *
+ *   - **Field present**, diff against it succeeds → measured; `refUsed`
+ *     reports the bare ref verbatim (NOT a range — pre-existing contract,
+ *     unchanged).
+ *   - **Field absent** → the range is RESOLVED via `resolveBaselineRange()`
+ *     (scripts/lib/vcs-repo-spec.mjs): preferred remote `R` →
+ *     `refs/remotes/<R>/HEAD` → `refs/remotes/<R>/{main,master}` → local
+ *     `{main,master}`. NOT a skip — `refUsed` reports the range actually
+ *     resolved (`gitlab/main...HEAD`, `origin/master...HEAD`, …).
+ *     This REPLACES the hard-coded `'origin/main...HEAD'` literal the
+ *     function carried until #1039, which hard-coded BOTH the remote name
+ *     AND the default branch in one string. In any repo whose remote is not
+ *     named `origin`, or whose default branch is not `main`, that diff
+ *     always failed → the tripwire skipped → and
+ *     `skills/wave-executor/wave-loop.md` renders every `skipped === true`
+ *     with NO WARN. A guard that neither bit nor reported that it was not
+ *     biting.
+ *   - **Field absent AND nothing resolves** (fresh `git init`, no remotes,
+ *     no `main`/`master` anywhere) → skip with `reason: 'no-baseline-ref'`.
+ *     This is an ABSENCE — there is genuinely no session base to measure
+ *     against — and is deliberately NOT folded onto `unresolvable-ref`,
+ *     which means the QUERY failed (not a git repo, git not on PATH, a
+ *     present-but-dead `session-start-ref` after a rebase/force-push).
+ *     The split follows `isQueryFailure()` from the same module, the single
+ *     predicate that separates "I could not ask" from "I asked; the answer
+ *     is no". Folding them was the pre-#1039 behaviour and made an operator
+ *     unable to tell a broken checkout from a fresh repo.
+ *
+ * Named ceiling (BV-004) on the local-branch tail of the resolution chain:
+ * when the chain lands on a LOCAL `main`/`master` and HEAD is already that
+ * branch, `main...HEAD` has merge-base === HEAD and the COMMITTED source is
+ * empty, so the session's commits are invisible and the ratio counts only
+ * the uncommitted and untracked files instead of skipping. That is the
+ * honest floor of the available information (no remote-tracking ref exists
+ * to say where the session started); it can only under-report, and an
+ * under-report is as silent as a skip under `wave-loop-review.md`'s
+ * WARN-on-breach rule. Revisit if this function ever gains a non-warn
+ * consumer that treats `skipped:false` as "measured successfully".
+ *
+ * @param {object} args
+ * @param {string|undefined} args.repoRoot
+ * @param {number} [args.threshold] — breach threshold, `>=` counts as
+ *   breached (default `2.0`).
+ * @param {object} [args.env=process.env] — source of the PROCESS-LOCAL raw
+ *   session id whose other work trees are added (#1659); injectable for tests.
+ * @param {string} [args.eventsFile] — explicit events ledger for the
+ *   work-tree records (default: the repoRoot's ledger).
+ * @returns {{ ok: true, skipped: true, reason: 'no-state-md'|'unreadable-state-md'|'no-baseline'|'stale-baseline'|'no-baseline-ref'|'unresolvable-ref' }
+ *   | { ok: true, skipped: false, filesRatio: number, plannedFiles: number,
+ *       actualFiles: number, breached: boolean, threshold: number, refUsed: string,
+ *       otherWorkTrees?: { counted: number, skipped: number, otherRepo: number,
+ *                          malformed: number, invalid: number } }}
+ *   Additive since #1039: `no-baseline-ref` is a NEW member of the skip-reason
+ *   union. No existing member was renamed or removed, and the measured-result
+ *   shape (all eight keys) is byte-identical to the pre-#1039 contract.
+ *   Additive since #1659: the committed source also unions the files the
+ *   session (process-local raw id) committed in its OTHER own work trees of
+ *   the same repository, each diffed inside itself against its own recorded
+ *   start ref (`orchestrator.session.work_tree`). `otherWorkTrees` appears
+ *   only when such a tree is recorded: `counted` trees measured, `skipped`
+ *   trees unusable (gone, ref unresolvable — they never fail the drift),
+ *   `otherRepo` trees of a different repository (not comparable, ignored),
+ *   `malformed` unreadable ledger lines and `invalid` own events without a
+ *   usable tree/start_ref (a partial read, never a clean verdict).
+ */
+export function computeDrift({ repoRoot, threshold = 2.0, env = process.env, eventsFile } = {}) {
+  const parsedFm = readFrontmatterOrReason(repoRoot);
+  if (!parsedFm.ok) {
+    return { ok: true, skipped: true, reason: parsedFm.reason };
+  }
+
+  const classified = classifyBaselineFromFrontmatter(parsedFm.fm);
+  if (classified === null) {
+    // Distinguishable from readFrontmatterOrReason's failures — STATE.md
+    // parses fine, but `scope-baseline-session` was never written.
+    return { ok: true, skipped: true, reason: 'no-baseline' };
+  }
+  if (classified.stale === true) {
+    // A fresh diff against an old denominator is noise, not a measurement
+    // — no filesRatio is computed on this path.
+    return { ok: true, skipped: true, reason: 'stale-baseline' };
+  }
+
+  const baseline = classified;
+  const cwd = repoRoot ?? process.cwd();
+  const rawRef = typeof baseline.sessionStartRef === 'string' && baseline.sessionStartRef.length > 0
+    ? baseline.sessionStartRef
+    : null;
+
+  // Resolve the diff range. The `session-start-ref` branch keeps its exact
+  // pre-#1039 shape (two-dot `<ref>..HEAD`, `refUsed` = the bare ref); only
+  // the absent-field branch changed, from a hard-coded literal to a real
+  // resolution. See the JSDoc above for the three outcomes.
+  let diffRange;
+  let refUsed;
+  if (rawRef !== null) {
+    diffRange = `${rawRef}..HEAD`;
+    refUsed = rawRef;
+  } else {
+    const resolved = resolveBaselineRange({ repoRoot: cwd });
+    if (!resolved.ok) {
+      // `isQueryFailure()` is the frozen predicate that keeps the two causes
+      // apart: a broken/absent git ⇒ `unresolvable-ref` (degraded
+      // measurement), a repo that simply has no baseline ref ⇒
+      // `no-baseline-ref` (a real, benign repo state).
+      return {
+        ok: true,
+        skipped: true,
+        reason: isQueryFailure(resolved.reason) ? 'unresolvable-ref' : 'no-baseline-ref',
+      };
+    }
+    diffRange = resolved.range;
+    refUsed = resolved.range;
+  }
+
+  // Untracked files can be numerous, so the 1 MiB default buffer would turn
+  // a large tree into an ENOBUFS skip.
+  const gitOpts = { cwd, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, timeout: DRIFT_GIT_TIMEOUT_MS };
+  const changedFiles = new Set();
+  try {
+    const committed = execFileSync('git', ['diff', '--name-only', diffRange], gitOpts);
+    const workingTree = execFileSync('git', ['diff', '--name-only', 'HEAD'], gitOpts);
+    // `--full-name` + `:/` keep these paths in the same repo-root-relative
+    // space as `git diff --name-only`, even if `cwd` is a subdirectory.
+    const untracked = execFileSync('git', ['ls-files', '--others', '--exclude-standard', '--full-name', '--', ':/'], gitOpts);
+    for (const file of [...outputPaths(committed), ...outputPaths(workingTree)]) changedFiles.add(file);
+    for (const file of outputPaths(untracked)) {
+      if (!isUntrackedRuntimeWrite(file)) changedFiles.add(file);
+    }
+  } catch {
+    // The range resolved but a numerator query failed — a present-but-dead
+    // `session-start-ref` (rebase, force-push, deleted commit), a resolved
+    // base that vanished between resolution and diff, a working-tree or
+    // untracked query git could not answer, output over `maxBuffer`
+    // (ENOBUFS), or a query past `DRIFT_GIT_TIMEOUT_MS`. None can produce a
+    // trustworthy numerator, and a partial one must not be reported as
+    // measured. All share `unresolvable-ref`: every reader renders a skip
+    // silently and none branches on the reason (census in the JSDoc above).
+    return { ok: true, skipped: true, reason: 'unresolvable-ref' };
+  }
+
+  // #1659: add what the session committed in its OTHER own work trees. The
+  // own tree is excluded inside (its STATE.md ref above stays authoritative).
+  const otherTrees = otherWorkTreeFiles({ repoRoot, gitOpts, env, eventsFile });
+  if (otherTrees !== null) for (const file of otherTrees.files) changedFiles.add(file);
+
+  // Same `filterExcluded()` primitive `writeBaseline()`'s denominator
+  // (`countPlannedFiles()`) calls (#894 review finding F1), so the pattern
+  // filter on both sides of the ratio is one function. The untracked
+  // `.orchestrator/` rule above is numerator-only by construction: a planned
+  // path carries no tracked status to test.
+  const actualFiles = filterExcluded([...changedFiles]).length;
+
+  const plannedFilesRaw = baseline.plannedFiles;
+  const plannedFiles = typeof plannedFilesRaw === 'number' && Number.isFinite(plannedFilesRaw)
+    ? plannedFilesRaw
+    : 0;
+
+  // Division-by-zero guard: a baseline that froze zero planned files (no declared
+  // file scope, or a non-numeric count coerced to 0 above) would otherwise yield
+  // Infinity or NaN; `max(plannedFiles, 1)` keeps the ratio finite and comparable.
+  const filesRatio = round2(actualFiles / Math.max(plannedFiles, 1));
+  const breached = filesRatio >= threshold;
+
+  return {
+    ok: true,
+    skipped: false,
+    filesRatio,
+    plannedFiles,
+    actualFiles,
+    breached,
+    threshold,
+    refUsed,
+    // Additive (#1659), present ONLY when another own work tree is recorded,
+    // so the eight-key shape above is unchanged for single-tree sessions.
+    ...(otherTrees !== null
+      ? {
+        otherWorkTrees: {
+          counted: otherTrees.counted,
+          skipped: otherTrees.skipped,
+          otherRepo: otherTrees.otherRepo,
+          malformed: otherTrees.malformed,
+          invalid: otherTrees.invalid,
+        },
+      }
+      : {}),
+  };
+}

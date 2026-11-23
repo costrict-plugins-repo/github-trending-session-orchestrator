@@ -1,0 +1,169 @@
+# Owner Persona Schema (`owner.yaml`)
+
+> Per-user configuration for the session-orchestrator plugin. Lives at
+> `~/.config/session-orchestrator/owner.yaml`. Never committed to a project repo.
+>
+> Issue #174 — D1 of Sub-Epic #161 (Owner Persona Layer).
+> Parent epic: #157 (v3.1.0 Environment-Aware Sessions).
+>
+> **SSOT is code, not this file:** `scripts/lib/owner-yaml.mjs` (schema,
+> validator, loader, writer) + `scripts/lib/config/private-config-dir.mjs`
+> (path resolution). This page describes that module; when the two disagree,
+> the module wins.
+
+## Path Resolution
+
+The loader (`scripts/lib/owner-yaml.mjs`, via `resolvePrivateConfigDir()` in
+`scripts/lib/config/private-config-dir.mjs`) resolves the canonical path as:
+
+```
+${SO_CONFIG_HOME ?? XDG_CONFIG_HOME ?? <homedir>/.config}/session-orchestrator/owner.yaml
+```
+
+| Platform   | Default path                                            |
+|------------|---------------------------------------------------------|
+| macOS      | `~/.config/session-orchestrator/owner.yaml`             |
+| Linux      | `${XDG_CONFIG_HOME:-~/.config}/session-orchestrator/owner.yaml` |
+| Windows    | `%USERPROFILE%\.config\session-orchestrator\owner.yaml` |
+
+A missing file is **not an error** — it signals the user has not opted in.
+`loadOwnerConfig()` then returns `getDefaults()` with `source: 'defaults'`.
+
+## Schema
+
+Four **required** sections (`owner`, `tone`, `efficiency`, `hardware-sharing`)
+and the optional sections below. An invalid required section discards the whole
+file (defaults are returned, errors reported); an invalid optional object
+section is replaced by its default and reported via `droppedSections`
+(`source: 'partial'`).
+
+| Section / Field                     | Type / enum                          | Required | Default   | Notes                                              |
+|-------------------------------------|--------------------------------------|----------|-----------|----------------------------------------------------|
+| `owner.name`                        | non-empty string                     | yes      | `''`      | Display name.                                      |
+| `owner.language`                    | `de` \| `en`                         | yes      | `en`      | Drives soul.md default language.                   |
+| `tone.style`                        | `direct` \| `neutral` \| `friendly`  | yes      | `neutral` |                                                    |
+| `tone.tonality`                     | string or absent                     | no       | `''`      | Free-form descriptor.                              |
+| `efficiency.output-level`           | `lite` \| `full` \| `ultra`          | yes      | `full`    | Token dial.                                        |
+| `efficiency.preamble`               | `minimal` \| `verbose`               | yes      | `minimal` | Pre-tool-call narration.                           |
+| `hardware-sharing.enabled`          | boolean                              | yes      | `false`   | Consent gate for hardware-pattern export.          |
+| `hardware-sharing.hash-salt`        | string                               | no       | `''`      | Required (non-empty) when `enabled = true`.        |
+| `paths.vault-dir`                   | string                               | no       | `''`      | `''` = no override; beats the committed `vault-integration.vault-dir`. |
+| `paths.baseline-path`               | string                               | no       | `''`      | Host-local `plan-baseline-path` override (#653).   |
+| `paths.namespace-map-path`          | string                               | no       | `''`      | Host-local repo-pseudonym JSON map (#725 D5).      |
+| `paths.confidential-names-file`     | string                               | no       | `''`      | Host-local JSON array of names for the CP11 leakage rule (#728a). Names live in that file only, never inline here. |
+| `dispatcher.autonomy`               | `off` \| `advisory` \| `autonomous-gated` \| `''` | no | `''` | `''` = no override (#679).                         |
+| `learnings.store-role`              | `writer` \| `inbox`                  | no       | absent    | Absent, or an empty `learnings:`, = `writer` outside listed inbox repos. Env `SO_LEARNINGS_STORE_ROLE` overrides it. `inbox` = this host (every repo not listed in `learnings.inbox-repos`) only appends to `learnings-inbox.jsonl` (#1516). Any other value, any key other than `store-role` or `inbox-repos` in `learnings` (e.g. `store_role`), or an unreadable/unparseable owner.yaml that names `learnings`, is `invalid`: canonical-store writes refuse (`LearningsStoreRoleError`), they do not fall back to `writer`. |
+| `learnings.inbox-repos`             | list of strings                      | no       | absent    | Repo-root paths whose stores are `inbox` on this host (#1754). Each entry must be non-empty, absolute or `~/`-prefixed (`HOME`, else OS home), with no leading/trailing whitespace or NUL/CR/LF. Precedence: trimmed non-empty env `SO_LEARNINGS_STORE_ROLE` > store inside a listed root > `learnings.store-role` > `writer`. Paths resolve symlinks of the deepest existing ancestor and follow the filesystem’s own spelling for existing components via `realpathSync.native` (on case-insensitive filesystems those existing components match regardless of case); components that do not exist yet retain their written spelling and compare exactly; linked worktrees need their own entry. A `learnings` section that fails validation in any YAML form, including a non-list or any invalid entry, is `invalid` for every store; canonical-store writes refuse, never fall back to `writer` (null is treated as absent). |
+| `hooks.profile`                     | `strict` \| `full` \| `standard` \| `relaxed` | no       | absent    | Host hook profile (#1881); absent = `standard`, `full` = `strict`. `relaxed` (#2090) runs the hooks of `standard` and warns and runs two measured destructive-guard cases (a truncating redirect onto an unmodified tracked file, `git reset --hard` on a clean tree); everything else stays denied. Env `SO_HOOK_PROFILE` wins; `minimal` and `off` are env-only, because an agent can append to this file. Profiles: [session-config-reference § Hook Runtime Profile Control](./session-config-reference.md#hook-runtime-profile-control-211). |
+| `hooks.disabled`                    | list of hook names                   | no       | absent    | Hooks switched off on this host, unioned with env `SO_DISABLED_HOOKS`. A safety hook (`pre-bash-destructive-guard`, `enforce-scope`, `enforce-commands`, both sessions-ledger guards, `config-protection`, `pre-task-scope-disjoint`, `pre-bash-staging-fence`) is refused. Any other key in `hooks`, or an invalid value, drops the section and the default profile applies. |
+| `notifications.stop`                | boolean (`on`/`off`/`1`/`0` accepted) | no      | absent    | `false` = `hooks/on-stop.mjs` sends no desktop notification (OSC 9 + OSC 777, "Session stopped — your turn") when a session stops (#1936); absent = on. Env `SO_STOP_NOTIFICATION` (`on`/`off`) wins. A per-user choice, so it lives here and not in the repo's Session Config. Any other key in `notifications`, or an unreadable value, drops the section and the notification stays on. Plugin versions before the switch ignore the section. |
+| `agent-caps.process-starting`, `agent-caps.reading` | integer from 1, or `off` | no | absent | Agent caps on this host, per class. Env `SO_AGENT_CAP_PROCESS_STARTING` / `SO_AGENT_CAP_READING` win; this beats the Session Config. Details: [Agent Caps](./session-config-reference.md#agent-caps). |
+| `agent-caps.brake-engage-pct`, `agent-caps.brake-release-pct` | integer 1 to 99; engage also `off` | no | absent | Memory brake on this host. Env `SO_AGENT_BRAKE_ENGAGE_PCT` / `SO_AGENT_BRAKE_RELEASE_PCT` win. A bad value warns and is skipped; any other key in `agent-caps` drops the section. |
+| `design-review.enabled`             | boolean (`on`/`off`/`1`/`0` accepted) | no      | absent    | `false` switches the design review and its close gate off on this host without a commit (#1452); env `SO_DESIGN_REVIEW` wins, this beats the committed Session Config. Read on its own by `scripts/design-review.mjs` (`readOwnerDesignReviewBlock`), even when the loader discards the rest of the file; an unparseable file is named in the output, an unknown value is ignored and named. |
+| `design-review.close-gate`          | `warn` \| `refuse`                    | no      | absent    | Host-local close-gate mode (#1452). Env `SO_DESIGN_REVIEW_CLOSE_GATE` wins. |
+| `design-review.act-on-verdicts`     | boolean (`on`/`off`/`1`/`0` accepted) | no      | absent    | Host-local switch for whether review findings (`designer critique` and `ux-evaluator`) create work (default off, agentic-designer#85). Env `SO_DESIGN_REVIEW_ACT_ON_VERDICTS` wins; this beats the committed Session Config. |
+| `vaults`, `baselines`               | lists                                | no       | absent    | Passed through untouched; parsed leniently at point of use. |
+
+### Privacy Contract
+
+- `hardware-sharing.enabled = true` **requires** a non-empty
+  `hardware-sharing.hash-salt`. The validator rejects consent without the means
+  to anonymise per-host learnings.
+- Only PATHS live in `owner.yaml`; the host-local data they point at
+  (confidential names, namespace map) is never inlined and never committed.
+
+## Example
+
+See [`scripts/lib/owner-config.example.yaml`](../scripts/lib/owner-config.example.yaml)
+for an annotated, copyable example.
+
+## API Surface
+
+`scripts/lib/owner-yaml.mjs` — the live SSOT. **Synchronous**; every call site
+consumes it without `await`. `js-yaml` is imported lazily, so the module is
+safe on the hook import graph.
+
+```js
+import { loadOwnerConfig, resolveOwnerYamlPath, validateOwnerConfig, getDefaults }
+  from './scripts/lib/owner-yaml.mjs';
+
+const result = loadOwnerConfig();
+// {
+//   config: <merged with getDefaults()>,
+//   source: 'file' | 'partial' | 'defaults' | ...,
+//   path: '<absolute path>',
+//   errors: string[], warnings: string[],
+//   droppedSections?: Array<{ section: string, errors: string[], rawKeys: string[] }>,
+// }
+// rawKeys = keys of the dropped section that carried a non-empty value, so a
+// caller (CP11) can tell "key present" without re-reading the file (#1270).
+
+// Test override
+const result2 = loadOwnerConfig({ path: '/tmp/test-owner.yaml' });
+
+// Pure validation, no I/O, never throws.
+const { valid, errors } = validateOwnerConfig(rawObj);
+```
+
+Also exported: `validateOwnerSections()` (per-section buckets),
+`writeOwnerConfig()`, `OPTIONAL_OBJECT_SECTIONS`, `resolvePrivateConfigDir`.
+
+## Where this gets read
+
+`loadOwnerConfig()` has 10 live consumers outside its own module
+(`rg -ln "loadOwnerConfig" scripts hooks`, 2026-09-09) — two hooks
+(`hooks/on-session-start.mjs`, `hooks/skill-invocation-telemetry.mjs`), the
+session-start owner-config banner (`scripts/lib/owner-config-banner.mjs`), the
+host-path + dispatcher-autonomy resolvers (`scripts/lib/config/host-paths.mjs`,
+`scripts/lib/config/dispatcher-autonomy.mjs`), the named-vault resolver, the
+owner-leakage scanner, telemetry, and vault-mirror. Since #1936 `hooks/on-stop.mjs`
+also reads it, lazily and only on the Stop path, for `notifications.stop`. For the behavioural
+contract of the persona layer itself see
+[`.claude/rules/owner-persona.md`](../.claude/rules/owner-persona.md).
+
+## Validation Rules (rejection examples)
+
+```yaml
+# REJECTED — owner.name empty
+owner: { name: "", language: en }
+
+# REJECTED — language outside the de|en enum
+owner: { name: x, language: "english" }
+
+# REJECTED — enum violation
+owner: { name: x, language: en }
+tone: { style: "snarky" }
+
+# REJECTED — privacy contract: enabled=true without hash-salt
+owner: { name: x, language: en }
+hardware-sharing: { enabled: true }
+
+# ACCEPTED — all four required sections present and valid
+owner:
+  name: Example Owner
+  language: de
+tone:
+  style: direct
+efficiency:
+  output-level: full
+  preamble: minimal
+hardware-sharing:
+  enabled: false
+```
+
+## Owner privacy pattern source
+
+Host-local owner leakage patterns use a separate protected version 1 JSON file, not an owner.yaml section. See [Owner privacy patterns](owner-privacy-patterns.md) for source precedence, schema, migration and strict packed-release checks. `paths.vault-dir` remains the canonical vault target used by the vault migration and consolidation tools; `SO_VAULT_DIR` overrides it.
+
+### Host-local drift path exceptions (#937)
+
+Optional `drift-check.foreign-host-prefixes` is an array of absolute directory
+prefixes belonging to known foreign hosts, for example
+`/Users/remote-user/Projects/foreign-layout`. Missing `/Users/…` references
+under a declared prefix become warnings; other missing paths remain errors.
+Matching respects directory boundaries and accepts a trailing slash. Prefixes
+must contain at least three components (four under `/Users` or `/home`); roots,
+home directories, broad Projects roots, traversal, globs and malformed entries
+are rejected. One invalid entry drops the entire optional `drift-check` section
+while preserving other valid owner settings. This section does not change
+`drift-check.mode` or its precedence. No default allowlist is supplied.

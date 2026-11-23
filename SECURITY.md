@@ -1,0 +1,364 @@
+# Security Policy
+
+## Supported Versions
+
+| Version | Supported |
+|---------|-----------|
+| 5.x | Yes |
+| 4.x and earlier | No |
+
+Only the latest 5.x minor receives fixes. See [CHANGELOG.md](CHANGELOG.md) for the
+current release.
+
+## Reporting a Vulnerability
+
+If you discover a security vulnerability in Session Orchestrator, please report it responsibly and privately.
+
+**Report it through GitHub Private Vulnerability Reporting:** [open a private report](https://github.com/Kanevry/session-orchestrator/security/advisories/new) (repository tab *Security* → *Report a vulnerability*). This is the only channel; please do not open a public issue for a vulnerability.
+
+Please include:
+- Description of the vulnerability
+- Steps to reproduce
+- Affected files/skills
+- Potential impact
+
+**Response time:** We aim to acknowledge reports within 48 hours and provide a fix or mitigation plan within 7 days.
+
+## Scope
+
+Session Orchestrator is a plugin for AI coding agents (Claude Code, Codex CLI,
+Cursor, Pi), composed of Markdown instructions plus a Node ESM runtime under
+`scripts/` and `hooks/`. It requires Node 24+.
+
+What it **does** touch:
+
+- **Local filesystem** — reads/writes repo files, `.orchestrator/` runtime state,
+  and (when vault integration is enabled) a host-local vault directory under `$HOME`.
+- **Your VCS CLI** — spawns `glab` / `gh` using your existing authentication.
+- **Credentials via environment** — reads `GITLAB_TOKEN` (baseline fetch),
+  `CLANK_EVENT_SECRET` (event-bus bearer token), and `NPM_TOKEN` from a gitignored
+  `.env.local` (publish flow only). It does not keep them anywhere else, with one
+  exception: the publish flow writes `NPM_TOKEN` to a mode-`0600` file in a private
+  directory under the system temp directory for the duration of each npm call and
+  deletes it afterwards; if deletion fails it prints a warning to delete the file
+  and rotate the token. A hard process kill skips that cleanup.
+  `CLANK_EVENT_SECRET` is transmitted as a bearer token when the event bus is
+  configured. See `.env.example` in the source repository.
+- **Outbound network** — most paths are opt-in: event-bus webhook POSTs
+  (only when `CLANK_EVENT_URL` *and* `CLANK_EVENT_SECRET` are set), GitLab API
+  baseline fetches (only with `GITLAB_TOKEN`), anonymous usage telemetry
+  (strictly opt-in, one-time consent, whitelist-projected — see
+  [docs/telemetry.md](docs/telemetry.md)).
+  **Summary: two connections are on by default (update check, security-pulse), each with its own switch; telemetry sends nothing before consent.**
+  **On by default, two paths:** (1) the SessionStart update check, one GET to
+  the public npm registry, independent of telemetry consent. A successful result
+  is cached for 24 hours per repository; a failed request or cache write can
+  cause another request at the next session. Disable it with
+  `SO_DISABLE_UPDATE_CHECK`, `DO_NOT_TRACK` or
+  `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` (see
+  [docs/telemetry.md](docs/telemetry.md)). (2) The security-pulse background
+  refresher, started from SessionStart when its cache is due (6-hour TTL per
+  part; sooner when HEAD moved or a part failed, at most one start per
+  10 minutes). It fetches the Node release index and the CISA KEV feed, sends the
+  names and versions of the lockfile packages at HEAD (private packages
+  filtered out) to OSV, and, for GitHub remotes, queries open private
+  vulnerability reports through your `gh` login. `security-delta.mode` does not
+  gate it. It does not start when `DO_NOT_TRACK` or
+  `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` is set (set, non-empty, not `0`,
+  not `false`), the same two flags the update check honours. Its own switch is
+  `SO_SECURITY_PULSE_REFRESH=off`; `SO_DISABLE_STARTUP_PROBES=1` switches off
+  all startup probes. Release and site scripts the operator starts by
+  hand also make network requests.
+- **An optional self-hosted ingest server** — `server/ingest/` is a small HTTP
+  service (with `Dockerfile`, rate limiting, SQLite persistence, retention) that an
+  operator may deploy to *receive* telemetry. It is not run by the plugin and is not
+  required to use it.
+
+What it does **not** do:
+- Execute user-provided code directly
+- Store or forward credentials to any third party
+- Send telemetry or event-bus data without an explicit opt-in
+
+Security concerns are most likely to involve:
+- **Hook scripts** (`hooks/*.mjs`) — command injection via crafted file paths or tool input
+- **Skill instructions** — prompt injection that makes an agent leak data, run foreign code or switch a guard off for other sessions (see [What the guards are, and are not](#what-the-guards-are-and-are-not))
+- **Agent dispatch** — unintended tool access or scope escalation during wave execution
+- **Session Config** — the `*-command` keys are executed via a shell; see
+  [Session Config Command Trust](#session-config-command-trust) below
+
+## Disclosure
+
+We follow [responsible disclosure](https://en.wikipedia.org/wiki/Responsible_disclosure). Fixes are committed with a security advisory once a patch is available.
+
+### Fixed in 5.21.2
+
+Versions before 5.21.2 are affected by an issue in the post-edit hooks (#2226). Update to 5.21.2 or later. The GitHub security advisory for this fix carries the details.
+
+## Enforcement Architecture
+
+Enforcement is a set of `PreToolUse` / `PreToolUse`-adjacent hooks registered via
+`hooks/hooks.json` (with per-platform variants for Codex, Cursor, and Pi). All are
+Node ESM; the former Bash implementations were removed in the v3.0.0 native
+migration (#137/#138).
+
+### Wave-scoped enforcement
+
+Both wave guards read a `wave-scope.json` that the wave-executor writes before
+dispatching each wave. Its location is **platform-resolved** by
+`scripts/lib/scope-gate.mjs` — `.claude/`, `.codex/`, `.cursor/`, or `.pi/` under
+the project root, depending on the host agent.
+
+**File scope (`hooks/enforce-scope.mjs`)** intercepts `Edit`, `Write`, and
+`MultiEdit`. It resolves the target through `realpath` (symlink-bypass defense) and
+matches the result against `allowedPaths` — prefix, glob, or exact literal. An
+explicit *absolute* allowlist entry is honoured before the project-root containment
+check (#792), so a deliberate out-of-repo grant is reachable; every other
+out-of-repo path is denied.
+
+**Command scope (`hooks/enforce-commands.mjs`)** intercepts `Bash` and matches the
+command against `blockedCommands[]` using word-boundary matching (so `rm` does not
+match `format`). When `blockedCommands` is empty or absent, a hardcoded fallback
+list applies (`rm -rf`, `git push --force` / `-f`, `git reset --hard`,
+`drop table`, `git checkout --`, which also covers per-file discard and the
+`git restore` forms).
+
+Both wave guards **fail closed**: any unhandled internal error emits a deny,
+never a silent allow. (The session-level destructive-command guard makes the
+opposite, documented choice — see
+[Policy floor (blocked-commands)](#policy-floor-blocked-commands).)
+
+### Enforcement levels
+
+Both wave guards read the `enforcement` field from `wave-scope.json`:
+
+| Level | Behavior | Exit code |
+|-------|----------|-----------|
+| `strict` | Deny the operation via `hookSpecificOutput.permissionDecision: deny` on stdout | 0 |
+| `warn` | Allow the operation, emit stderr warning | 0 |
+| `off` | Skip all checks | 0 |
+
+A deny exits **0**, not 2 (#906). Per the Claude Code hook contract a hook signals
+either by exit code alone or by exit 0 plus structured JSON — never both; under
+`exit 2` stdout JSON is discarded, which previously swallowed every deny reason.
+The emitter is `scripts/lib/io.mjs#emitDeny`; see its JSDoc for the full payload.
+
+**Default is `strict`** (fail-closed) when the `enforcement` field is missing.
+
+### Policy floor (blocked-commands)
+
+Since #972 the destructive-command guard (`pre-bash-destructive-guard.mjs`) no
+longer reads a single policy file first-hit-wins — it merges two policy roles
+via `scripts/lib/blocked-commands-policy.mjs` (`loadEffectivePolicy`):
+
+| Role | Source | Semantics |
+|---|---|---|
+| **Floor** | `$CLAUDE_PLUGIN_ROOT/.orchestrator/policy/blocked-commands.json` | The plugin's own blocklist — immutable baseline. |
+| **Overlay** | First existing of `<cwd>`, `$CLAUDE_PROJECT_DIR` (`.orchestrator/policy/blocked-commands.json`) | The consumer repo's policy — strictly additive. |
+
+Roles are resolved purely by path — there is no marker field in the file.
+Precedence: `cwd` → `CLAUDE_PROJECT_DIR` for the overlay; the plugin root
+always supplies the floor. When both roles resolve to the same file (e.g.
+inside the plugin repo itself), that one file *is* the policy.
+
+**Merge contract** — union by rule `id`, floor rules first, escalate-only:
+
+- An overlay-only `id` is appended (additive).
+- On an `id` collision with a floor rule of severity `block`, the **whole floor
+  rule wins** — no field merge (an overlay-supplied `pattern` or
+  `path-allowlist` would be a bypass); the overlay definition is dropped with a
+  stderr warning.
+- A floor rule of severity `warn` escalates monotonically:
+  `max(floor, overlay)` with `warn < block`; unknown overlay severity → floor
+  kept + warning.
+
+**Failure semantics** — the authoritative contract for this hook. Unlike the
+wave guards above, it is deliberately *not* fail-closed on internal error:
+
+| Condition | Effective policy |
+|---|---|
+| Overlay malformed / missing `.rules` / empty `rules: []` | **Fail-to-floor**: floor alone + stderr warning (an empty overlay cannot disarm the floor) |
+| Floor unresolvable (no plugin root, or file missing) | Overlay alone + warning |
+| Both missing | Fail-open (guard skipped) + warning — unchanged pre-#972 behavior. One exception: a here-doc left open by its command substitution (`x=$(cat <<E )`) is denied before any policy is loaded, because bash and zsh read the lines after it differently (#2249) |
+| Internal error in the hook | `exit 0` fail-open — a documented decision; the merge module's functions are total (never throw) precisely so policy input can never reach this path |
+
+**Trust note:** whoever controls `CLAUDE_PLUGIN_ROOT` controls the floor. That
+is harness trust — the same party already controls the hook code itself — not a
+new attack surface.
+
+### Dynamic per-wave scoping
+
+Scope constraints change between waves:
+
+- **Discovery waves** use empty `allowedPaths` (deny-all writes) combined with
+  explicit read-only agent instructions (dual enforcement — hook-level + prompt-level).
+- **Quality waves** use two-phase scope: production file patterns for simplification
+  passes, then test-only patterns (`**/*.test.*`, `**/*.spec.*`) for test/review passes.
+
+### Session-level guards (active outside waves)
+
+| Hook | Protects against |
+|---|---|
+| `pre-bash-destructive-guard.mjs` | Destructive shell commands in the **main** session, per the effective `blocked-commands.json` policy — at least the 14 floor rules from the plugin's policy, plus any additive overlay rules from the repo's policy (`block` or `warn` severity, each citing its source rule; see [Policy floor (blocked-commands)](#policy-floor-blocked-commands)). Reads the text of the tool call only; see [What the guards are, and are not](#what-the-guards-are-and-are-not). `allow-destructive-ops: true` in Session Config is ignored (it was agent-writable); the operator relaxes the guard from outside the agent's reach with `SO_HOOK_PROFILE` / host-local `owner.yaml` `hooks.profile`, or switches it off with `SO_DISABLED_HOOKS=pre-bash-destructive-guard`. |
+| `config-protection.mjs` | Edits that *loosen* a quality gate — lowered thresholds, added `eslint-disable`/`@ts-ignore`, rules flipped to `off`, widened `.gitleaks.toml` allowlists, relaxed tsconfig strictness. Warn-by-default, fail-open on internal error. |
+| `pre-bash-staging-fence.mjs` + `wave-scope-commit-guard.mjs` | Concurrent `git add` races between parallel wave-agents, and lint-staged sweeps that re-stage files outside wave scope. Rejects the commit rather than the edit. |
+
+The behavioural rules these guards mechanise are documented in
+[`.claude/rules/parallel-sessions.md`](.claude/rules/parallel-sessions.md) (PSA-003,
+PSA-004, PSA-007).
+
+### What the guards are, and are not
+
+The destructive-command guard, the sessions-ledger guards and the STATE.md path
+guard are **accident guards for a cooperating agent**. They are not a containment
+boundary against an agent that is trying to get around them.
+
+What they see, measured against the code:
+
+- They read the **text** of one tool call. A script file the call runs
+  (`node ./cleanup.mjs`, `sh ./cleanup.sh`) is not inspected.
+- Alias spellings of a protected path are not all recognised: a symlink or
+  Windows junction, an NTFS stream suffix, case variants on a case-insensitive
+  volume, a trailing slash on a directory.
+- On Codex, text typed into an already open interactive shell reaches no hook.
+  On Windows, Codex sends PowerShell text with the tool name `Bash`, which the
+  POSIX rules do not understand.
+- The destructive-command guard no longer honours `allow-destructive-ops: true`
+  in the Session Config block of `CLAUDE.md` / `AGENTS.md`: the guarded agent
+  could write that line itself. The key is ignored with a stderr warning. The
+  operator relaxes the guard from outside the agent's reach (hook profile via
+  `SO_HOOK_PROFILE` at launch or host-local `owner.yaml` `hooks.profile`;
+  profile `relaxed` warns and runs two measured cases only, a truncating
+  redirect onto an unmodified git-tracked file and `git reset --hard` on a
+  clean tree, each only when written as one plain command, and denies
+  everything else) or turns it off with
+  `SO_DISABLED_HOOKS=pre-bash-destructive-guard`. This is not the only way past a
+  guard; the points above are others.
+
+How reports are handled: a further unrecognised spelling or command shape is a
+normal bug or hardening item, not a vulnerability. A guard that leaks data,
+executes foreign code, or is turned off for other sessions remains a security
+report. What the guards do on each harness is listed in
+[docs/codex-setup.md](docs/codex-setup.md) § Which guard runs on which harness.
+
+## Supply Chain
+
+- `.npmrc` sets `ignore-scripts=true` — no dependency may run install/postinstall
+  scripts. This is the primary defense against postinstall-style attacks (SEC-020).
+- CI enforces `npm audit --omit=dev --audit-level=high`.
+- **gitleaks** (37 rules) and an **owner-leakage scanner**
+  (`scripts/lib/validate/check-owner-leakage.mjs`) both run in CI and as `.husky/`
+  pre-commit stages, so a secret or private-path leak is normally blocked before it
+  reaches a public branch. Note the asymmetry: the owner-leakage stage is
+  unconditional, whereas the local gitleaks stage is **skipped silently when gitleaks
+  is not installed** — CI remains the backstop for that one, and `--no-verify`
+  bypasses both.
+- This repo is **npm-canonical**: `package-lock.json` is the committed lockfile and
+  `scripts/check-package-manager.mjs` guards against a foreign lockfile appearing.
+
+## Opening a repository you did not write
+
+Cloning a repository and letting an agent edit files in it must not run that
+repository's commands. Since 5.21.2 the post-edit typecheck hook
+(`hooks/post-edit-validate.mjs`) and the post-edit import probe
+(`hooks/post-edit-import-probe.mjs`) start nothing unless the project is the
+plugin's own checkout. In any other project the typecheck hook reports `skip`
+and the import probe returns silently. Neither runs a command from the
+project's Session Config (`typecheck-command`), a compiler or ESLint from its
+`node_modules`, or a compiler from your `PATH`. A wave scope
+manifest does not change this. Before 5.21.2, the typecheck hook ran
+`typecheck-command` from the Session Config of whatever project the edited file
+belonged to; this was reported and fixed as
+[GHSA-f4r8-fcrq-2pj3](https://github.com/Kanevry/session-orchestrator/security/advisories/GHSA-f4r8-fcrq-2pj3).
+
+What still applies when you open a repository you did not write:
+
+- Session Config commands (`test-command`, `typecheck-command`, `lint-command`,
+  `custom-phases[].command`) run when you start a `/session` wave or a quality
+  gate in it, the same way its `package.json` scripts run when you call `npm`.
+  Read the Session Config block of `CLAUDE.md` / `AGENTS.md` before you start a
+  session in a repository you do not trust.
+- The harness's own folder trust (for example Claude Code's trust prompt) decides
+  whether hooks and project settings load at all; the plugin does not replace it.
+- The guards are accident guards, not a sandbox (see above).
+
+## Session Config Command Trust
+
+The Session Config keys `test-command`, `typecheck-command`, `lint-command`, and
+`custom-phases[].command` are executed via a shell, but only by the session
+workflow you start: the quality gates and custom phases of a `/session` run.
+A malicious commit to `CLAUDE.md` could therefore inject commands that run when
+you start such a session in that repository. That is **RCE-equivalent within the
+repo's existing trust model** for those paths: anyone able to commit can already
+achieve the same through `package.json` scripts, `.husky/` hooks, or a test
+file, and those run when you invoke `npm` or commit. The equivalence does **not**
+extend to the editor hooks: until 5.21.2 the post-edit typecheck hook ran
+`typecheck-command` by itself after every JS/TS edit, without a session (see
+[Opening a repository you did not write](#opening-a-repository-you-did-not-write)).
+
+The mitigation is review, not sandboxing: treat Session Config like code. Any diff
+touching a command-bearing key must show before/after. `custom-phases` additionally
+rejects shell metacharacters as defense-in-depth. Full trust model in
+[`.claude/rules/security.md`](.claude/rules/security.md).
+
+## Prerequisites
+
+- **Node.js 24+.** v3.x is Node ESM throughout; there is no Bash runtime dependency
+  for the hooks (`jq` is used only by a few `scripts/` validators, never by
+  `hooks/*.mjs`).
+- Hooks run inside the host agent's harness as tool-use interceptors, not as
+  standalone scripts.
+
+## Known Limitations
+
+1. **No wave enforcement outside active waves** — when no `wave-scope.json` exists
+   (between sessions, before the first wave, after cleanup), the two wave guards exit 0.
+   The session-level guards in the table above remain active.
+
+2. **Prompt injection via VCS content** — issue titles and descriptions fetched via
+   `glab`/`gh` are consumed in agent prompts without sanitization. A malicious issue
+   body could inject instructions into an agent's context. Mitigated by: issues are
+   typically user-created in controlled workflows. Wave scope enforcement and the
+   command guards catch accidents by a cooperating agent; they are not a containment
+   boundary against injected instructions that try to get around them (see
+   [What the guards are, and are not](#what-the-guards-are-and-are-not)).
+
+3. **Plugin relies on the host harness** — tool-level enforcement is provided by the
+   agent's hook system. The plugin cannot enforce restrictions if hooks are bypassed
+   at the harness level (`disableAllHooks`, `--no-verify`, etc.).
+
+4. **Session Config values are only partially validated** — `health-endpoints`,
+   `plan-baseline-path`, and `cross-repos` accept arbitrary strings. Do not embed
+   credentials in these fields (see Credential Safety below).
+
+5. **Guards are heuristics, not proofs** — `config-protection.mjs` is a
+   low-false-positive line/regex heuristic, not an exhaustive AST gate, and fails
+   open by design so a guard bug never blocks legitimate work. The command and path
+   guards read the text of a tool call (not a script file it runs, not every alias
+   spelling of a path, nothing typed into an already open Codex shell); see
+   [What the guards are, and are not](#what-the-guards-are-and-are-not).
+
+6. **A standalone single-file copy of `check-owner-leakage.mjs` cannot resolve
+   its sibling helper modules** (`../config/host-paths.mjs`,
+   `./confidential-names.mjs`, `../owner-yaml.mjs`) — the documented vendoring
+   shape (see [Supply Chain](#supply-chain) above). A CP11 confidential-names
+   guard configured only via `owner.yaml` `paths.confidential-names-file`
+   therefore degrades to an inert WARN with exit 0 in that copy (CP1–CP10 keep
+   running); configured instead via the `SO_CONFIDENTIAL_NAMES_FILE`
+   environment variable, the same standalone copy fails **closed** (a counted
+   FAIL, exit 1), because the raw env var is still readable without the
+   helpers. Prefer the environment variable over `owner.yaml` when vendoring
+   this scanner as a single file.
+
+## Credential Safety
+
+- Secrets are read from the environment or a gitignored `.env.local`, never written
+  into repo files by the plugin.
+- VCS CLI tools (`glab`, `gh`) use your existing authentication; their credential
+  security is your responsibility.
+- **Do not embed API keys, passwords, or auth tokens** in Session Config fields
+  (especially `health-endpoints` URLs). Session Config lives in `CLAUDE.md`, which is
+  normally committed.
+- **Do not paste tokens into permission allowlists** in `.claude/settings.json` or
+  `.claude/settings.local.json` (SEC-025). `settings.local.json` is conventionally
+  untracked, so the pre-commit leakage scanner — which enumerates tracked files —
+  structurally cannot see a token pasted there.

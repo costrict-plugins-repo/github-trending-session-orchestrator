@@ -1,0 +1,96 @@
+# Phase 6: Session Summary Template
+
+> Sub-file of the session-end skill (#1157 — agentskills.io: SKILL.md core < 500 lines, procedure in `references/`). Extracted VERBATIM from `skills/session-end/SKILL.md`; `SKILL.md` keeps a one-line stub naming this phase and its gate condition.
+
+Present to the user:
+
+```
+## Session Summary
+
+### Completed
+- [x] Issue #N: [description] — [evidence: tests passing, files changed]
+- [x] Issue #M: [description]
+
+### Outcome served [#1824]
+- <statement> — observed: <observed | not observable in this session (reason) | not measured>
+- never count not-measured as achieved
+- this is the session's goal behind its tasks (STATE.md `outcome-*`, one line); single `[Abnahme]` issues stay under Abnahme offen, never here as well
+- omit the section when STATE.md names no outcome
+
+### Abnahme offen (implemented ≠ accepted — never counted as Completed) [#1678]
+- [ ] #<IID> [Abnahme] <Kriterium> — owner: <body | assignee | Owner> — not-before: <date | —>
+- scope: [linked to this session's plan/epic | all open — link not determinable]
+
+### Unverified (kein Außenrichter) [#1825]
+- <Ergebnis> — UNVERIFIED: kein Außenrichter (<was ihn liefern würde>)
+- a result listed here never counts as Completed
+
+### Carried Over
+- [ ] Issue #P: [what's left] — new issue #Q created
+- [ ] [description] — blocked by [reason]
+
+### Dropped at Handover Gate (deselected in triage — origin issue left open) [#769]
+- [ ] [middle-band item] — origin #<IID> — reason: [operator deselected in Phase 1.65 triage; no [Carryover] duplicate filed]
+
+### New Issues Created
+- Issues dieser Session: [line printed by scripts/issue-balance.mjs, verbatim — Phase 5 Step 3b.3] [#1947]
+- #R: [title] (priority: [X], status: ready)
+- #S: [title] (priority: [X], status: ready)
+- [Backlog-Sammel] #C: [N] LOW-Folgepunkte / zurückgestellte Punkte (one collector per session)
+
+### Entscheidungen für dich [#1950]
+- [decision taken on the owner's behalf: default chosen, scope cut, requirement reinterpreted where it contradicted] — [why] — [how to reverse]
+- up to five points; write `keine` when there were none — never omit the section
+
+### Nicht geprüft [#1950]
+- [what no check covers — a green gate proves one property, name the ones it does not]
+- up to five points; write `keine` when everything shipped is covered — never omit the section
+
+### Ergebnis gegen Erwartung [#1950]
+- [task id]: Erwartung „<sentence from the plan>“ — Ergebnis: <met | partly: … | missed: …>
+- only for tasks whose plan carried an `Erwartung`; write `keine Erwartung im Plan` when none did
+
+### Unresolved Review Findings (MED/LOW — recorded, not ticketed) [#617]
+- [MED] <finding> — <file:line> — <why deferred / fold decision>
+- [LOW] <finding> — <file:line>
+
+### Metrics
+- Duration: [total wall-clock time]
+- Waves: [N completed]
+- Agents: [total dispatched] ([X complete, Y partial, Z failed])
+- Files changed: [N]
+- Per-wave breakdown:
+  - Wave 1 (Discovery): [duration] — [N agents] — [K files]
+  - Wave 2 (Impl-Core): [duration] — [N agents] — [K files]
+  - ...
+- Tests: [passing/total] · Δ this session: +[added] / −[removed] / ~[consolidated] · tests:src LOC ratio [x.xx] (advisory ceiling 1.60)
+- TypeScript: 0 errors
+- Commits: [N] pushed to [branch]
+- Mirror: [synced/skipped]
+- Docs Health: Vault staleness — [render one of the three cases below based on Phase 2.3 result]
+  - Findings present (warn mode): `[N stale projects, M stale narratives] (mode=warn). See .orchestrator/metrics/vault-staleness.jsonl.`
+  - Skipped (disabled or mode=off): `skipped (disabled | mode=off).`
+  - Clean run: `clean (mode=<mode>).`
+- Custom Phases: [render based on Phase 2.5 result — omit the line entirely if `custom-phases` was absent/empty]
+  - Per phase: `<name>: <pass|FAIL> (exit <code>, mode=<mode>)[ — review: <path>]`
+  - None ran (all filtered out by `when`): `none applicable for session-type=<type>.`
+- Vault orphans: [render based on Phase 3.7e — omit the line entirely when `vault-integration.enabled` is not `true`]
+  - Candidates present: `<N> untracked vault file(s) modified since session start (candidates, mtime is no proof): <path>, <path>, ... — recorded as Open Question, nothing committed or deleted.`
+  - None: `none since session start (<U> untracked in total).`
+  - Could not measure (exit 2 / `status: unavailable`): `could not measure (<reason>)` — never "none".
+- Enforcement: [N violations blocked / M warnings] (or "N/A" if enforcement off)
+- Circuit breaker: [N agents hit limits, M spirals detected] (or "none")
+- Metrics written to: `.orchestrator/metrics/sessions.jsonl`
+- Learnings: [N] new, [M] confirmed, [K] contradicted/expired — written to `.orchestrator/metrics/learnings.jsonl`
+
+### Next Session Recommendations
+- Priority: [what should be tackled next]
+- Type: [housekeeping/feature/deep recommended]
+- Notes: [any context for next session]
+```
+
+> **Outcome-served anchor (#1824):** the statement and its observable come from STATE.md via `readOutcome()` (`scripts/lib/state-md.mjs`) — never retyped from memory; `null` means the session named no outcome and the section is omitted. `observed` is the same value the Phase 3.7 record carries (`session-metrics-write.md` § `outcome`): `observed` ONLY when the observable named in STATE.md was actually checked in this session, with the check quoted; `not-observable-in-session` with the reason when it can only be seen later (a metric after a release, a user reaction); otherwise `not measured`. A not-measured outcome is never reported as achieved.
+
+> **Test-delta anchor:** the `Δ this session` figures are aggregated from the `test_delta` field of this session's agent reports (added / removed / consolidated test cases); the `tests:src LOC ratio` is the output of `node scripts/lib/tests-src-ratio.mjs --json` — the single measurement per `.claude/rules/test-value.md` § TV-003; never re-derive it by hand. When the envelope carries `reason: "no-tests-found"` (#1451), report the ratio as not measurable, not as within the corridor. A bare `passing/total` count is not a progress signal — a growing suite reads as progress even when the growth is redundant, which is exactly why the delta and the ratio are reported alongside it. When the ratio exceeds the advisory ceiling, recommend that the NEXT session's Quality wave run as a **consolidation wave**: no new test lands without a redundant one being removed in the same change. This is advisory only — it never blocks the close.
+
+> **Documentation Coverage anchor:** If Phase 3.2 ran and produced task verification results (i.e. `docs-orchestrator.enabled: true` and `docs-tasks` were found), the results appear here as a `### Documentation Coverage (docs-orchestrator)` subsection emitted by Phase 3.2 Step 7. The content is written dynamically — it is not pre-populated in this template. When `docs-orchestrator.enabled` is `false` or `docs-tasks` were absent, this subsection is omitted entirely.

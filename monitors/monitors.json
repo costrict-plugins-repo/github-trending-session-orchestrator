@@ -1,0 +1,20 @@
+[
+  {
+    "name": "ecosystem-health",
+    "command": "node \"${CLAUDE_PLUGIN_ROOT}\"/scripts/lib/ecosystem-health.mjs --watch",
+    "description": "Local state-file watcher: every 900 s it stats and reads ONE file, .orchestrator/metrics/ecosystem-health.jsonl under the project dir (getProjectDir, #1517), and emits one NDJSON line per change (appeared / disappeared / changed). No network, no CI or branch probing, no repo enumeration, no Session Config read. Nothing writes that file yet (0 writers, measured 2026-09-18), so every run emits `no-state-yet` and idles until SIGTERM — ceiling and revisit trigger at DEFAULT_INTERVAL_S in scripts/lib/ecosystem-health.mjs. Hung on session-start because the previous trigger (on-skill-invoke:ecosystem-health) was self-referential: it could only start when the ecosystem-health skill ran, and that skill has 0 recorded invocations fleet-wide, so the watcher never started once.",
+    "when": "on-skill-invoke:session-start"
+  },
+  {
+    "name": "convergence-monitor",
+    "command": "node \"${CLAUDE_PLUGIN_ROOT}\"/scripts/lib/convergence-monitor.mjs --tail",
+    "description": "Wave convergence telemetry monitor — tails .orchestrator/metrics/events.jsonl (that file only; it never opens sessions.jsonl) and surfaces convergence signals (shrinking diff, pass-rate plateau, velocity).",
+    "when": "on-skill-invoke:wave-executor"
+  },
+  {
+    "name": "wave-transcript-tail",
+    "command": "node \"${CLAUDE_PLUGIN_ROOT}\"/scripts/lib/wave-transcript-tail.mjs --tail",
+    "description": "FA-1 wave supervision — tails live subagent transcripts of the OWN session and emits stagnation_detected(source:tail) to .orchestrator/metrics/events.jsonl (#1114)",
+    "when": "on-skill-invoke:wave-executor"
+  }
+]

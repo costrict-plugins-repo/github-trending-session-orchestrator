@@ -1,0 +1,606 @@
+#!/usr/bin/env node
+/**
+ * validate-plugin.mjs — Validate plugin structure against the Claude Code Plugin API.
+ * Port of validate-plugin.sh (issue #218).
+ *
+ * Usage:
+ *   node scripts/validate-plugin.mjs [<plugin-root>]
+ *
+ * If <plugin-root> is omitted, uses `git rev-parse --show-toplevel`.
+ *
+ * Exit codes:
+ *   0 — all checks passed
+ *   1 — one or more validation failures
+ *
+ * Sub-scripts in scripts/lib/validate/ are NOT reimplemented here — they are
+ * spawned via child_process so that check logic stays in a single place.
+ */
+
+import { fileURLToPath } from 'node:url';
+import path from 'node:path';
+import { die, requireJq } from './lib/common.mjs';
+import { spawnSync } from './lib/native-command.mjs';
+
+// ---------------------------------------------------------------------------
+// Bootstrap
+// ---------------------------------------------------------------------------
+
+const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
+const VALIDATE_DIR = path.join(SCRIPT_DIR, 'lib', 'validate');
+const DRIFT_CHECKER = path.join(SCRIPT_DIR, '..', 'skills', 'claude-md-drift-check', 'checker.mjs');
+
+// Require jq (same gate as validate-plugin.sh's require_jq)
+try {
+  requireJq();
+} catch (/** @type {unknown} */ e) {
+  die(/** @type {Error} */ (e).message);
+}
+
+// Resolve plugin root
+let PLUGIN_ROOT;
+if (process.argv[2]) {
+  PLUGIN_ROOT = path.resolve(process.argv[2]);
+} else {
+  const gitResult = spawnSync('git', ['rev-parse', '--show-toplevel'], {
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  if (gitResult.status !== 0) {
+    die('Not inside a git repository');
+  }
+  PLUGIN_ROOT = gitResult.stdout.trim();
+}
+
+// ---------------------------------------------------------------------------
+// Check runner — mirrors run_check() in validate-plugin.sh
+// ---------------------------------------------------------------------------
+
+let totalPass = 0;
+let totalFail = 0;
+
+/**
+ * Run a single sub-script from scripts/lib/validate/.
+ * Returns the exit code of the sub-script (0 = all checks passed, 1 = failure).
+ *
+ * @param {string} script - basename of the .mjs file (e.g. "check-plugin-json.mjs")
+ * @returns {number} exit code
+ */
+function runCheck(script) {
+  const result = spawnSync('node', [path.join(VALIDATE_DIR, script), PLUGIN_ROOT], {
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+  const combined = (result.stdout ?? '') + (result.stderr ?? '');
+
+  // Print output, stripping the per-helper "Results: " summary line
+  // (orchestrator emits one final tally)
+  const lines = combined.split('\n');
+  const filtered = lines.filter((l) => !/^Results: /.test(l));
+  // Trim trailing blank lines that result from stripping the Results line
+  while (filtered.length > 0 && filtered[filtered.length - 1].trim() === '') {
+    filtered.pop();
+  }
+  if (filtered.length > 0) {
+    process.stdout.write(filtered.join('\n') + '\n');
+  }
+
+  // Accumulate pass/fail counts from the sub-script output
+  const passMatches = combined.match(/^[ ]{2}PASS:/gm);
+  const failMatches = combined.match(/^[ ]{2}FAIL:/gm);
+  totalPass += passMatches ? passMatches.length : 0;
+  totalFail += failMatches ? failMatches.length : 0;
+
+  return result.status ?? 1;
+}
+
+/**
+ * Advisory second pass for `check-skill-script-paths.mjs` (#1208): run it a
+ * second time with `--strict-sh --json` so the flag has a run surface inside
+ * validate-plugin, without promoting `.sh` findings to blocking here — the
+ * BLOCKING `.mjs`-only call above stays exactly as it is. Same non-blocking
+ * shape as the `check-unwired-features.mjs` / `check-learning-provenance.mjs`
+ * / `check-vcs-repo-flag.mjs` calls further down (exit code deliberately
+ * ignored; `checkFailed` is never set from this call). `runCheck()` cannot be
+ * reused here because it always spawns `[script, PLUGIN_ROOT]` with no room
+ * for extra flags, so this is a small dedicated spawn instead.
+ *
+ * @returns {void}
+ */
+function runStrictShAdvisory() {
+  const result = spawnSync(
+    'node',
+    [path.join(VALIDATE_DIR, 'check-skill-script-paths.mjs'), PLUGIN_ROOT, '--strict-sh', '--json'],
+    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] },
+  );
+  let parsed;
+  try {
+    parsed = JSON.parse(result.stdout || '');
+  } catch {
+    process.stdout.write(
+      '  WARN: check-skill-script-paths --strict-sh: could not parse JSON output (advisory)\n',
+    );
+    return;
+  }
+  const shDead = (parsed.findings || []).filter(
+    (f) => f.kind === 'missing-path' && f.path.endsWith('.sh'),
+  ).length;
+  process.stdout.write(
+    `  check-skill-script-paths --strict-sh: ${shDead} dead .sh citation(s) (advisory)\n`,
+  );
+}
+
+/**
+ * Run the surface-count drift family (issue #663) from the claude-md-drift-check
+ * checker over the doc surfaces that carry artifact counts (README.md +
+ * .orchestrator/steering/structure.md). The checker emits JSON; this adapter
+ * translates surface-count drift into validate-plugin's line vocabulary.
+ *
+ * The family covers: command / skill / agent / hook-event / hook-matcher / test
+ * counts. The checker runs in `warn` mode (it never exits non-zero on drift);
+ * THIS adapter decides the gate. Drift is reported as a `WARN:` line that does
+ * NOT increment the failure tally — surface-count drift in docs is advisory at
+ * the validate-plugin gate (it would otherwise red the whole build on a single
+ * stale prose number that any contributor can land). The hard-fail contract
+ * lives in the checker itself (`--mode hard` → exit 1), exercised by the
+ * regression suite. A genuine infra/parse failure of the checker DOES fail.
+ *
+ * @returns {number} 0 always for drift (advisory); 1 only on checker infra/parse failure.
+ */
+function runDriftCheck() {
+  console.log('--- Check: surface-count drift (command/skill/agent/hook/test) ---');
+  const result = spawnSync(
+    'node',
+    [
+      DRIFT_CHECKER,
+      '--mode', 'warn',
+      '--include-path', 'README.md',
+      '--include-path', '.orchestrator/steering/structure.md',
+      '--skip-path-resolver',
+      '--skip-project-count',
+      '--skip-issue-refs',
+      '--skip-session-files',
+      '--skip-session-config-parity',
+      '--skip-vault-dir-parity',
+    ],
+    {
+      cwd: PLUGIN_ROOT,
+      env: { ...process.env, VAULT_DIR: PLUGIN_ROOT },
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    },
+  );
+
+  // Infra failure (exit 2) — surface the stderr and count one fail.
+  if (result.status === 2) {
+    console.log(`  FAIL: drift checker infra-error: ${(result.stderr || '').trim()}`);
+    totalFail += 1;
+    return 1;
+  }
+
+  let parsed;
+  try {
+    const line = (result.stdout || '').trim().split('\n').find((l) => l.startsWith('{'));
+    parsed = JSON.parse(line);
+  } catch {
+    console.log('  FAIL: drift checker produced no parseable JSON output');
+    totalFail += 1;
+    return 1;
+  }
+
+  // Only surface-count-family errors are relevant here (other checks are skipped).
+  const SURFACE_IDS = new Set([
+    'command-count', 'skill-count', 'agent-count',
+    'hook-event-count', 'hook-matcher-count', 'test-count',
+  ]);
+  const driftErrors = (parsed.errors || []).filter((e) => SURFACE_IDS.has(e.check));
+  const ranSurfaces = (parsed.checks_run || []).filter((c) => SURFACE_IDS.has(c));
+
+  if (driftErrors.length === 0) {
+    console.log(`  PASS: surface counts in sync (${ranSurfaces.length} surface(s) checked: ${ranSurfaces.join(', ') || 'none claimed'})`);
+    totalPass += 1;
+    return 0;
+  }
+
+  // Advisory: report drift as WARN lines (do NOT increment the failure tally).
+  console.log(`  PASS: surface-count drift check ran (${ranSurfaces.length} surface(s) checked)`);
+  totalPass += 1;
+  for (const e of driftErrors) {
+    console.log(`  WARN: [${e.check}] ${e.file}:${e.line} — ${e.message}`);
+  }
+  return 0;
+}
+
+/**
+ * BLOCKING (#1224): the committed hook-reachable allowlist
+ * (`hooks/_lib/hook-import-set.json`) must match a fresh crawl of the four hook
+ * manifests. The allowlist is what gates `hooks/post-edit-import-probe.mjs`, so
+ * a stale set silently NARROWS that probe — a newly hook-reachable module would
+ * be edited without ever being checked, which is precisely the 2026-09-04
+ * host-wide-block incident class the probe exists to catch. A rotting allowlist
+ * is therefore a real defect, not a cosmetic drift, hence FAIL rather than WARN.
+ *
+ * `scripts/generate-hook-import-set.mjs --check` owns the comparison (it exits 1
+ * on drift); this adapter only translates it into validate-plugin's vocabulary.
+ * `runCheck()` cannot be reused — it spawns from `scripts/lib/validate/` and
+ * passes PLUGIN_ROOT positionally, while the generator takes `--plugin-root`.
+ *
+ * @returns {number} 0 when in sync, 1 on drift or a generator error.
+ */
+function runHookImportSetCheck() {
+  console.log('--- Check: hook-import-set drift (#1224) ---');
+  const script = path.join(SCRIPT_DIR, 'generate-hook-import-set.mjs');
+  const result = spawnSync(
+    process.execPath,
+    [script, '--plugin-root', PLUGIN_ROOT, '--check'],
+    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] },
+  );
+  const combined = ((result.stdout ?? '') + (result.stderr ?? '')).trim();
+
+  // A silent exit 0 is NOT a pass. The generator's CLI entry is gated on
+  // `import.meta.url === file://${process.argv[1]}`, which does not hold when
+  // the spawned path traverses a symlink (measured: `/tmp` → `/private/tmp` on
+  // macOS makes the whole CLI body a no-op that still exits 0). Demanding the
+  // in-sync marker turns that failure mode from a silent pass into a finding.
+  const inSync = combined.match(/(\d+) modules, in sync/);
+  if (result.status === 0 && inSync) {
+    console.log(`  PASS: hook-import-set: in sync (${inSync[1]} entries)`);
+    totalPass += 1;
+    return 0;
+  }
+  if (result.status === 0) {
+    console.log('  FAIL: hook-import-set: generator exited 0 without reporting a comparison '
+      + `(no in-sync marker in output: ${JSON.stringify(combined.slice(0, 120))})`);
+    totalFail += 1;
+    return 1;
+  }
+  const detail = combined.split('\n').filter(Boolean).pop()
+    ?? `generator exited ${result.status}`;
+  console.log(`  FAIL: hook-import-set: ${detail.replace(/^✗\s*hook-import-set:\s*/, '')}`);
+  console.log('        Remedy: node scripts/generate-hook-import-set.mjs && stage hooks/_lib/hook-import-set.json');
+  totalFail += 1;
+  return 1;
+}
+
+/**
+ * BLOCKING: the cross-harness portable surface (`AGENTS.md` +
+ * `.agents/skills/`) must match a fresh generation from `CLAUDE.md` +
+ * `skills/`. 7 of 8 surveyed harnesses read `AGENTS.md` and never `CLAUDE.md`,
+ * so a stale or absent copy means those harnesses silently see NO Session
+ * Config — a failure that is invisible from inside Claude Code, which is
+ * exactly why it needs a mechanical gate rather than a convention.
+ *
+ * `scripts/generate-agents-skills.mjs --check` owns the comparison (exit 1 on
+ * drift); this adapter only translates it. `runCheck()` cannot be reused — it
+ * spawns from `scripts/lib/validate/` and passes PLUGIN_ROOT positionally,
+ * while the generator takes `--plugin-root`. The in-sync marker is demanded
+ * for the same reason `runHookImportSetCheck()` demands one: a spawn whose
+ * path traverses a symlink can make the generator's CLI body a no-op that
+ * still exits 0.
+ *
+ * @returns {number} 0 when in sync, 1 on drift or a generator error.
+ */
+function runAgentsSurfaceCheck() {
+  console.log('--- Check: cross-harness portable surface (AGENTS.md + .agents/skills/) ---');
+  const script = path.join(SCRIPT_DIR, 'generate-agents-skills.mjs');
+  const result = spawnSync(
+    process.execPath,
+    [script, '--plugin-root', PLUGIN_ROOT, '--check'],
+    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] },
+  );
+  const combined = ((result.stdout ?? '') + (result.stderr ?? '')).trim();
+
+  const inSync = combined.match(/agents-surface: (\d+) artefact\(s\), in sync/);
+  if (result.status === 0 && inSync) {
+    console.log(`  PASS: agents-surface: in sync (${inSync[1]} artefacts)`);
+    totalPass += 1;
+    return 0;
+  }
+  if (result.status === 0) {
+    console.log('  FAIL: agents-surface: generator exited 0 without reporting a comparison '
+      + `(no in-sync marker in output: ${JSON.stringify(combined.slice(0, 120))})`);
+    totalFail += 1;
+    return 1;
+  }
+  for (const line of combined.split('\n').filter((l) => l.startsWith('✗'))) {
+    console.log(`  FAIL: ${line.replace(/^✗\s*/, '')}`);
+    totalFail += 1;
+  }
+  console.log('        Remedy: node scripts/generate-agents-skills.mjs');
+  return 1;
+}
+
+// ---------------------------------------------------------------------------
+// Run all checks — same order as validate-plugin.sh
+// plugin.json checks are prerequisite; abort early if they fail.
+// ---------------------------------------------------------------------------
+
+let checkFailed = 0;
+
+const pluginJsonRc = runCheck('check-plugin-json.mjs');
+if (pluginJsonRc !== 0) {
+  checkFailed = 1;
+  process.stdout.write('\n');
+  process.stdout.write('===========================================\n');
+  process.stdout.write(`  Results: ${totalPass} passed, ${totalFail} failed\n`);
+  process.stdout.write('===========================================\n');
+  process.exit(1);
+}
+
+process.stdout.write('\n');
+if (runCheck('check-component-paths.mjs') !== 0) checkFailed = 1;
+
+process.stdout.write('\n');
+if (runCheck('check-json-files.mjs') !== 0) checkFailed = 1;
+
+process.stdout.write('\n');
+if (runCheck('check-agents.mjs') !== 0) checkFailed = 1;
+
+process.stdout.write('\n');
+if (runCheck('check-commands.mjs') !== 0) checkFailed = 1;
+
+// FAIL-capable from day one: every rule this check enforces (frontmatter present,
+// parses as YAML, kebab-case name matching the directory, non-empty description)
+// was measured at 0 violations across all 46 SKILL.md files at the commit that
+// added it — so unlike the WARN-only censuses further down, it cannot be red on
+// arrival. It sits next to check-commands.mjs because it shares that check's
+// posture: a real js-yaml parse, not the line-regex approach of check-agents.mjs
+// that let 12 unparseable SKILL.md frontmatter blocks go unnoticed.
+process.stdout.write('\n');
+if (runCheck('check-skills.mjs') !== 0) checkFailed = 1;
+
+process.stdout.write('\n');
+if (runDriftCheck() !== 0) checkFailed = 1;
+
+process.stdout.write('\n');
+if (runCheck('check-hooks-symmetry.mjs') !== 0) checkFailed = 1;
+
+process.stdout.write('\n');
+if (runHookImportSetCheck() !== 0) checkFailed = 1;
+
+process.stdout.write('\n');
+if (runCheck('check-guard-requires-parity.mjs') !== 0) checkFailed = 1;
+
+process.stdout.write('\n');
+if (runCheck('check-banner-parity.mjs') !== 0) checkFailed = 1;
+
+process.stdout.write('\n');
+if (runCheck('check-playwright-mcp-canary.mjs') !== 0) checkFailed = 1;
+
+process.stdout.write('\n');
+if (runCheck('check-peekaboo-driver-canary.mjs') !== 0) checkFailed = 1;
+
+process.stdout.write('\n');
+if (runCheck('check-path-utils-canary.mjs') !== 0) checkFailed = 1;
+
+process.stdout.write('\n');
+if (runCheck('check-codex-plugin.mjs') !== 0) checkFailed = 1;
+
+process.stdout.write('\n');
+if (runCheck('check-codex-skills.mjs') !== 0) checkFailed = 1;
+
+process.stdout.write('\n');
+if (runCheck('check-pi-package.mjs') !== 0) checkFailed = 1;
+
+process.stdout.write('\n');
+if (runCheck('check-pi-prompts.mjs') !== 0) checkFailed = 1;
+
+process.stdout.write('\n');
+if (runCheck('check-cursor-adapter.mjs') !== 0) checkFailed = 1;
+
+// BLOCKING: the vendor-neutral portable surface — root AGENTS.md ↔ CLAUDE.md
+// alias, root plugin.json (agent-plugins.org 1.0.0) manifest-version parity
+// against package.json, and the .agents/skills/ mirror against the
+// agentskills.io field list. The generator's own --check runs first (below);
+// this checker is the INDEPENDENT oracle over the same artefacts, so a
+// generator bug cannot vouch for its own output.
+process.stdout.write('\n');
+if (runCheck('check-agents-skills.mjs') !== 0) checkFailed = 1;
+
+process.stdout.write('\n');
+if (runAgentsSurfaceCheck() !== 0) checkFailed = 1;
+
+process.stdout.write('\n');
+if (runCheck('check-session-plan-routing.mjs') !== 0) checkFailed = 1;
+
+process.stdout.write('\n');
+if (runCheck('check-plugin-monitors.mjs') !== 0) checkFailed = 1;
+
+process.stdout.write('\n');
+if (runCheck('check-plugin-schema.mjs') !== 0) checkFailed = 1;
+
+process.stdout.write('\n');
+if (runCheck('check-owner-leakage.mjs') !== 0) checkFailed = 1;
+
+process.stdout.write('\n');
+if (runCheck('check-rules.mjs') !== 0) checkFailed = 1;
+
+process.stdout.write('\n');
+if (runCheck('check-auq-clarity.mjs') !== 0) checkFailed = 1;
+
+process.stdout.write('\n');
+if (runCheck('check-unicode-safety.mjs') !== 0) checkFailed = 1;
+
+process.stdout.write('\n');
+if (runCheck('check-dead-bridge.mjs') !== 0) checkFailed = 1;
+
+// BLOCKING (#1371): a hand-written `process.argv[1] === import.meta.url` entry
+// guard is false under any symlinked invocation, so main() never runs and the
+// process still exits 0 — the caller reads silence as success. This can block
+// honestly because the backlog was drained to zero in the same change: the check
+// is not red on arrival for work nobody intends to do (contrast the WARN-only
+// censuses below, each of which had a standing backlog when it landed).
+process.stdout.write('\n');
+if (runCheck('check-entry-guard.mjs') !== 0) checkFailed = 1;
+
+// BLOCKING (#1422), the complement of the check above: `check-entry-guard`
+// judges the FORM of a guard that already exists, so a registered hook with NO
+// guard at all passes it trivially — the #1393 regression class exactly. This
+// one asks the other half of the question over the union of the four platform
+// manifests: does every registered hook run its entry only under
+// `isMainModule(import.meta.url)` / `invokedAsScript()`, and does no profile
+// gate sit at module top level where its `process.exit(0)` kills a mere
+// importer. Blocking honestly: 27/27 registered hooks were guarded at the
+// moment it landed, because #1393 drained the backlog first.
+process.stdout.write('\n');
+if (runCheck('check-hook-entry-guards.mjs') !== 0) checkFailed = 1;
+
+// FAIL-capable, unlike the WARN-only censuses below: R2+R4 were measured at
+// 1 hit / 1 TP / 0 FP each against the full test corpus, so this check cannot be
+// red on arrival for anything but a real instance of the class. The alternatives
+// (R1 at 67 FP, R3 at 47 FP) are exactly the shape that gets demoted to WARN and
+// then ignored — see the rule table in the check's header.
+process.stdout.write('\n');
+if (runCheck('check-untracked-test-deps.mjs') !== 0) checkFailed = 1;
+
+// WARN-only (v1): the unwired-config-key census reports but never fails the
+// build — see the rationale in the check's header (a blocking gate on today's
+// inventory would be red from day one and get disabled). Exit code is
+// deliberately ignored; only a tool error (2) would be worth escalating later.
+process.stdout.write('\n');
+runCheck('check-unwired-features.mjs');
+
+// WARN-only (#1017), same rationale as the census above: 11 of 13 provenance
+// pointers in .claude/rules/ dangle at the time this check landed, so a blocking
+// gate would be red on arrival. The exit code is deliberately ignored; a tool
+// error still surfaces because that path prints FAIL: lines, which runCheck
+// tallies into totalFail.
+process.stdout.write('\n');
+runCheck('check-learning-provenance.mjs');
+
+// WARN-only (#971), same rationale as the two censuses above: a `gh`/`glab` call
+// without `--repo`/`-R` resolves its target project from the ambient cwd remote —
+// silently the wrong project in a sibling worktree, an /autopilot child, or a repo
+// whose origin is a fork — and a gate that blocks on a backlog no single pass can
+// drain gets switched off rather than obeyed. What WARN buys is that each newly
+// added bare call site shows up in every validator run while the sweep drains the
+// rest. No headcount is quoted here on purpose: the live number moves with every
+// commit, and only the check's own `--json` summary can state it as of a SHA. The
+// exit code is deliberately ignored; a tool error still surfaces because that path
+// prints FAIL: lines, which runCheck tallies into totalFail.
+process.stdout.write('\n');
+runCheck('check-vcs-repo-flag.mjs');
+
+// Separate advice contract (#1024): name the PR or drop a rejected repo flag.
+// WARN-only, with tool errors surfaced through FAIL lines as in the bare census.
+process.stdout.write('\n');
+runCheck('check-vcs-repo-flag-positional.mjs');
+
+// WARN-only (#1023): a `gh`/`glab` command cited in docs that no released CLI
+// ever had — `glab repo edit --visibility`, `glab group list` — costs an
+// operator a failed command and a re-derivation. The oracle is the CLI's own
+// `--help` COMMANDS section, never an exit code (`glab repo <anything> --help`
+// exits 0). WARN rather than FAIL because that oracle is the LOCALLY installed
+// binary: a version skew must not red an unrelated commit, and a missing binary
+// SKIPs. The exit code is deliberately ignored; a tool error still surfaces
+// because that path prints FAIL: lines, which runCheck tallies into totalFail.
+process.stdout.write('\n');
+runCheck('check-doc-cli-commands.mjs');
+
+// BLOCKING (#1176): a `scripts/**.mjs` path cited in skills/, commands/ or
+// agents/ prose that does not exist. Unlike the WARN-only check above, the
+// oracle is this repository's own filesystem — no version skew of a foreign
+// binary can red an unrelated commit, so a finding is always a real defect.
+// A deliberately absent path is annotated in place:
+// `<!-- path-check: planned #<iid> | historical | example -->`, honoured on the
+// citation's own line or the line immediately above.
+process.stdout.write('\n');
+if (runCheck('check-skill-script-paths.mjs') !== 0) checkFailed = 1;
+runStrictShAdvisory();
+
+// BLOCKING (#1157 follow-up): a relative markdown link under skills/, commands/,
+// agents/ or .claude/rules/ that does not resolve from the LINKING file's own
+// directory. The check above judges cited SCRIPT paths; this one judges links
+// between the instruction files themselves — the defect class a `references/`
+// split creates, where the moved text is byte-identical and every `./sibling.md`
+// in it now points one directory too deep. Three such links shipped broken on
+// 2026-09-06 and no gate saw them; the worst silently detached the six
+// session-end tail phases from their dispatcher.
+if (runCheck('check-skill-links.mjs') !== 0) checkFailed = 1;
+
+// BLOCKING (#1446 / GH#69): instruction prose that tells an agent to write
+// `learnings.jsonl` with a shell `>` / `>>`. The store is gitignored, so a bad
+// write has no VCS restore; the sanctioned writers (`apply-session-learnings.mjs`,
+// `sweep-expired-learnings.mjs --prune`) validate, snapshot `.bak` and archive.
+process.stdout.write('\n');
+if (runCheck('check-learnings-shell-writes.mjs') !== 0) checkFailed = 1;
+
+// BLOCKING (#1870): a fenced skill snippet that imports `node:child_process`.
+// The model runs these snippets in the USER's repo, where Windows Node starts a
+// bare `git` from the cwd; snippets use `scripts/lib/native-command.mjs`. The
+// ESLint ban from #1864 covers `.mjs` only. Backlog was 0 when it landed.
+process.stdout.write('\n');
+if (runCheck('check-skill-child-process.mjs') !== 0) checkFailed = 1;
+
+// BLOCKING (#1865 AC 3): a NEW direct rename call under scripts/ or hooks/
+// outside the atomic writers in `scripts/lib/io.mjs` / `hooks/_lib/atomic-json.mjs`.
+// Per-file allowlist ratchet of the sites left after wave 1; it only shrinks.
+// A deliberate non-write rename carries `// direct-rename:ok <reason>`.
+process.stdout.write('\n');
+if (runCheck('check-direct-rename.mjs') !== 0) checkFailed = 1;
+
+// WARN-only: a state-mutating `git` call in tests/ that names no target resolves
+// its destination from the ambient cwd (or an inherited GIT_DIR) — the 2026-08-19
+// incident, where fixture commits, a fixture remote and a fixture identity landed
+// in the REAL .git and two commits reached both remotes with the wrong author.
+// WARN rather than FAIL is a MEASURED posture, not caution: the v1 rule reported
+// 11 findings against tests/ and all 11 were false positives (`git init <dir>`,
+// whose positional IS the target). After that refinement the live corpus reports
+// 0 findings — i.e. zero measured true positives to weigh against a textual
+// detector's residual false-positive surface (the variable argv arrays it cannot
+// judge; the live count is in its own PASS line, never restated here).
+// check-untracked-test-deps.mjs above earned FAIL-capability on a
+// measured 1 TP / 0 FP; this check has not, and a single FAIL: line here reds the
+// whole validator. Ratchet to FAIL once a live true positive has been observed
+// and the GIT_DIR-inheritance gap (reported as `gitDirInheritable`) is closed
+// centrally. The exit code is deliberately ignored; a tool error still surfaces
+// because that path prints FAIL: lines, which runCheck tallies into totalFail.
+process.stdout.write('\n');
+runCheck('check-test-git-config-target.mjs');
+
+// BLOCKING (#1613): a test that spawns `sh`/`bash` by bare name is red on native
+// Windows (no sh on PATH, bash is WSL) — 301 red tests at fd8d3673. It may block
+// because the backlog was drained in the same change: the live census leaves only
+// three files in open MRs, baselined inside the checker as WARN.
+process.stdout.write('\n');
+if (runCheck('check-test-posix-shell.mjs') !== 0) checkFailed = 1;
+
+// BLOCKING (#1183): every `emitEvent()` call site under hooks/**/*.mjs must be
+// try/catch-guarded (emitEvent() throws EventValidationError on a malformed
+// record — an unguarded call aborts the hook process). Five pre-existing
+// unguarded sites are baselined inside the checker itself and report WARN,
+// never FAIL, so this can be blocking-by-default without going red on
+// arrival; only a NEW unguarded site fails the build.
+process.stdout.write('\n');
+if (runCheck('check-hooks-emit-event-guard.mjs') !== 0) checkFailed = 1;
+
+process.stdout.write('\n'); if (runCheck('check-workflow-continue-on-error.mjs') !== 0) checkFailed = 1;
+
+// BLOCKING (#1722): a module under scripts/ or hooks/ that builds a
+// `.orchestrator/metrics` path must route it through resolveLedgerPath()
+// (events/sessions: resolveEventsLedgerRoot()). The ledgers are gitignored, so
+// from a linked worktree an unrouted writer leaves a copy that is lost with the
+// worktree. Deliberately local sites sit on the checker's own ALLOWLIST.
+process.stdout.write('\n');
+if (runCheck('check-metrics-ledger-root.mjs') !== 0) checkFailed = 1;
+
+// BLOCKING (#1184): every scripts/lib/validate/check-*.mjs must be referenced
+// by basename from this file, .husky/pre-commit, or .gitlab-ci.yml — or carry
+// a `// registration: standalone <reason>` header marker declaring itself
+// deliberately CLI-only. A checker nobody runs is built work with no effect.
+process.stdout.write('\n');
+if (runCheck('check-validator-registration.mjs') !== 0) checkFailed = 1;
+
+// ---------------------------------------------------------------------------
+// Summary
+// ---------------------------------------------------------------------------
+
+process.stdout.write('\n');
+process.stdout.write('===========================================\n');
+process.stdout.write(`  Results: ${totalPass} passed, ${totalFail} failed\n`);
+process.stdout.write('===========================================\n');
+
+if (checkFailed > 0 || totalFail > 0) {
+  process.exit(1);
+}
+process.exit(0);

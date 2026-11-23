@@ -1,0 +1,1186 @@
+#!/usr/bin/env node
+/**
+ * enforce-scope.mjs — PreToolUse hook: block Edit/Write/MultiEdit outside allowed wave paths.
+ *
+ * Replaces enforce-scope.sh (87-line Bash). Part of v3.0.0 Windows-native migration.
+ * Issue: github.com/Kanevry/session-orchestrator/issues/137
+ *
+ * Decision flow (8 gates + one pre-gate, early-exit):
+ *   G1  tool filter — only Edit/Write/MultiEdit are gated
+ *   G2  file_path present + string
+ *   G3  wave-scope.json exists
+ *   G3b (#1123, #1194) the manifest belongs to THIS session — a manifest that
+ *       PROVABLY names another live session in this shared working copy is not
+ *       ours to enforce; allow + emit one event. Runs AFTER the parse so a
+ *       corrupt manifest still fails closed. Identity is PROCESS-LOCAL only
+ *       (hook payload + CLAUDE_CODE_SESSION_ID), never the repo-global
+ *       `session.lock` — see the gate's own block for why.
+ *   G4  path-guard gate enabled
+ *   G5  enforcement != "off"
+ *   G5b (#792) allowlist-first: an EXPLICIT absolute allowedPaths entry that
+ *       matches the fully realpath-resolved candidate → allow, BEFORE G6.
+ *       Runs before G6 so a deliberate out-of-repo grant (e.g. a vault path)
+ *       is reachable at all — G6 would otherwise deny every out-of-repo path
+ *       without ever consulting allowedPaths. See matchedAbsoluteGrant.
+ *       (#1398 cond. 4) The matched grant is GRADED through the shared
+ *       `gradeScopeEntry` predicate; an `error` verdict emits ONE WARN and the
+ *       write is still ALLOWED — this gate never denies on a grading verdict.
+ *   G5c (#1295) out-of-root carveout for THIS repo's Claude Code auto-memory
+ *       directory (`~/.claude/projects/<encoded-repo-path>/memory/`). Harness-
+ *       owned, lives outside the working copy, cannot collide with any wave
+ *       scope. Evaluated inside G6's out-of-root branch only; a SIBLING repo's
+ *       memory dir and every other out-of-repo path stay denied.
+ *   G5d (#1881) out-of-root carveout for the temp directory (`/tmp` and
+ *       `os.tmpdir()`, realpath-resolved), unless the project itself lives in
+ *       that temp root. Scratch files there cannot collide with any wave
+ *       scope; they were 71 of 792 denials in 7 days. See isTempScratch.
+ *   G6  resolved path inside project root
+ *   G7  relative path matches an allowedPaths pattern
+ *   G8  (all passed) → allow
+ *
+ * Empty-allowedPaths reasoning (#1057): the VERDICT for an empty allowlist is
+ * unchanged (deny-all, the #256 contract), but the deny REASON is now classified
+ * — Discovery's read-only contract, an unreadable manifest, a crashed session's
+ * leftover, an incomplete `--union`, or undecidable. See
+ * `scripts/lib/scope-gate.mjs` § Empty-`allowedPaths` classification.
+ *
+ * Exit codes:  0 = allow   2 = deny
+ *
+ * SECURITY notes (inline refs):
+ *   REQ-01  top-level try/catch → emitDeny on unexpected error (fail-closed)
+ *   REQ-03  realpath(dirname) to resolve symlinks; ENOENT → fall back to path.resolve
+ *   REQ-04  relativeFromRoot() === null → deny as outside-root
+ *   REQ-05  normalize path separators to "/" before pathMatchesPattern (Windows compat)
+ *   REQ-06  relative file_path resolved against projectRoot, not process.cwd()
+ *   REQ-08  wave-scope.json read once; parsed object passed to all gate checks
+ *   REQ-09  (#792) G5b out-of-repo carveout is structurally safe: RELATIVE
+ *           allowedPaths entries can NEVER match an out-of-repo path (the
+ *           isAbsolute filter drops them), so `**` / `../**` cannot be used to
+ *           escape the repo; only entries that are themselves absolute match,
+ *           and only against their own literal (canonical/realpath) subtree.
+ *           Empty absolute set → the pre-gate is inert (byte-identical to the
+ *           pre-#792 behaviour).
+ *
+ * Coordinator carveout (#245): a short, explicit list of harness-owned files
+ * bypasses Gate 7 (allowedPaths glob) — specifically STATE.md across all platform
+ * state dirs and the wave-scope.json manifest itself. Coordinators write these
+ * between waves as part of the harness protocol; subjecting them to per-wave
+ * allowedPaths would force every wave plan to re-list harness infrastructure.
+ * Project-root containment (Gate 6) and enforcement-off (Gate 5) still apply.
+ * No wildcards — exact string match only.
+ */
+
+import os from 'node:os';
+import path from 'node:path';
+import { promises as fs } from 'node:fs';
+import { pathToFileURL } from 'node:url';
+
+import { shouldRunHook } from './_lib/profile-gate.mjs';
+// Static for the SAME reason profile-gate.mjs is (#993, see the late-binding
+// block below): a leaf predicate with ZERO repo imports (node:fs + node:url
+// only) that decides whether this hook runs at all. Everything carrying a
+// transitive repo graph stays late-bound inside bootstrap().
+import { isMainModule } from '../scripts/lib/is-main-module.mjs';
+
+// ---------------------------------------------------------------------------
+// #993 — late-bound repo dependencies
+//
+// These used to be STATIC imports. A SyntaxError in any of them failed at ESM
+// LINK time, before the first statement here ran: node exited 1 with 0 bytes on
+// stdout, and the `main().catch(...)` handler at the bottom of this file was
+// structurally unreachable. Under the exit-0 PreToolUse protocol (#906) that
+// crash is, on the only decision-bearing channel, INDISTINGUISHABLE from an
+// explicit `emitAllow()` — the guard failed open and SILENTLY. This is the
+// sibling defect #992 fixed for pre-bash-destructive-guard; #993 generalises the
+// same repair here.
+//
+// Binding them late (dynamic `import()` inside `bootstrap()`, below) turns that
+// link-time crash into a catchable runtime error, which is what makes the
+// GUARD INACTIVE banner in `_lib/guard-source-loader.mjs` reachable at all.
+//
+// BANNER-ONLY (#993 D1): this hook consumes ZERO command-blocker symbols, so no
+// module here opts into the `git show HEAD:` fallback — every load failure
+// degrades straight to GUARD INACTIVE, never DEGRADED.
+//
+// `profile-gate.mjs` and `node:*` builtins stay static — they cannot be the
+// broken repo module.
+// ---------------------------------------------------------------------------
+/** @type {typeof import('../scripts/lib/io.mjs').readStdin} */ let readStdin;
+/** @type {typeof import('../scripts/lib/io.mjs').emitAllow} */ let emitAllow;
+/** @type {typeof import('../scripts/lib/io.mjs').emitDeny} */ let emitDeny;
+/** @type {typeof import('../scripts/lib/io.mjs').emitWarn} */ let emitWarn;
+let isPathInside;
+let relativeFromRoot;
+let resolveProjectDir;
+// The launch dir the harness states — platform.mjs's one definition of the env
+// chain, so the relocation trace below cannot drift from the clamp (#1504).
+let launchDirFromEnv;
+// #1977 — maps a linked worktree to the checkout whose auto-memory the harness loads.
+let verifiedMainCheckout;
+// #1504 point 6 — the manifest that governs THIS session; bound from scope-gate below.
+let findOwnScopeFile;
+let resolveScopeContext;
+let pathMatchesPattern;
+let suggestForScopeViolation;
+let readJson;
+// #1057 — empty-`allowedPaths` classification + the session clock it needs.
+let classifyEmptyScope;
+let suggestForEmptyScope;
+let sessionStartedAtMs;
+// #1398 cond. 4 — THE shared grading predicate for an absolute Gate 5b grant,
+// plus the resolver it takes. The hook WARNS on an `error` verdict and never
+// denies on it; see Gate 5b. Both come from the module already bound below —
+// no new module edge, so `hooks/_lib/hook-import-set.json` is unchanged.
+let gradeScopeEntry;
+let canonicalizeGrantPrefix;
+// #2066 — the absolute-grant spelling shared with hooks/post-bash-write-verify.mjs.
+let absoluteGrantPattern;
+// #1123 — "is this manifest even mine?" (G3b). Process-local identity only
+// (#1194): the repo-global `session.lock` tier is shared by every session in the
+// checkout and would classify a peer's manifest as ours.
+let readProcessLocalSessionIds;
+let classifyManifestSession;
+// #1636 point 1 — the root holding THIS session's own lock (its `session_root`
+// after ExitWorktree), where the #1057 session clock must be read (#1634 shape).
+let resolveOwnLockRoot;
+
+const PLUGIN_ROOT = path.resolve(import.meta.dirname, '..');
+
+/** This hook's name — threaded into the guard banner (#993: no hard-wired literal). */
+const HOOK_NAME = 'enforce-scope';
+
+/**
+ * The consequence block spliced VERBATIM into the GUARD INACTIVE banner (#993),
+ * naming the enforcement this hook's outage stops applying. No `degraded` block:
+ * this hook has no headFallback module, so it can never DEGRADE — only go INACTIVE.
+ */
+const GUARD_CONSEQUENCE = {
+  inactive: [
+    '    Consequence: Edit/Write/MultiEdit scope enforcement is OFF — writes',
+    '    outside the wave allowedPaths (and outside the project root) are NOT',
+    '    being blocked. This is a BROKEN GUARD, not a policy decision — do not',
+    '    route around it, repair it.',
+  ],
+};
+
+/**
+ * Project dir for banner keying, resolved WITHOUT `platform.mjs` — that module
+ * is one of the ones that may have failed to load.
+ *
+ * @returns {string}
+ */
+function bannerProjectDir() {
+  return process.env.CLAUDE_PROJECT_DIR || process.cwd();
+}
+
+/**
+ * Bind every repo dependency late, making a load failure VISIBLE (GUARD INACTIVE
+ * banner) instead of a silent exit-1 / 0-byte disarm. Throws on any load failure;
+ * the entry-point catch banners. No entry opts into headFallback — this hook is
+ * banner-only (#993 D1).
+ *
+ * @returns {Promise<void>}
+ */
+async function bootstrap() {
+  const lib = (...seg) => pathToFileURL(path.join(PLUGIN_ROOT, 'scripts', 'lib', ...seg)).href;
+
+  const { armGuard } = await import('./_lib/guard-source-loader.mjs');
+  const { modules } = await armGuard(
+    {
+      io: { specifier: lib('io.mjs') },
+      pathUtils: { specifier: lib('path-utils.mjs') },
+      platform: { specifier: lib('platform.mjs') },
+      hardening: { specifier: lib('hardening.mjs') },
+      common: { specifier: lib('common.mjs') },
+      // #1057. Bound DIRECTLY rather than through the `hardening.mjs` barrel:
+      // that barrel re-exports an explicit, frozen symbol list shared by six
+      // hooks, and widening it for one hook's need would drag three symbols
+      // into five unrelated import surfaces. `hardening` already imports
+      // `scope-gate` transitively, so this adds no new failure mode — a broken
+      // scope-gate already banners GUARD INACTIVE through that edge.
+      scopeGate: { specifier: lib('scope-gate.mjs') },
+      // #1123. Bound through the same loader as every other repo dependency, so
+      // a SyntaxError in the identity module banners GUARD INACTIVE instead of
+      // link-crashing the hook into a silent fail-open (#993).
+      sessionIdentity: { specifier: lib('session-identity/own-session.mjs') },
+      // #1636 point 1. Same loader, same banner-on-failure contract.
+      hookRoot: { specifier: pathToFileURL(path.join(PLUGIN_ROOT, 'hooks', '_lib', 'hook-root.mjs')).href },
+    },
+    {
+      hookName: HOOK_NAME,
+      repoRoot: PLUGIN_ROOT,
+      projectDir: bannerProjectDir(),
+      consequence: GUARD_CONSEQUENCE,
+    }
+  );
+
+  ({ readStdin, emitAllow, emitDeny, emitWarn } = modules.io);
+  ({ isPathInside, relativeFromRoot } = modules.pathUtils);
+  ({ resolveProjectDir, launchDirFromEnv, verifiedMainCheckout } = modules.platform);
+  ({ pathMatchesPattern, suggestForScopeViolation } = modules.hardening);
+  ({ readJson } = modules.common);
+  ({
+    classifyEmptyScope,
+    suggestForEmptyScope,
+    sessionStartedAtMs,
+    gradeScopeEntry,
+    canonicalizeGrantPrefix,
+    absoluteGrantPattern,
+    findOwnScopeFile,
+    resolveScopeContext,
+  } = modules.scopeGate);
+  ({ readProcessLocalSessionIds, classifyManifestSession } = modules.sessionIdentity);
+  ({ resolveOwnLockRoot } = modules.hookRoot);
+}
+
+async function main() {
+  // SECURITY-REQ-01: null-guard empty stdin — treat as allow (no input = not a real hook call)
+  const input = await readStdin();
+  if (!input) return emitAllow();
+
+  const toolName = input.tool_name;
+  const filePath = input?.tool_input?.file_path;
+
+  // Gate 1: only Edit, Write, and MultiEdit are path-gated
+  if (toolName !== 'Edit' && toolName !== 'Write' && toolName !== 'MultiEdit') return emitAllow();
+
+  // Gate 2: file_path must be a non-empty string
+  if (!filePath || typeof filePath !== 'string') return emitAllow();
+
+  // Control state follows the session coordinator; relative grants follow
+  // the actual isolated agent checkout. Entered coordinator worktrees are
+  // discovered only through bounded reciprocal Git metadata and own identity.
+  const ownIds = new Set(readProcessLocalSessionIds({ hookInput: input }));
+  const context = resolveScopeContext({ cwd: input.cwd, ownIds, classify: classifyManifestSession });
+  if (context.error) return emitDeny('Scope coordinator cannot be resolved', context.error);
+  const projectRootRaw = context.writeRoot;
+  let projectRoot;
+  try { projectRoot = await fs.realpath(projectRootRaw); }
+  catch { projectRoot = projectRootRaw; }
+  const manifestRoot = context.manifestRoot;
+  const located = context;
+  const scopePath = located.path ?? located.foreignPath;
+  if (!scopePath) {
+    await recordHiddenManifestOncePerWave({ projectRootRaw, projectRoot, ownIds, filePath });
+    return emitAllow();
+  }
+
+  // SECURITY-REQ-08: read scope file once; pass parsed object to all subsequent checks
+  //
+  // #1057: `parseOk` records WHETHER that read produced a usable scope RECORD.
+  // Both fold-to-`{}` / fold-to-`[]` paths (corrupt JSON #794 GAP-5, malformed
+  // shapes #558) already deny and CONTINUE to deny — the flag exists so the deny
+  // REASON can say "the manifest is broken" instead of "update the session plan
+  // and restart the wave", which is the one instruction that cannot help here.
+  let scope;
+  let parseOk = true;
+  try {
+    scope = await readJson(scopePath);
+    if (scope === null || typeof scope !== 'object' || Array.isArray(scope)) {
+      parseOk = false;
+      scope = {};
+    }
+  } catch {
+    parseOk = false;
+    scope = {};
+  }
+
+  // -------------------------------------------------------------------------
+  // Gate 3b (#1123) — is this manifest even MINE?
+  //
+  // `wave-scope.json` lives in the WORKING COPY, not in the session. Two live
+  // sessions sharing one checkout read the same file, so session A's manifest
+  // enforced session B's writes: measured 2026-08-22 (#1082), where a Discovery
+  // wave's `allowedPaths: []` — which `wave-loop.md` prescribes for EVERY
+  // Discovery wave — denied every write of an unrelated parallel session, with
+  // a deny reason that could only tell it to fix a wave plan it does not own.
+  //
+  // Deliberately runs AFTER the parse block: a corrupt manifest yields `{}`,
+  // hence no ids, hence `'unknown'` — and keeps failing closed. A gate that
+  // peeked at the raw bytes instead would let a truncated manifest disarm the
+  // guard.
+  //
+  // `'own'` and `'unknown'` fall through completely unchanged. A legacy manifest
+  // without a `session` field is `'unknown'` and stays enforced: only what is
+  // PROVABLY foreign is treated as foreign.
+  //
+  // IDENTITY TIER (#1194): `readProcessLocalSessionIds` — the hook payload and
+  // `CLAUDE_CODE_SESSION_ID` — and deliberately NOT `readOwnSessionIds`, whose
+  // third tier is the repo-global `session.lock`. That lock is ONE file shared
+  // by every session in the checkout, so unioning it made a peer's manifest
+  // match a peer-written lock id and classify as `'own'`: Gate 7 then denied the
+  // second session's legitimate writes — the exact lockout G3b exists to end.
+  // A better signal REPLACES a worse one (`host-resources.md` § HR-102).
+  //
+  // The trade this buys, accepted rather than hidden: a session that wrote a
+  // PEER's id into its OWN manifest (it lost the `bootstrapLock()` race and took
+  // the id from the lock without the process-local check) reads
+  // `'foreign'` and its own guard stands down. The defense is on the WRITER side — the
+  // manifest writer must omit the `session` keys when the lock does not name it
+  // (`skills/wave-executor/wave-loop.md` § Scope Manifest, "Verify the binding
+  // names YOU before you write it") — not on this reader.
+  //
+  // CEILING (BV-004): on a harness that exports no session env var and puts no
+  // `session_id` in the hook payload, both tiers are empty, so G3b is
+  // permanently `'unknown'` = enforce = pre-#1123 behaviour there. Codex CLI
+  // does send `session_id` (measured 2026-10-20, codex-cli 0.160.1, #1691). The
+  // Cursor and Pi bridges (`normalizeCursorHookPayload` / `normalizePiHookPayload`)
+  // forward `session_id` only when the host event or ctx carries one; whether
+  // Cursor/Pi supply it is unmeasured, and without it G3b stays `'unknown'` there.
+  //
+  // ACCEPTED RESIDUAL, named rather than hidden: `session` is a plain field in a
+  // file any process in this working copy can write, so writing a foreign id
+  // into it switches this guard off for that manifest. That is the SAME power
+  // `enforcement: "off"` already grants in the same file — this gate adds no new
+  // authority, and the manifest is the coordinator's own artefact either way.
+  {
+    // `ownIds` is the process-local set built above Gate 3.
+    const { verdict, manifestIds } = classifyManifestSession(scope, ownIds);
+    if (verdict === 'foreign') {
+      // Observability only, and deliberately NOT emitWarn: this branch is hit on
+      // every single Edit of the non-owning session, so a stderr line per write
+      // would be noise the operator learns to ignore. One event per decision
+      // point, awaited before emitAllow() — emitAllow() calls process.exit(),
+      // which would discard a pending append.
+      try {
+        const { emitEvent } = await import('../scripts/lib/events.mjs');
+        await emitEvent(
+          'orchestrator.scope.foreign_session_ignored',
+          {
+            hook: HOOK_NAME,
+            manifest: scopePath,
+            manifest_session: manifestIds,
+            own_session: [...ownIds],
+            wave: scope.wave,
+            file_path: filePath,
+          },
+          { repoRoot: manifestRoot },
+        );
+      } catch { /* observability is best-effort — never blocks the decision */ }
+      return emitAllow();
+    }
+  }
+
+  const enforcement = scope.enforcement ?? 'strict';
+  const allowedPaths = Array.isArray(scope.allowedPaths) ? scope.allowedPaths : [];
+  // A PRESENT-but-non-array `allowedPaths` (#558: null / string / object) is a
+  // MALFORMED record, not an empty grant — same class as unparseable JSON, so it
+  // earns the same reason. Absent is different and stays `parseOk`.
+  if (scope.allowedPaths !== undefined && !Array.isArray(scope.allowedPaths)) parseOk = false;
+  const gatesEnabled = scope.gates?.['path-guard'] !== false;
+
+  // Gate 4: path-guard gate explicitly disabled
+  if (!gatesEnabled) return emitAllow();
+
+  // Gate 5: enforcement is turned off
+  if (enforcement === 'off') return emitAllow();
+
+  // -------------------------------------------------------------------------
+  // #1057 — WHY is the allowlist empty?
+  //
+  // FIVE repo states produce `allowedPaths.length === 0` and the DENY IS RIGHT
+  // IN ALL FIVE; only the instruction differs (Discovery's read-only contract,
+  // a corrupt manifest, a crashed session's leftover, an incomplete `--union`,
+  // or genuinely undecidable). This block is therefore VERDICT-NEUTRAL: it
+  // selects a sentence, never a decision — `suggest()` below is the only
+  // consumer, and its `'unknown'` branch is byte-identical to the pre-#1057 text.
+  //
+  // Computed AFTER the early-exit gates (a disabled or `off` wave pays no
+  // fs.stat) and BEFORE the first deny site, so all three deny sites share one
+  // explanation instead of drifting apart.
+  // -------------------------------------------------------------------------
+  const emptyScopeReason =
+    allowedPaths.length === 0
+      ? classifyEmptyScope({
+          role: scope.role,
+          parseOk,
+          scopeMtimeMs: await mtimeMsOf(scopePath),
+          // #1636: beside THIS session's own lock, not at the manifest root —
+          // identity is the process-local id set (G3b), never session.lock.
+          sessionStartMs: sessionStartedAtMs(
+            resolveOwnLockRoot({ session_id: [...ownIds][0] ?? null, cwd: input.cwd }, manifestRoot),
+          ),
+        })
+      : null;
+  const scopeRelRaw = relativeFromRoot(manifestRoot, scopePath);
+  const scopeHint = (scopeRelRaw ?? scopePath).split(path.sep).join('/');
+
+  /**
+   * The suggestion half of every deny below.
+   *
+   * With a NON-empty allowlist this is byte-identical to the pre-#1057 call.
+   * With an empty one it routes through the classifier — whose `'unknown'`
+   * branch delegates back to `suggestForScopeViolation(target, '')`, i.e. the
+   * same sentence as before. Strictly an addition.
+   *
+   * @param {string} target
+   * @returns {string}
+   */
+  const suggest = (target) =>
+    emptyScopeReason === null
+      ? suggestForScopeViolation(target, allowedPaths.join(', '))
+      : suggestForEmptyScope(target, emptyScopeReason, { role: scope.role, scopePath: scopeHint });
+
+  // SECURITY-REQ-06: resolve relative file_path against projectRoot, not process.cwd()
+  const absPathInput = path.isAbsolute(filePath)
+    ? filePath
+    : path.resolve(projectRoot, filePath);
+
+  // SECURITY-REQ-03: resolve symlinks to prevent symlink-escape.
+  // Strategy:
+  //   1. Try fs.realpath on the file itself — follows symlinks (blocks `src/evil → /etc/passwd`).
+  //   2. On ENOENT (file doesn't exist yet — common for Write), walk up to the
+  //      nearest existing ancestor, realpath it, then re-attach the non-existent
+  //      suffix. Keeps projectRoot and resolvedPath in the same canonical namespace
+  //      (e.g. both under /private/tmp on macOS).
+  //   3. Any non-ENOENT fs error → fail-closed.
+  let resolvedPath;
+  try {
+    resolvedPath = await fs.realpath(absPathInput);
+  } catch (err) {
+    if (err?.code !== 'ENOENT') {
+      return emitDeny(
+        'Scope check failed — unable to resolve file path',
+        `Internal: ${err?.code ?? 'unknown'}`,
+      );
+    }
+    // File doesn't exist yet — walk up to nearest existing ancestor.
+    try {
+      const segments = [path.basename(absPathInput)];
+      let ancestor = path.dirname(absPathInput);
+      while (true) {
+        try {
+          const realAncestor = await fs.realpath(ancestor);
+          segments.reverse();
+          resolvedPath = path.join(realAncestor, ...segments);
+          break;
+        } catch (e) {
+          if (e?.code !== 'ENOENT') throw e;
+          const parent = path.dirname(ancestor);
+          if (parent === ancestor) {
+            // Hit filesystem root (should not occur for paths under projectRoot).
+            resolvedPath = absPathInput;
+            break;
+          }
+          segments.push(path.basename(ancestor));
+          ancestor = parent;
+        }
+      }
+    } catch (e) {
+      return emitDeny(
+        'Scope check failed — unable to resolve file path',
+        `Internal: ${e?.code ?? 'unknown'}`,
+      );
+    }
+  }
+
+  // Gate 5b (#792): allowlist-first for explicit absolute (out-of-repo) grants.
+  // An EXPLICIT absolute allowedPaths entry (e.g. a coordinator-granted vault
+  // path) is structurally unreachable under Gate 6, which denies every
+  // out-of-repo path before allowedPaths is ever consulted. Honour such grants
+  // here — matching ONLY absolute entries against the fully realpath-resolved
+  // candidate, so relative entries can never be used to escape the repo (REQ-09).
+  //
+  // GRADING (#1398 acceptance condition 4): this gate ALLOWS exactly what it
+  // allowed before — the verdict below is a WARN, never a deny. Until now the
+  // asymmetry was silent: `scripts/validate-wave-scope.mjs` graded these grants
+  // (system-root denylist, home depth + sensitive-subdirectory rule) and NOTHING
+  // called it from code — four prose steps in `skills/wave-executor/` were the
+  // only thing between a manifest and this gate, so a manifest that skipped them
+  // reached here ungraded and the operator never learned that it had.
+  //
+  // Now the same predicate runs HERE, on the grant that actually matched, and an
+  // `error` verdict surfaces as one operator-visible notice. Deliberately not a
+  // deny: this hook runs in every repo on the host, the grant is the
+  // coordinator's own artefact, and turning a live allow into a block on a
+  // pre-flight rule would break working sessions to enforce a policy whose place
+  // is before dispatch. `emitWarn` is an ALLOW that carries a notice (exit 0,
+  // `systemMessage` only) — see `scripts/lib/io.mjs`.
+  //
+  // THE SAME `resolve` THE VALIDATOR PASSES (#1398 cond. 4, closed 2026-09-21).
+  // It was omitted here on the assumption that canonicalisation is too expensive
+  // for a PreToolUse hot path; measuring it refuted that, and the omission was
+  // the last source of a verdict divergence between the two callers of one
+  // predicate (`/tmp/x/**`: `warn` here, `error/non-canonical` there — silent on
+  // exactly the grant that matches nothing at this gate).
+  //
+  // MEASURED 2026-09-21, A/B in one process, 200 repetitions, median:
+  //   - this call site grades ONE grant per Gate 5b hit, never the manifest:
+  //     +0.067 ms, 15 `realpathSync` — 75× under the 5 ms decision threshold;
+  //   - a Gate 5b hit requires an out-of-repo write AND an absolute grant that
+  //     matches it. The live 64-entry manifest of that session carried 0
+  //     absolute entries and therefore cost 0 syscalls: an ordinary in-repo
+  //     write never reaches this line at all.
+  // `canonicalizeGrantPrefix` memoizes per process and never throws (see its
+  // docblock); `gradeScopeEntry` additionally degrades a throwing resolver to
+  // the literal spelling, so the worst case is today's verdict.
+  const matchedGrant = matchedAbsoluteGrant(resolvedPath, allowedPaths);
+  if (matchedGrant !== null) {
+    const grade = gradeScopeEntry(matchedGrant, { resolve: canonicalizeGrantPrefix });
+    if (grade?.verdict === 'error') {
+      await recordRefusedGrantOncePerWave({ scope, scopePath, projectRoot: manifestRoot, input, grant: matchedGrant, grade, filePath: resolvedPath });
+      return emitWarn(
+        `Gate 5b honoured an out-of-repo grant that scripts/validate-wave-scope.mjs would REFUSE ` +
+          `before dispatch — allowedPaths ${grade.message}. The write to '${resolvedPath}' is ` +
+          `ALLOWED (this gate never denies on a grading verdict); re-validate the manifest.`,
+      );
+    }
+    return emitAllow();
+  }
+
+  // Gate 6: path must be inside the project root
+  if (!isPathInside(resolvedPath, projectRoot)) {
+    // Gate 5d (#1881) — scratch in the temp directory. See isTempScratch.
+    if (await isTempScratch(resolvedPath, projectRoot)) {
+      return emitAllow();
+    }
+
+    // Gate 5c (#1295) — THIS repo's harness auto-memory directory.
+    //
+    // Claude Code writes its own auto-memory (`MEMORY.md` + per-fact files)
+    // OUTSIDE the working copy, at
+    // `~/.claude/projects/<encoded-repo-path>/memory/`. Every wave manifest
+    // therefore blocked the coordinator's memory writes until the manifest was
+    // torn down — six sessions in a consumer repo re-documented the same
+    // workaround (retro 2026-09-09). That directory
+    // is harness-owned and cannot collide with ANY wave file scope, so it is
+    // always-allowed territory; it is the single out-of-repo carveout here.
+    //
+    // NARROWNESS (security boundary — no wider allow than this one directory):
+    //   - Only the memory dir of THIS repo, as the harness names it. That name
+    //     is NOT unique: `encodeProjectDir()` maps every non-alphanumeric
+    //     character (`/`, `.`, `_`, …) to `-`, exactly as Claude Code names the
+    //     folder (measured 2026-11-08, see the encoder), so `/x/a.b`, `/x/a_b`
+    //     and `/x/a-b` share one memory dir — a harness-level collision this
+    //     gate inherits and cannot narrow. Every OTHER sibling repo's memory
+    //     dir stays denied.
+    //   - Containment is exact-prefix on the REALPATH-resolved candidate, so
+    //     `..` segments and symlink tricks cannot widen it.
+    //   - Evaluated only on the out-of-root branch: the in-repo gates (Gate 7,
+    //     Discovery's `allowedPaths: []` deny-all) are untouched.
+    //
+    // Encoder REUSED, never re-written (BV-001 rung 2): `encodeProjectDir()`
+    // from `scripts/lib/wave-transcript-tail.mjs` is the repo's one encoder for
+    // `<encoded-repo-path>`. Bound LAZILY here rather than in `bootstrap()` —
+    // same pattern as the G3b event import above — so the happy path pays no
+    // module load, and an import failure falls through to the deny below
+    // (fail-closed, byte-identical to the pre-#1295 behaviour).
+    //
+    // CEILING (BV-004): `CLAUDE_CONFIG_DIR` is NOT honoured, because nothing in
+    // this codebase honours it today (`rg -n "CLAUDE_CONFIG_DIR" scripts hooks`
+    // → 0 matches, 2026-09-13) and `wave-transcript-tail.mjs` resolves the same
+    // substrate from `homedir()`. Revisit together with that resolver if the
+    // harness config dir ever becomes relocatable here.
+    // CALLER DISCRIMINATION (#1352): the carve-out is the COORDINATOR's, never a
+    // dispatched wave agent's. See {@link classifyCaller} for the measurement.
+    // A subagent falls through to the gates below — under a manifest that does
+    // not grant the path (Discovery's `allowedPaths: []`) that is a DENY.
+    // #1492: the LAUNCH dir too — the harness keys auto-memory on the path it
+    // was launched with, which after `EnterWorktree` is no longer the root.
+    // #1977: a root that is a linked worktree counts as its main checkout, see
+    // {@link ownMemoryDirs}.
+    const memoryDirs = await ownMemoryDirs([resolveProjectDir(), manifestRoot]);
+    const caller = classifyCaller(input);
+    if (!context.isolated && caller !== 'subagent' && memoryDirs.some((dir) => isInsideDir(resolvedPath, dir))) {
+      // One event per decision point, awaited before emitAllow() —
+      // emitAllow() calls process.exit(), which would discard a pending append.
+      try {
+        const { emitEvent } = await import('../scripts/lib/events.mjs');
+        await emitEvent(
+          'orchestrator.scope.memory_dir_allowed',
+          {
+            hook: HOOK_NAME,
+            manifest: scopePath,
+            wave: scope.wave,
+            file_path: resolvedPath,
+            // HR-105: the fail-OPEN case must be COUNTABLE, or the ambiguity is
+            // unfalsifiable — and it takes TWO values to be countable.
+            // `'absent'` = no `agent_id` key at all (the harness's own contract
+            // for a main-thread call); `'malformed'` = an `agent_id` key that is
+            // PRESENT but unusable (number/object/array/blank string), which
+            // would otherwise be indistinguishable from the legitimate case.
+            // `'coordinator'` = `agent_type` without `agent_id`.
+            discriminator: caller,
+          },
+          { repoRoot: manifestRoot },
+        );
+      } catch { /* observability is best-effort — never blocks the decision */ }
+      return emitAllow();
+    }
+
+    const reason = `Scope violation: path outside project root`;
+    const suggestion = suggest(filePath);
+    return enforcement === 'strict'
+      ? emitDeny(reason, suggestion)
+      : emitWarn(`${reason} — ${suggestion}`);
+  }
+
+  // Compute the relative path from project root to the resolved file path
+  const relPath = relativeFromRoot(projectRoot, resolvedPath);
+
+  // SECURITY-REQ-04: null return means outside root — deny rather than pass null to pathMatchesPattern
+  if (relPath === null) {
+    const reason = `Scope violation: '${filePath}' outside project root`;
+    const suggestion = suggest(filePath);
+    return enforcement === 'strict'
+      ? emitDeny(reason, suggestion)
+      : emitWarn(`${reason} — ${suggestion}`);
+  }
+
+  // SECURITY-REQ-05: normalize Windows path separators to '/' before glob matching
+  const normalizedRel = relPath.split(path.sep).join('/');
+
+  // Coordinator carveout (#245): exact-path allowlist for harness-owned files.
+  // STATE.md and wave-scope.json are written by the coordinator between waves;
+  // per-wave allowedPaths lists should not need to enumerate harness infrastructure.
+  //
+  // CALLER DISCRIMINATION (#1361) — the carve-out is the COORDINATOR's, exactly
+  // as Gate 5c's is (#1352), and for a sharper reason: the two files it covers
+  // are the harness's own control surfaces. STATE.md is coordinator-owned by
+  // contract (`skills/_shared/state-ownership.md`), and `wave-scope.json` IS the
+  // manifest every later gate of this wave reads — a subagent permitted to write
+  // it can rewrite its own file scope and disarm the guard for the rest of the
+  // wave. A `'subagent'` therefore falls through to Gate 7, where a manifest that
+  // does not grant the path is a DENY.
+  //
+  // ALLOW-CENSUS (RCR-007, the precondition for forbidding what is allowed
+  // today): 1069 transcripts across 46 sessions of this repo carried 4385
+  // subagent writes; 0 targeted a carve-out path (2026-09-13 @ `5501f700`). The
+  // fix takes nothing away from any observed legitimate writer.
+  //
+  // FAIL-OPEN on ambiguity, same as Gate 5c and for the same reason: the other
+  // three classifications keep the ALLOW, because fail-closed would deny the
+  // coordinator's own `/close` STATE.md writes. The classification is emitted so
+  // that fail-open stays COUNTABLE (HR-105) — before #1361 this branch called
+  // `emitAllow()` (`process.exit(0)`, no log, no event), so whether it ever fired
+  // was unfalsifiable after the fact.
+  const carveoutCaller = classifyCaller(input);
+  if (!context.isolated && carveoutCaller !== 'subagent' && isCoordinatorCarveout(normalizedRel, projectRoot, scopePath)) {
+    // One event per decision point, awaited before emitAllow() — emitAllow()
+    // calls process.exit(), which would discard a pending append.
+    try {
+      const { emitEvent } = await import('../scripts/lib/events.mjs');
+      await emitEvent(
+        'orchestrator.scope.coordinator_carveout_allowed',
+        {
+          hook: HOOK_NAME,
+          manifest: scopePath,
+          wave: scope.wave,
+          // Repo-RELATIVE by choice: the carve-out set is in-repo by
+          // construction, so the relative form carries the whole decision
+          // without putting a host-local absolute path into the ledger.
+          file_path: normalizedRel,
+          discriminator: carveoutCaller,
+        },
+        { repoRoot: manifestRoot },
+      );
+    } catch { /* observability is best-effort — never blocks the decision */ }
+    return emitAllow();
+  }
+
+  // Gate 7: check normalised relative path against each allowedPaths pattern
+  const matched = allowedPaths.some((pattern) => pathMatchesPattern(normalizedRel, pattern));
+
+  if (!matched) {
+    const reason = `Scope violation: '${normalizedRel}' not in allowed paths [${allowedPaths.join(', ')}]`;
+    const suggestion = suggest(normalizedRel);
+    return enforcement === 'strict'
+      ? emitDeny(reason, suggestion)
+      : emitWarn(`${reason} — ${suggestion}`);
+  }
+
+  // Gate 8 / all gates passed → allow
+  return emitAllow();
+}
+
+/**
+ * #1485 point 1 — the catch event for Gate 5b's WARN branch, ONCE per wave.
+ *
+ * `scripts/validate-wave-scope.mjs` has no mechanical caller; the Gate 5b WARN
+ * is the only place a refused grant is seen at all, and a `systemMessage` is not
+ * countable. Owner decision 2026-10-02, option (b): the FIRST WARN of a wave
+ * writes `orchestrator.scope.refused_grant_allowed`, so "how many waves ran on
+ * a manifest the validator would refuse" becomes a ledger query (HR-105). The
+ * WARN itself is unchanged and still fires on every write.
+ *
+ * DEDUPE: a marker `.orchestrator/tmp/gate5b-refused-grant/<session>-w<wave>`
+ * created with `flag: 'wx'` (O_CREAT|O_EXCL). Exclusive create is atomic, so of
+ * two hook processes racing on the first WARN exactly one wins and emits — no
+ * lock, no read-modify-write. The session joins the key because wave numbers
+ * restart in every session sharing this working copy. `.orchestrator/tmp/` is
+ * gitignored; one marker per (session, wave) that ever hit a refused grant.
+ *
+ * Any marker failure OTHER than EEXIST (unwritable dir, ENOTDIR) still emits:
+ * over-reporting a rare event beats re-creating the silent gap this closes.
+ *
+ * COST: runs only on the Gate 5b `error` branch — an ordinary in-repo write
+ * never reaches it, so the hot path pays nothing. NAMED CEILING (BV-004): a
+ * legacy manifest without a session id and a payload without one share the key
+ * `no-session-w<N>` across sessions; revisit if such manifests are still seen.
+ *
+ * Never throws — observability must not change the WARN.
+ *
+ * @param {{scope: Record<string, unknown>, scopePath: string, projectRoot: string,
+ *   input: Record<string, unknown>, grant: string, grade: {code?: string},
+ *   filePath: string}} facts
+ * @returns {Promise<void>}
+ */
+async function recordRefusedGrantOncePerWave({ scope, scopePath, projectRoot, input, grant, grade, filePath }) {
+  try {
+    const session = String(
+      scope.session_id ?? scope.session ?? input?.session_id ?? process.env.CLAUDE_CODE_SESSION_ID ?? 'no-session',
+    );
+    const key = `${session}-w${scope.wave ?? 'unknown'}`.replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 160);
+    const markerDir = path.join(projectRoot, '.orchestrator', 'tmp', 'gate5b-refused-grant');
+    try { await fs.mkdir(markerDir, { recursive: true }); } catch { /* the create below decides */ }
+    try {
+      await fs.writeFile(path.join(markerDir, key), `${new Date().toISOString()}\n`, { flag: 'wx' });
+    } catch (e) {
+      if (e?.code === 'EEXIST') return; // this wave already reported
+    }
+    const { emitEvent } = await import('../scripts/lib/events.mjs');
+    await emitEvent(
+      'orchestrator.scope.refused_grant_allowed',
+      {
+        hook: HOOK_NAME,
+        manifest: scopePath,
+        wave: scope.wave,
+        grant,
+        code: grade?.code,
+        file_path: filePath,
+      },
+      { repoRoot: projectRoot },
+    );
+  } catch { /* observability is best-effort — never changes the WARN */ }
+}
+
+/**
+ * #1504 point 3 — the catch event for a session root that HID an active wave,
+ * ONCE per (session, wave, session root).
+ *
+ * `resolveSessionRoot()` answers with the repo the payload `cwd` sits in. A wave
+ * agent that `cd`s into a nested or sibling repo (or a session that entered a
+ * worktree) therefore resolves a root without a manifest, and Gate 3 allows
+ * every write there while the wave's manifest sits at the launch dir, unread.
+ * The revisit trigger `resolveSessionRoot` names for exactly that relocation
+ * ("an `orchestrator.scope.*` record") could never fire: this allow left no
+ * trace. Behaviour stays ALLOW — this is the trace, not a new deny.
+ *
+ * Fires only when BOTH hold, so the ordinary no-manifest allow — every write in
+ * every repo without a wave — stays silent (HR-101):
+ *   1. the harness states a launch dir and it is not the resolved session root;
+ *   2. the launch root carries a manifest that is not provably a peer's
+ *      ({@link findOwnScopeFile}: own, or unbound/legacy — one that WOULD have
+ *      been enforced). A peer's manifest at the launch root hides nothing of ours.
+ *
+ * COST on the hot path: rung 1 is an env read plus a string compare — no
+ * filesystem call while the session root IS the launch dir, i.e. for every
+ * session that never left its checkout. One `realpath` when only the spelling
+ * differs (macOS `/var` → `/private/var`); the ≤4 `existsSync` of rung 2 only
+ * for a genuinely relocated root.
+ *
+ * DEDUPE: the {@link recordRefusedGrantOncePerWave} pattern — an exclusive
+ * create (`flag: 'wx'`) of `<launch>/.orchestrator/tmp/scope-root-relocated/<key>`.
+ * The event goes to the LAUNCH repo's ledger, where the wave's other records
+ * live. The session root's basename joins the key so a second relocated repo in
+ * one wave is reported too. NAMED CEILING (BV-004): two relocated roots sharing a
+ * basename in one wave report once; revisit if a record ever names the wrong repo.
+ *
+ * Never throws — observability must not change the allow.
+ *
+ * @param {{projectRootRaw: string, projectRoot: string, ownIds: Set<string>,
+ *   filePath: string}} facts
+ * @returns {Promise<void>}
+ */
+async function recordHiddenManifestOncePerWave({ projectRootRaw, projectRoot, ownIds, filePath }) {
+  try {
+    const launchRaw = launchDirFromEnv();
+    if (launchRaw === '') return;
+    const launchResolved = path.resolve(launchRaw);
+    if (launchResolved === projectRootRaw || launchResolved === projectRoot) return;
+    let launch;
+    try {
+      launch = await fs.realpath(launchResolved);
+    } catch {
+      return; // a launch dir that does not exist holds no manifest
+    }
+    if (launch === projectRoot) return;
+
+    const { path: manifest } = findOwnScopeFile(launch, ownIds, classifyManifestSession);
+    if (!manifest) return;
+
+    let scope = {};
+    try {
+      const parsed = JSON.parse(await fs.readFile(manifest, 'utf8'));
+      if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) scope = parsed;
+    } catch { /* unreadable → keyed and reported as wave `unknown` */ }
+
+    const session = String(scope.session_id ?? scope.session ?? [...ownIds][0] ?? 'no-session');
+    const key = `${session}-w${scope.wave ?? 'unknown'}-${path.basename(projectRoot)}`
+      .replace(/[^A-Za-z0-9._-]/g, '_')
+      .slice(0, 160);
+    const markerDir = path.join(launch, '.orchestrator', 'tmp', 'scope-root-relocated');
+    try { await fs.mkdir(markerDir, { recursive: true }); } catch { /* the create below decides */ }
+    try {
+      await fs.writeFile(path.join(markerDir, key), `${new Date().toISOString()}\n`, { flag: 'wx' });
+    } catch (e) {
+      if (e?.code === 'EEXIST') return; // this root already reported for this wave
+    }
+    const { emitEvent } = await import('../scripts/lib/events.mjs');
+    await emitEvent(
+      'orchestrator.scope.manifest_hidden_by_session_root',
+      {
+        hook: HOOK_NAME,
+        manifest,
+        launch_root: launch,
+        session_root: projectRoot,
+        wave: scope.wave,
+        file_path: path.isAbsolute(filePath) ? filePath : path.resolve(projectRoot, filePath),
+      },
+      { repoRoot: launch },
+    );
+  } catch { /* observability is best-effort — never changes the allow */ }
+}
+
+/**
+ * `mtimeMs` of a file, or `null` when it cannot be stat'ed.
+ *
+ * The PROVENANCE half of the #1057 staleness comparison. It is fed into a
+ * SUBTRACTION against this session's start time — deliberately NOT compared to a
+ * TTL: an absolute age cap blinds the check in exactly the regime it exists for
+ * (a legitimate long deep session ages into the blind spot with nothing having
+ * gone wrong). Same argument `hooks/post-bash-write-verify.mjs` makes for
+ * `sessionAgeMs` under "Why the minimum, and why NOT a staleness cap".
+ *
+ * Never throws — an unstat-able manifest simply yields an undecidable clock, and
+ * {@link classifyEmptyScope} degrades to `'unknown'`, never to an allow.
+ *
+ * @param {string} file
+ * @returns {Promise<number|null>}
+ */
+async function mtimeMsOf(file) {
+  try {
+    return (await fs.stat(file)).mtimeMs;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * #1295 — the Claude Code auto-memory directories that belong to THIS repo.
+ *
+ * One path per distinct root (per home spelling): the encoding of the launch
+ * dir the harness saw (`CLAUDE_PROJECT_DIR` / cwd), of the session root
+ * (#1492 — a worktree the session entered) and of its realpath. All are needed
+ * because Claude Code encodes the path it was LAUNCHED with, while this hook
+ * compares against the canonical session root (on macOS `/tmp` →
+ * `/private/tmp`). Keeping the launch dir keeps the pre-#1492 grant exactly
+ * (the launch dir WAS the root then); the session-root entries name the
+ * worktree this session works in. A sibling repo's root encodes to none of them.
+ *
+ * #1977: a root that is a linked worktree is REPLACED by its main checkout,
+ * because Claude Code keeps auto-memory under the main repo. Measured
+ * 2026-11-08, claude 2.1.319: three worktree project folders hold no `memory`,
+ * the main repo's does, and that MEMORY.md was injected into the worktree
+ * session. Replaced, not added, so the folder nobody reads stops being granted.
+ * Only a back-pointer-verified worktree maps (`verifiedMainCheckout`); any other
+ * root keeps its own entry, as before.
+ *
+ * Returns `[]` when the encoder cannot be loaded, so the caller falls through to
+ * its deny (fail-closed).
+ *
+ * @param {string[]} candidateRoots — launch dir, session root, its realpath
+ * @returns {Promise<string[]>}
+ */
+async function ownMemoryDirs(candidateRoots) {
+  try {
+    const [{ encodeProjectDir }, { homedir }] = await Promise.all([
+      import('../scripts/lib/wave-transcript-tail.mjs'),
+      import('node:os'),
+    ]);
+    const home = homedir();
+    if (!home) return [];
+    // The candidate arrives REALPATH-resolved (SECURITY-REQ-03), so the home
+    // side must be too — otherwise the macOS `/tmp` → `/private/tmp` symlink
+    // alone makes every comparison miss.
+    let homeReal = home;
+    try {
+      homeReal = await fs.realpath(home);
+    } catch { /* non-existent home — the raw form is all there is */ }
+    const homes = new Set([home, homeReal]);
+    const roots = new Set(
+      candidateRoots
+        .filter((p) => typeof p === 'string' && p.length > 0)
+        .map((root) => verifiedMainCheckout(root) || root),
+    );
+    const dirs = [];
+    for (const h of homes) {
+      for (const root of roots) {
+        dirs.push(path.join(h, '.claude', 'projects', encodeProjectDir(root), 'memory'));
+      }
+    }
+    return dirs;
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Exact-prefix containment: is `candidate` `dir` itself or a descendant of it?
+ *
+ * Both sides are `path.resolve`d first, so `..` segments collapse before the
+ * comparison and cannot escape `dir`. The `path.sep` suffix is load-bearing —
+ * without it `<dir>-evil/x` would match the prefix of `<dir>`.
+ *
+ * @param {string} candidate
+ * @param {string} dir
+ * @returns {boolean}
+ */
+function isInsideDir(candidate, dir) {
+  const base = path.resolve(dir);
+  const target = path.resolve(candidate);
+  return target === base || target.startsWith(base + path.sep);
+}
+
+/**
+ * Gate 5d (#1881): is this out-of-root write a scratch file in the temp
+ * directory? Only when the project itself does NOT live in that temp root —
+ * for a project under /tmp (test fixtures, materialized pre-push trees) its
+ * temp siblings may be other repos or fixtures, so every gate stays as before.
+ * `resolvedPath` arrives realpath-resolved and the roots are realpaths, so
+ * `/tmp/../etc` or a symlink out of /tmp does not match.
+ *
+ * CEILING (BV-004): every tree under the temp root counts as scratch — also
+ * another session's gate or release tree there, a Discovery agent under a
+ * deny-all manifest, and a DANGLING symlink in /tmp (realpath fails, the walk
+ * resolves its parent), which a Write then follows. Accepted because Bash could
+ * write to all of these anyway; revisit if a temp tree ever holds state a wave
+ * must not touch.
+ *
+ * @param {string} resolvedPath — realpath-resolved write target, outside the project root
+ * @param {string} projectRoot
+ * @param {string[]} [roots] — temp roots; default {@link tempRoots}
+ * @returns {Promise<boolean>}
+ */
+export async function isTempScratch(resolvedPath, projectRoot, roots) {
+  const temp = roots ?? (await tempRoots());
+  const realRoot = await fs.realpath(projectRoot).catch(() => path.resolve(projectRoot));
+  const scratchRoots = temp.filter((dir) => !isInsideDir(realRoot, dir));
+  return scratchRoots.some((dir) => isInsideDir(resolvedPath, dir));
+}
+
+/**
+ * The realpaths of `/tmp` and `os.tmpdir()` that exist on this host (Gate 5d).
+ * A root that cannot be resolved is left out, never guessed.
+ *
+ * @returns {Promise<string[]>}
+ */
+async function tempRoots() {
+  const roots = [];
+  for (const dir of new Set(['/tmp', os.tmpdir()])) {
+    try {
+      roots.push(await fs.realpath(dir));
+    } catch { /* absent on this platform — not a temp root here */ }
+  }
+  return roots;
+}
+
+/**
+ * Classify a PreToolUse payload as coming from a dispatched SUBAGENT or from the
+ * main (coordinator) thread — the discriminator Gate 5c's memory carve-out needs
+ * (#1352).
+ *
+ * MEASURED, not assumed (2026-09-13, Claude Code 2.1.270, `strings` over
+ * `~/.local/share/claude/versions/2.1.270`):
+ *  - The base hook-input builder shared by EVERY event is
+ *    `{session_id: e.id, transcript_path: yf(e.id), cwd, …, agent_id: s?.agentId,
+ *    agent_type: d}` — PreToolUse spreads it verbatim
+ *    (`{...Na(s.session,Z(),d,s), hook_event_name:"PreToolUse", tool_name, …}`).
+ *  - The harness's own schema documents the field: *"Subagent identifier. Present
+ *    only when the hook fires from within a subagent (e.g., a tool called by an
+ *    AgentTool worker). Absent for the main thread, even in --agent sessions. Use
+ *    this field (not agent_type) to distinguish subagent calls from main-thread
+ *    calls."*
+ *  - Two candidates are REFUTED by the same source: `transcript_path` is
+ *    `yf(session.id)` — session-derived, hence IDENTICAL for coordinator and
+ *    subagent; and `CLAUDE_CODE_CHILD_SESSION=1` appears in a main-thread `env`
+ *    dump (`isSidechain:false`), so it marks the CLI process, not the caller.
+ *
+ * `agent_type` is deliberately a WEAKER witness, used only in the negative
+ * direction: per the same schema it is present on the main thread of an `--agent`
+ * session WITHOUT `agent_id`, so `agent_type`-without-`agent_id` positively names
+ * a coordinator, while `agent_type` alone can never name a subagent.
+ *
+ * FAIL-OPEN on ambiguity, deliberately (BV-004 ceiling): a payload this function
+ * cannot read as a subagent keeps the pre-#1352 ALLOW, because fail-closed here
+ * would deny the coordinator's own memory writes and break `/close`. The value is
+ * emitted on the event so the ambiguity is countable (HR-105) — but countability
+ * needs TWO fail-open values, not one:
+ *
+ *  - `'absent'`    — NO `agent_id` key in the payload at all. The harness's own
+ *                    documented shape for a main-thread call; the legitimate case.
+ *  - `'malformed'` — an `agent_id` key IS present and carries something this
+ *                    function cannot use as an identity (number, object, array,
+ *                    empty/whitespace string). Folding this into `'absent'` made a
+ *                    PRESENT-but-unusable marker byte-identical to a genuine
+ *                    main-thread call, so a future harness or bridge sending a
+ *                    numeric or object agent id would hand EVERY subagent the
+ *                    carve-out with nothing in the ledger to show it. Empty and
+ *                    whitespace-only strings belong here, not in `'absent'`: the
+ *                    key is present, so the sender believed it was identifying a
+ *                    subagent, and that is exactly the case this value separates.
+ *
+ * Only `agent_id` can produce `'malformed'`. `agent_type` is used solely in the
+ * positive coordinator direction and can never hide a subagent, so an unusable
+ * `agent_type` without an `agent_id` stays `'absent'`.
+ *
+ * Revisit if `discriminator: 'malformed'` appears at all, or if `'absent'`
+ * dominates the records on a harness that DOES dispatch subagents.
+ *
+ * @param {Record<string, unknown>} input Parsed PreToolUse stdin payload.
+ * @returns {'subagent'|'coordinator'|'malformed'|'absent'}
+ */
+function classifyCaller(input) {
+  const agentId = input?.agent_id;
+  if (typeof agentId === 'string' && agentId.trim() !== '') return 'subagent';
+  if (agentId !== undefined && agentId !== null) return 'malformed';
+  const agentType = input?.agent_type;
+  if (typeof agentType === 'string' && agentType.trim() !== '') return 'coordinator';
+  return 'absent';
+}
+
+const COORDINATOR_CARVEOUT_PATHS = Object.freeze([
+  '.claude/STATE.md',
+  '.codex/STATE.md',
+  '.cursor/STATE.md',
+  '.pi/STATE.md',
+]);
+
+/**
+ * Returns true if the given project-relative, forward-slash-normalized path is
+ * one of the harness-owned files the coordinator writes between waves.
+ *
+ * Matches STATE.md across all platform state dirs and the wave-scope.json the
+ * hook just read (its exact, resolved relative path — no wildcard). Exact
+ * string comparison only; any glob semantics belong in Gate 7.
+ */
+function isCoordinatorCarveout(normalizedRel, projectRoot, scopePath) {
+  if (COORDINATOR_CARVEOUT_PATHS.includes(normalizedRel)) return true;
+  const scopeRel = relativeFromRoot(projectRoot, scopePath);
+  if (scopeRel === null) return false;
+  return scopeRel.split(path.sep).join('/') === normalizedRel;
+}
+
+/**
+ * #792: Honour EXPLICIT absolute allowedPaths entries that point OUTSIDE the repo
+ * (a deliberate coordinator grant, e.g. "/Users/x/Projects/vault/**").
+ * Such entries are structurally unreachable under the default relative-only
+ * matcher because Gate 6 denies out-of-repo paths first, and Gate 7 only ever
+ * matches the ROOT-RELATIVE candidate (an absolute pattern can never match it).
+ *
+ * SECURITY (REQ-09): matches ONLY entries that are themselves absolute, against
+ * the fully realpath-resolved candidate — so RELATIVE entries (`**`, `../**`)
+ * can NEVER be used to escape the repo. When no absolute entry exists the helper
+ * returns null and the caller falls through to Gate 6 unchanged (inert pre-gate).
+ * An absolute entry matches only its own literal (canonical/realpath) subtree;
+ * the operator is responsible for supplying a canonical absolute path.
+ *
+ * MATCHING IS SHAPE-BLIND HERE; GRADING IS SHARED (#1398 cond. 4). This helper
+ * still decides nothing about whether a grant SHOULD exist: `/Users/<u>/**` and
+ * `/Users/<u>/.ssh/**` match exactly like `/Users/<u>/Projects/vault/**`. What
+ * changed is that the CALLER now runs the ONE grading predicate —
+ * `gradeScopeEntry` in `scripts/lib/scope-gate.mjs`, the same function
+ * `scripts/validate-wave-scope.mjs` turns into an exit-1 refusal — over the grant
+ * this helper returns, and WARNS when it grades `error`.
+ *
+ * ONE PREDICATE, ONE ARGUMENT SHAPE — THE VERDICTS NO LONGER DIFFER (#1398
+ * cond. 4, closed 2026-09-21). Both callers now pass the SAME fs-backed
+ * `resolve` (`canonicalizeGrantPrefix`, exported from
+ * `scripts/lib/scope-gate.mjs`), so only the CONSEQUENCE is asymmetric: the
+ * validator refuses an `error` before dispatch, this gate allows it with a
+ * notice at write time. The history, because the asymmetry was load-bearing for
+ * two fixes, measured 2026-09-20 @ 7e110a2a with the resolver-free call:
+ *   - `/private/etc/**`, `/private/var/**` — the macOS realpaths of the
+ *     denylisted `/etc` and `/var`, i.e. the spellings Gate 5b ACTUALLY matches
+ *     (it matches the realpath-resolved candidate): hook `warn`, validator
+ *     `error`. The notice fired on `/etc/**`, which reaches nothing here, and
+ *     stayed silent on the spelling that reaches everything. CLOSED by listing
+ *     the two aliases literally (`DENIED_ABSOLUTE_ALIAS_ROOTS`), at zero
+ *     syscalls — they still cost nothing and stay.
+ *   - `/tmp/x/**` — hook `warn`, validator `error/non-canonical`: the last
+ *     divergence, 1 of 9 probes, and not closable by any literal list, because
+ *     proving a literal prefix resolves elsewhere IS the realpath call. CLOSED
+ *     by passing the resolver here too, once its cost was measured instead of
+ *     assumed (+0.067 ms per Gate 5b hit; see the call site).
+ * The parity of the two verdict tables is pinned by
+ * `tests/lib/scope-gate.test.mjs` § "hook / validator grading parity", so a NEW
+ * divergence is a red test rather than a comment someone has to notice.
+ *
+ * Returns the MATCHED PATTERN rather than a boolean precisely so the caller has
+ * something to grade: with a bare `true` the grant that opened the gate is
+ * unknowable at the call site, and any notice would have to re-derive it.
+ *
+ * @param {string} resolvedPath — fully realpath-resolved candidate (absolute)
+ * @param {string[]} allowedPaths — raw allowedPaths array from wave-scope.json
+ * @returns {string|null} the first matching absolute entry, or null
+ */
+function matchedAbsoluteGrant(resolvedPath, allowedPaths) {
+  const abs = allowedPaths.filter((p) => typeof p === 'string' && path.isAbsolute(p));
+  if (abs.length === 0) return null;
+  const normalizedAbs = resolvedPath.split(path.sep).join('/');
+  return abs.find((pat) => pathMatchesPattern(normalizedAbs, absoluteGrantPattern(pat))) ?? null;
+}
+
+// ---------------------------------------------------------------------------
+// Entry point (#993)
+//
+// TWO distinct failure classes, two distinct handlers — do NOT merge them:
+//
+//   1. LOAD failure (`bootstrap()` throws): the guard never armed. Under the
+//      exit-0 protocol a bare exit-1 crash with 0 bytes of stdout is, on the
+//      only decision-bearing channel, indistinguishable from an allow. Now it
+//      exits 0 (still fail-OPEN — a broken module must not brick the session,
+//      and emitDeny itself may be the module that failed to load) but SAYS SO:
+//      GUARD INACTIVE. Banner-only — no headFallback module here (#993 D1).
+//   2. RUNTIME failure inside `main()`: pre-existing behaviour, unchanged. The
+//      guard armed and then tripped over a specific path; that fails CLOSED via
+//      emitDeny (SECURITY-REQ-01). The two paths MUST stay separate.
+// ---------------------------------------------------------------------------
+// Entry guard (#1393): run only when this file IS the script node was invoked
+// with — every harness path execs it (`sh run-node.sh <this file>`). A bare
+// `import()` (a probe, a test, a curious agent) must neither run main() nor
+// tear the importing process down. The profile gate sits INSIDE the guard for
+// that second reason: at module top level its `process.exit(0)` exited every
+// process that merely imported this hook. bootstrap() is inside too — loading
+// the guard sources is work a disabled hook and a bare importer must not do.
+if (isMainModule(import.meta.url)) {
+  // #211: exit 0 immediately (silent allow) when this hook is disabled via profile/env
+  if (!shouldRunHook('enforce-scope')) process.exit(0);
+
+  try {
+    await bootstrap();
+  } catch (loadError) {
+    try {
+      const { emitGuardInactiveBanner } = await import('./_lib/guard-source-loader.mjs');
+      // hookName is threaded explicitly (#993 — no hard-wired literal in the loader).
+      emitGuardInactiveBanner({ hookName: HOOK_NAME, error: loadError, consequence: GUARD_CONSEQUENCE });
+    } catch {
+      // Last resort: even the banner helper failed to load. Emit unconditionally —
+      // repeated noise beats a silent disarm.
+      process.stderr.write(
+        '🚨 enforce-scope: GUARD INACTIVE — module load failed ' +
+          `(${String(loadError?.message || loadError).split('\n')[0]}). ` +
+          'Edit/Write/MultiEdit scope enforcement is OFF. See issue #993.\n'
+      );
+    }
+    process.exit(0); // fail-open, but no longer fail-silent
+  }
+
+  // SECURITY-REQ-01 (fail-closed): any unhandled rejection → structured deny, never bare exit 1
+  main().catch((e) => {
+    emitDeny(
+      'Internal hook error — request blocked for safety',
+      `${e?.message ?? String(e)}`,
+    );
+  });
+}

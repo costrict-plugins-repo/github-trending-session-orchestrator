@@ -1,0 +1,325 @@
+/**
+ * utils.mjs — Shared utilities for vault-mirror (Issue #283 split).
+ *
+ * Exports: subjectToSlug, isValidSlug, uuidPrefix8, toDate,
+ *          truncateAtWord, yamlQuoteIfNeeded, parseFrontmatter,
+ *          slugifyTagSegment, buildTag, slugifyIdSafe, TAG_MAX_LENGTH,
+ *          resolveSourceSessionLink, recordKeySuffix8
+ */
+
+import { parseSessionId } from '../session-id.mjs';
+import { digestSha256Short } from '../crypto-digest-utils.mjs';
+
+/** Normalize letters for new note slugs. */
+function normalizeSlugLetters(value) {
+  const german = { ä: 'ae', ö: 'oe', ü: 'ue', ß: 'ss' };
+  return value.normalize('NFC').toLowerCase()
+    .replace(/[äöüß]/g, (letter) => german[letter])
+    .normalize('NFKD').replace(/\p{M}/gu, '');
+}
+
+/** Historical ASCII deletion, frozen for record identity and old note lookup. */
+export function legacySubjectToSlug(subject) {
+  return slugSubject(subject, (value) => value.toLowerCase());
+}
+
+/**
+ * Convert a subject string to a kebab slug.
+ * - If subject contains slashes, collapse to last path segment.
+ * - Transliterate German letters and decompose accents.
+ * - Replace dots and underscores with hyphens.
+ * - Strip all non-[a-z0-9-] chars.
+ * - Collapse consecutive hyphens.
+ * - Trim leading/trailing hyphens.
+ */
+export function subjectToSlug(subject) {
+  return slugSubject(subject, normalizeSlugLetters);
+}
+
+function slugSubject(subject, normalize) {
+  let s = subject;
+  if (s.includes('/')) {
+    const parts = s.split('/').filter(Boolean);
+    s = parts[parts.length - 1];
+  }
+  return normalize(s)
+    .replace(/[._]/g, '-')
+    .replace(/[^a-z0-9-]/g, '')
+    .replace(/-+/g, '-')
+    .replace(/^-+|-+$/g, '');
+}
+
+const slugRegex = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+
+/**
+ * Validate that `s` is a filesystem-safe kebab slug.
+ *
+ * Guards against RegExp's implicit ToString coercion (issue #718): without
+ * the `typeof` check, `slugRegex.test(undefined)` coerces to the literal
+ * string "undefined" — which matches `^[a-z0-9]+(?:-[a-z0-9]+)*$` — and
+ * `isValidSlug(undefined)` returns `true`. Callers (e.g. `processSession` in
+ * process.mjs) rely on `isValidSlug(rawSessionId) === false` to route
+ * missing/non-string ids to the uuid-based synthesizer; the coercion trap
+ * let `undefined` through as a "valid" id and crashed downstream on
+ * `session_id.length`.
+ *
+ * @param {unknown} s
+ * @returns {boolean}
+ */
+export function isValidSlug(s) {
+  return typeof s === 'string' && slugRegex.test(s);
+}
+
+/**
+ * Max length of a single vault tag string. Mirrors the authoritative
+ * vaultFrontmatterSchema (`tags[].max(64)` in skills/vault-sync/validator.mjs).
+ */
+export const TAG_MAX_LENGTH = 64;
+
+/**
+ * Slugify ONE tag segment to a kebab slug matching the schema's per-segment
+ * regex (`/^[a-z0-9]+(?:-[a-z0-9]+)*$/`).
+ *
+ * Unlike {@link subjectToSlug}, this does NOT collapse slashes — callers pass a
+ * single segment at a time so {@link buildTag} can preserve the `/`-separated
+ * tag hierarchy. Whitespace, dots and underscores become hyphens (so
+ * "Deep Mode" → "deep-mode"); all other non-`[a-z0-9-]` chars are stripped. An
+ * empty result falls back to "unknown" so the enclosing tag never contains an
+ * empty `/`-segment (which would violate tagPathRegex).
+ *
+ * @param {string} input
+ * @returns {string}
+ */
+export function slugifyTagSegment(input) {
+  // Tags are persistent identifiers, so retain historical ASCII deletion.
+  const slug = String(input ?? '').toLowerCase()
+    .replace(/[\s._]+/g, '-')
+    .replace(/[^a-z0-9-]/g, '')
+    .replace(/-+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  return slug || 'unknown';
+}
+
+/**
+ * Build a schema-valid vault tag from path segments (#602). Each segment is
+ * kebab-slugified (preserving the `/`-separated hierarchy), and the joined tag
+ * is capped at {@link TAG_MAX_LENGTH} characters. When truncation lands on a
+ * separator or hyphen, the trailing char is removed so the result still matches
+ * the schema's tagPathRegex.
+ *
+ * @param {Array<string>|string} segments
+ * @returns {string}
+ */
+export function buildTag(segments) {
+  const slugged = (Array.isArray(segments) ? segments : [segments]).map((s) =>
+    slugifyTagSegment(s),
+  );
+  if (slugged.length === 0) return 'unknown';
+  let tag = slugged.join('/');
+  if (tag.length > TAG_MAX_LENGTH) {
+    // Trim to the cap, then strip any trailing separator/hyphen exposed by the
+    // cut so the tail segment stays a valid kebab slug.
+    tag = tag.slice(0, TAG_MAX_LENGTH).replace(/[/-]+$/, '');
+  }
+  return tag;
+}
+
+/**
+ * Slugify a value for use as a vault note `id` (#602), guaranteeing the
+ * schema's kebab + min-length-2 contract. Returns null when no usable slug
+ * remains (caller treats this as an invalid entry).
+ *
+ * @param {string} input
+ * @returns {string|null}
+ */
+export function slugifyIdSafe(input) {
+  // Normalise whitespace to hyphens first (so "My ID" → "my-id" rather than
+  // "myid"), then preserve the historical ASCII kebab contract.
+  const normalised = String(input ?? '').replace(/\s+/g, '-');
+  // Session identity retains historical deletion; transliteration is for new
+  // learning names, never an incidental Session-ID migration.
+  const slug = legacySubjectToSlug(normalised);
+  if (!slug) return null;
+  // Schema requires min length 2; pad a single-char slug deterministically.
+  return slug.length >= 2 ? slug : `${slug}-x`;
+}
+
+/** The vault-sync schema's `id` cap (`skills/vault-sync/validator.mjs`, `.max(128)`). */
+export const NOTE_ID_MAX_LENGTH = 128;
+
+/**
+ * The frontmatter `id` of a generated note (#1601, #1602). The FILENAME slug
+ * stays the note's identity on disk (paths never change); the `id` adds the
+ * repo namespace so it is unique across the vault's per-repo folders — a
+ * session id or learning subject recurs across repos — and is capped at
+ * {@link NOTE_ID_MAX_LENGTH}. An over-long id keeps a 119-char prefix plus an
+ * 8-hex SHA-256 suffix of the FULL id, so two long subjects sharing a prefix
+ * stay distinct. Deterministic: the same `(repoNs, slug)` always yields the
+ * same id. Without a namespace (vault-less callers, unit tests) the slug is
+ * only capped.
+ *
+ * BV-004 ceiling: the separator is a single `-` (the schema slug forbids
+ * `--`), so namespace `a` + slug `b-c` and namespace `a-b` + slug `c` render
+ * the same id. Revisit-Trigger: the vault validator reports a duplicate id
+ * whose two notes sit in different namespace folders.
+ *
+ * @param {string|null|undefined} repoNs - the resolved repo namespace folder.
+ * @param {string} slug - the note's filename slug (or rendered session slug).
+ * @returns {string}
+ */
+export function noteIdFor(repoNs, slug) {
+  const base = String(slug ?? '');
+  const ns = typeof repoNs === 'string' && repoNs.length > 0 ? (isValidSlug(repoNs) ? repoNs : legacySubjectToSlug(repoNs)) : '';
+  const full = ns ? `${ns}-${base}` : base;
+  if (full.length <= NOTE_ID_MAX_LENGTH) return full;
+  const suffix = digestSha256Short(full);
+  return `${full.slice(0, NOTE_ID_MAX_LENGTH - suffix.length - 1).replace(/-+$/, '')}-${suffix}`;
+}
+
+/**
+ * Does a note's frontmatter `id` name the note `slug`? Accepts both the
+ * pre-#1601 id (the bare slug — a numeric one parses as the same string here,
+ * `parseFrontmatter` keeps scalars verbatim) and the current {@link noteIdFor}
+ * form, so notes written before the id change keep their ownership evidence.
+ *
+ * @param {unknown} fmId
+ * @param {string} slug
+ * @param {string|null|undefined} repoNs
+ * @returns {boolean}
+ */
+export function noteIdMatches(fmId, slug, repoNs) {
+  return typeof fmId === 'string' && (fmId === slug || fmId === noteIdFor(repoNs, slug));
+}
+
+/**
+ * The `id:` frontmatter value, always a double-quoted YAML string (#1601): an
+ * unquoted all-digit id (`id: 433`) parses as a NUMBER under a real YAML parser
+ * and fails the schema's `z.string()`.
+ *
+ * @param {string} id
+ * @returns {string}
+ */
+export function yamlNoteId(id) {
+  return JSON.stringify(String(id));
+}
+
+/**
+ * Replace the frontmatter `id:` line of a note — used when a displaced note
+ * moves to its disambiguated name (#1506.2), whose `id` must match the file,
+ * and by the id migration (#1601, `migrate-ids.mjs`). Only the `id:` line
+ * INSIDE the leading frontmatter block changes; every other byte — body,
+ * other fields, `[REDACTED]` spans (#1025) — is kept verbatim. A note without
+ * a frontmatter `id:` line is returned unchanged.
+ * @param {string} content
+ * @param {string} id
+ * @returns {string}
+ */
+export function withNoteId(content, id) {
+  if (!content.startsWith('---')) return content;
+  const end = content.indexOf('\n---', 3);
+  if (end === -1) return content;
+  const head = content.slice(0, end);
+  const nextHead = head.replace(/^id:.*$/m, `id: ${yamlNoteId(id)}`);
+  return nextHead === head ? content : nextHead + content.slice(end);
+}
+
+/** Derive the first 8 chars of a UUID (strip hyphens, take first 8 hex chars). */
+export function uuidPrefix8(id) {
+  return id.replace(/-/g, '').slice(0, 8);
+}
+
+/**
+ * The disambiguation suffix of a NEW `<slug>-<suffix>.md` note (#1506.1): the
+ * first 8 hex chars of a SHA-256 over the FULL record key. `uuidPrefix8` only
+ * separates UUID ids — non-UUID ids sharing their first 8 chars collided, and
+ * the third record of a subject was never mirrored. Existing `-<uuid8>` notes
+ * keep their names; only newly created disambiguation files use this suffix.
+ *
+ * @param {string} recordKey - the record's `source-record` (or its raw id).
+ * @returns {string} 8 lowercase hex chars.
+ */
+export function recordKeySuffix8(recordKey) {
+  return digestSha256Short(String(recordKey));
+}
+
+/** Format a UTC ISO date string as YYYY-MM-DD. */
+export function toDate(isoString) {
+  if (!isoString) return '';
+  return isoString.slice(0, 10);
+}
+
+/** Truncate a string to maxLen chars, ending at a word boundary. */
+export function truncateAtWord(str, maxLen) {
+  if (str.length <= maxLen) return str;
+  const truncated = str.slice(0, maxLen);
+  const lastSpace = truncated.lastIndexOf(' ');
+  return lastSpace > 0 ? truncated.slice(0, lastSpace) : truncated;
+}
+
+/** Determine if a YAML title value needs quoting (contains : # \ or starts with -). */
+export function yamlQuoteIfNeeded(value) {
+  if (/[:#{}[\],&*?|<>=!%@`\\]/.test(value) || value.startsWith('-') || value.startsWith('"')) {
+    return `"${value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+  }
+  return value;
+}
+
+// ── Source-session link resolver (Issue #704) ─────────────────────────────────
+
+/**
+ * Decide whether a learning's source_session should be emitted as an Obsidian
+ * wiki-link or as plain text.
+ *
+ * When `opts.noteExists` is provided (a function `(slug: string) => boolean`),
+ * the decision is EXISTENCE-based: the target slug is looked up in the caller's
+ * known-sessions Set built from the real vault's 50-sessions directory. This is
+ * the authoritative path used by process.mjs and eliminates false-negatives for
+ * legacy/HHmm session IDs whose vault notes exist but don't match the strict
+ * semantic regex (e.g. `main-2026-04-23-1255`, `main-2026-05-25-deep`).
+ *
+ * Without the predicate (unit-test / vault-less run), the function falls back to
+ * strict format-validity (semantic `<branch>-<YYYY-MM-DD>-<mode>-<N>` or UUID-v4)
+ * — identical to the Wave-2 behaviour, never worse.
+ *
+ * @param {unknown} source_session
+ * @param {{ noteExists?: (slug: string) => boolean }} [opts]
+ * @returns {{ isLink: boolean, target: string }}
+ */
+export function resolveSourceSessionLink(source_session, opts = {}) {
+  const raw = source_session === null || source_session === undefined ? '' : String(source_session).trim();
+  if (!raw || raw === 'unknown') return { isLink: false, target: raw || 'unknown' };
+  // Provenance tags like "agent-proposed@wave-1" are never session notes.
+  if (/@/.test(raw)) return { isLink: false, target: raw };
+  // Session targets retain the same historical identity as their note filenames.
+  const slug = legacySubjectToSlug(raw) || raw;
+  if (typeof opts.noteExists === 'function') {
+    // EXISTENCE-based (authoritative when a predicate is supplied).
+    return opts.noteExists(slug) ? { isLink: true, target: slug } : { isLink: false, target: raw };
+  }
+  // Fallback (no predicate, e.g. unit tests / no vault): strict format validity.
+  const parsed = parseSessionId(raw);
+  const ok = parsed !== null && (parsed.format === 'semantic' || parsed.format === 'uuid');
+  return ok ? { isLink: true, target: slug } : { isLink: false, target: raw };
+}
+
+// ── Frontmatter parser (minimal — only reads the opening --- block) ───────────
+
+export function parseFrontmatter(content) {
+  if (!content.startsWith('---')) return null;
+  const end = content.indexOf('\n---', 3);
+  if (end === -1) return null;
+  const block = content.slice(3, end).trim();
+  const result = {};
+  for (const line of block.split('\n')) {
+    const colonIdx = line.indexOf(':');
+    if (colonIdx === -1) continue;
+    const key = line.slice(0, colonIdx).trim();
+    let value = line.slice(colonIdx + 1).trim();
+    // Strip surrounding quotes
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1);
+    }
+    result[key] = value;
+  }
+  return result;
+}

@@ -1,0 +1,234 @@
+#!/usr/bin/env node
+/**
+ * skill-invocation-telemetry.mjs — PreToolUse hook for Skill tool selection.
+ *
+ * Hook event: PreToolUse with matcher:"Skill" (issue #645, epic #643).
+ * Fires when the Skill tool is invoked (a skill is selected). Writes a
+ * selection record to `.orchestrator/metrics/skill-invocations.jsonl`.
+ *
+ * Decision flow (when run as the hook, not imported):
+ *   1. shouldRunHook gate — exit 0 immediately when the hook is disabled.
+ *   2. Read JSON payload from stdin: { tool_name, tool_input: { skill }, session_id }.
+ *   3. Belt-and-suspenders guard: if tool_name !== "Skill", exit 0 immediately.
+ *   4. Build a 'selected' record and call appendSkillInvocation().
+ *   5. Daily-fallback telemetry flush check (Epic #841, #844; #1138) — non-blocking:
+ *      when more than 24h have passed since the last successful flush AND either
+ *      the offline queue is non-empty or a session has completed since, AND
+ *      consent resolves to send, spawn a detached child that runs
+ *      `telemetry _flush`. Cheap by construction (env kill-switch pre-check →
+ *      state stat → queue/ledger probe → consent) and never loads the roster on
+ *      the hot hook path.
+ *   6. Output: nothing on stdout. Diagnostic errors to stderr only.
+ *
+ * Exit codes: 0 always (informational, never blocking).
+ *
+ * The module is import-safe: the self-execution block below is guarded so that a
+ * test can `import { maybeSpawnDailyFlush }` without triggering the hook's
+ * stdin-read + exit path.
+ */
+
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+import { shouldRunHook } from './_lib/profile-gate.mjs';
+import { appendSkillInvocation } from '../scripts/lib/skill-invocations-schema.mjs';
+import { resolveEventsLedgerRoot } from '../scripts/lib/platform.mjs';
+import { resolveLedgerPath } from '../scripts/lib/ledger-path.mjs';
+import { shouldDailyFlush } from '../scripts/lib/telemetry/sync.mjs';
+import { telemetrySendBlockReason, resolveConsent, readTelemetryState } from '../scripts/lib/telemetry/consent.mjs';
+import { loadOwnerConfig } from '../scripts/lib/owner-yaml.mjs';
+import { isMainModule } from '../scripts/lib/is-main-module.mjs';
+import { spawn } from '../scripts/lib/native-command.mjs';
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/**
+ * Ledger paths. FUNCTIONS, not module-level consts: resolving the project dir
+ * walks the filesystem on first call, and this hook must not pay that at
+ * import time (#1153 P5).
+ *
+ * The two resolve independently (#1722): `skill-invocations.jsonl` goes
+ * through {@link resolveLedgerPath} (the main checkout's copy only when the
+ * launch dir is a linked worktree that gitignores it), while the metrics dir
+ * holding `sessions.jsonl` maps unconditionally via resolveEventsLedgerRoot
+ * (#1514/#1584).
+ *
+ * @returns {string}
+ */
+function sessionsMetricsDirPath() {
+  return path.join(resolveEventsLedgerRoot(), '.orchestrator', 'metrics');
+}
+
+/** @returns {string} */
+function jsonlPath() {
+  return resolveLedgerPath('.orchestrator/metrics/skill-invocations.jsonl');
+}
+
+/** Absolute path to the telemetry CLI (carries the hidden `_flush` subcommand). */
+const TELEMETRY_CLI_PATH = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  '../scripts/telemetry.mjs',
+);
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * True when an env var carries a truthy "on" signal (present, non-empty, not
+ * '0'/'false'). Kept local so the hook does not pull anything extra from consent.mjs.
+ * @param {unknown} raw
+ * @returns {boolean}
+ */
+function isTruthyEnvFlag(raw) {
+  if (raw === undefined || raw === null) return false;
+  const t = String(raw).trim();
+  if (t === '' || t === '0') return false;
+  return t.toLowerCase() !== 'false';
+}
+
+/**
+ * Read stdin to EOF (best-effort). Returns parsed JSON or null on failure.
+ * Uses a 5 s timeout consistent with Claude Code hook contract.
+ *
+ * @returns {Promise<object|null>}
+ */
+function readStdinJson() {
+  return new Promise((resolve) => {
+    if (process.stdin.readableEnded || process.stdin.closed) {
+      resolve(null);
+      return;
+    }
+    const chunks = [];
+    const timer = setTimeout(() => { resolve(null); }, 5_000);
+    process.stdin.setEncoding('utf8');
+    process.stdin.on('data', (c) => chunks.push(c));
+    process.stdin.on('end', () => {
+      clearTimeout(timer);
+      const raw = chunks.join('').trim();
+      if (!raw) { resolve(null); return; }
+      try { resolve(JSON.parse(raw)); } catch { resolve(null); }
+    });
+    process.stdin.on('error', () => { clearTimeout(timer); resolve(null); });
+    process.stdin.resume();
+  });
+}
+
+/**
+ * Non-blocking daily-fallback flush trigger. Ordered cheapest-first:
+ *   1. Check env kill-switches and require an interactive Claude Code session (no I/O).
+ *   2. shouldDailyFlush (one telemetry.json read; a queue stat + a sessions.jsonl
+ *      read only once the 24h gate has passed) — the common case (flushed within
+ *      24h) returns here WITHOUT loading owner.yaml or the roster.
+ *   3. full consent resolution — spawn a detached `telemetry _flush` only when it
+ *      resolves to send.
+ *
+ * Never throws; the caller's hook must always exit 0.
+ *
+ * @param {object} [opts]
+ * @param {NodeJS.ProcessEnv} [opts.env]  Env source (default process.env).
+ * @param {typeof spawn} [opts.spawnFn]   Spawn function (test injection).
+ * @param {number} [opts.now]             Reference time epoch-ms (default Date.now()).
+ * @param {string} [opts.statePath]       telemetry.json path override (test injection).
+ * @param {string} [opts.queuePath]       queue path override (test injection).
+ * @param {string} [opts.metricsDir]      Metrics dir for shouldDailyFlush's catch-up
+ *                                        probe (default: this repo's metrics dir).
+ * @returns {{ spawned: boolean, reason: string }}
+ */
+export function maybeSpawnDailyFlush({
+  env = process.env,
+  spawnFn = spawn,
+  now = Date.now(),
+  statePath,
+  queuePath,
+  metricsDir,
+} = {}) {
+  try {
+    // 1. Environment checks, before resolving any paths.
+    if (isTruthyEnvFlag(env?.DO_NOT_TRACK) || env?.SO_TELEMETRY_DISABLED === '1') {
+      return { spawned: false, reason: 'disabled-env' };
+    }
+
+    const blocked = telemetrySendBlockReason(env);
+    if (blocked) {
+      return { spawned: false, reason: blocked };
+    }
+
+    // 2. Backlog / catch-up check — bails out before owner.yaml load in the
+    //    common case. Since #1138 this is due EITHER on a stale non-empty queue
+    //    OR on a session that completed after the last successful flush, so the
+    //    fallback can originate a ping instead of only retrying failed sends.
+    if (!shouldDailyFlush({ statePath, queuePath, metricsDir: metricsDir ?? sessionsMetricsDirPath(), now })) {
+      return { spawned: false, reason: 'not-due' };
+    }
+
+    // 3. Authoritative consent gate.
+    const ownerConfig = loadOwnerConfig().config;
+    const { record } = readTelemetryState({ path: statePath });
+    const consent = resolveConsent({ env, ownerConfig, state: record, interactive: false });
+    if (consent.send !== true) {
+      return { spawned: false, reason: 'gated' };
+    }
+
+    const child = spawnFn(process.execPath, [TELEMETRY_CLI_PATH, '_flush'], {
+      detached: true,
+      stdio: 'ignore',
+    });
+    if (child && typeof child.unref === 'function') child.unref();
+    return { spawned: true, reason: 'spawned' };
+  } catch {
+    return { spawned: false, reason: 'error' };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
+
+async function main() {
+  const input = await readStdinJson();
+  if (!input) return;
+
+  // Belt-and-suspenders: the hooks.json matcher:"Skill" should already filter,
+  // but we guard defensively in case of misconfiguration or future matcher changes.
+  if (input.tool_name !== 'Skill') return;
+
+  const skillName = (typeof input.tool_input?.skill === 'string' && input.tool_input.skill.trim())
+    ? input.tool_input.skill.trim()
+    : 'unknown';
+
+  const sessionId = (typeof input.session_id === 'string' && input.session_id.trim())
+    ? input.session_id.trim()
+    : null;
+
+  /** @type {object} */
+  const record = {
+    timestamp: new Date().toISOString(),
+    event: 'selected',
+    skill: skillName,
+    session_id: sessionId,
+    schema_version: 1,
+  };
+
+  await appendSkillInvocation(jsonlPath(), record);
+
+  // Daily-fallback telemetry flush — non-blocking, best-effort, never throws.
+  maybeSpawnDailyFlush();
+}
+
+// ---------------------------------------------------------------------------
+// Self-execution guard — run only when invoked directly (not when imported).
+// ---------------------------------------------------------------------------
+
+const isMain =isMainModule(import.meta.url);
+if (isMain) {
+  // Exit 0 immediately when disabled via SO_HOOK_PROFILE / SO_DISABLED_HOOKS.
+  if (!shouldRunHook('skill-invocation-telemetry')) process.exit(0);
+
+  // Exit 0 always — informational hook must never block the Skill tool.
+  main().catch((err) => {
+    process.stderr.write(`[skill-invocation-telemetry] ERROR: ${err?.message ?? err}\n`);
+  }).finally(() => process.exit(0));
+}

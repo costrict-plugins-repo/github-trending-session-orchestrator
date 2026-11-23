@@ -1,0 +1,122 @@
+# Components & Reference
+
+Detailed component inventory and architecture reference for Session Orchestrator. The [README](../README.md) keeps the landing page lean; the full inventory lives here.
+
+## Repository anatomy
+
+```mermaid
+flowchart LR
+    USER([Operator]) -->|invokes /session| COORD[Coordinator]
+    COORD -->|reads| SK["Skills<br/>31 you type · 23 background"]
+    COORD -->|invokes| CMD[Commands<br/>33 slash-cmds]
+    COORD -->|dispatches| AG[Agents<br/>14 typed sub-agents]
+    AG -.->|parallel waves| W1[code-implementer]
+    AG -.-> W2[test-writer]
+    AG -.-> W3[security-reviewer]
+    AG -.-> W4[session-reviewer]
+    HOOK[Hooks<br/>10 event types] -.->|enforce scope + commands| COORD
+    COORD -->|writes| METRIC[.orchestrator/metrics/<br/>sessions · learnings · events]
+```
+
+## Skills (54: 31 you type, 23 in the background)
+
+- **Lifecycle:** `session-start`, `session-plan`, `wave-executor`, `session-end`, `quality-gates`, `using-orchestrator`
+- **Authoring:** `mcp-builder`, `hook-development`, `frontmatter-guard`
+- **Planning & discovery:** `plan`, `discovery`, `repo-audit`, `brainstorm`, `write-executable-plan`, `debug`, `claude-md-drift-check`, `grill`, `deepen` (same scope, deeper work: rawer inputs, sharper methods, an outside judge), `backlog` (checks GitLab issues for labels, readiness, size and dependencies, then proposes refinements for approval)
+- **Architecture:** `architecture` (carries the former `domain-model` grilling flow plus the `CONTEXT.md`/ADR formats under `skills/architecture/references/`)
+- **Cross-session:** `evolve`, `convergence-monitoring`, `memory-cleanup`, `reconcile`, `sunset-review`, `eval`
+- **Vault & docs:** `vault-sync`, `vault-mirror`, `docs-orchestrator`
+- **Ecosystem:** `bootstrap`, `gitlab-ops`, `gitlab-portfolio`, `ecosystem-health`, `mode-selector`, `autopilot`, `dispatcher`, `remote-offload`, `spinout`, `npm-publish`
+- **Testing:** `test-runner`, `playwright-driver`, `peekaboo-driver`, `ux-grill`, `test-audit`, `public-audit` (measures the public technical discoverability of an explicitly configured site: redirects, metadata, JSON-LD, sitemaps, robots, crawler responses; no login, no browser, no ranking claims)
+- **Content review:** `persona-panel`
+- **Operator ergonomics:** `eli5` (plain-language restatement of the last answer)
+- **Visualization:** `tmux-layout` (opt-in operator side-channel — [ADR-0007](adr/0007-tmux-visualization-substrate.md))
+
+## Commands (33)
+
+A slash command has exactly ONE definition. 31 are skills with `user-invocable: true` in `skills/<name>/SKILL.md` (the same file the model dispatches; `argument-hint` and `disable-model-invocation` live there too), and 2 are plain `commands/*.md` files without a same-named skill. Claude Code registers both shapes as `/session-orchestrator:<name>`, so a name that exists as both a command file and a user-invocable skill is listed twice in the `/` picker — `tests/commands/headless-bare-command-availability.test.mjs` forbids that twin. Claude Code lists a skill whose frontmatter has NO `user-invocable` key too, so every one of the 54 skills states the key explicitly: the other 23 say `false` and stay out of the picker (#1515).
+
+- **Skills (31):** `/architecture`, `/autopilot`, `/backlog`, `/bootstrap`, `/brainstorm`, `/close`, `/debug`, `/deepen`, `/discovery`, `/dispatcher`, `/eli5`, `/eval`, `/evolve`, `/go`, `/grill`, `/harness-audit`, `/memory-cleanup`, `/persona-panel`, `/plan`, `/portfolio`, `/public-audit`, `/reconcile`, `/release`, `/repo-audit`, `/spinout`, `/sunset-review`, `/test`, `/test-audit`, `/tmux-layout`, `/ux-grill`, `/write-executable-plan`.
+- **Command files (2):** `/session` (its skill is `session-start`) and `/templates-ack` (an in-session hook bypass with no skill body).
+
+Under `claude -p`, `/session` and `/plan` are reserved terminal built-ins; use `/session-orchestrator:session` and `/session-orchestrator:plan` there.
+
+## Agents (14 typed sub-agents)
+
+`code-implementer`, `test-writer`, `ui-developer`, `db-specialist`, `security-reviewer`, `session-reviewer`, `docs-writer`, `architect-reviewer`, `qa-strategist`, `analyst`, `ux-evaluator`, `dialectic-deriver`, `skill-applied-judge`, `eval-judge`.
+
+Custom agents live in `agents/` (plugin) or `.claude/agents/` (project) as Markdown with YAML frontmatter. The authoring spec — required fields, body conventions, validation commands — is in [`docs/agent-authoring.md`](./agent-authoring.md), following the canonical [code.claude.com/sub-agents](https://code.claude.com/docs/en/sub-agents) contract.
+
+## Hook event types (10)
+
+The full Claude wiring uses: `SessionStart` (banner + init), `SessionEnd` (close events), `PreToolUse/Edit|Write` (scope enforcement + config protection + sessions-ledger guard), `PreToolUse/Bash` (destructive-command guard + enforce-commands + templates-first + staging-fence + memory-propose audit), `PostToolUse` (edit validation + opt-in frontend-slop detection + loop-guard + context threshold), `Stop` (session events), `SubagentStop` (telemetry), `PostToolUseFailure` (corrective context), `PostToolBatch` (wave signal + operator-steer), `SubagentStart` (telemetry), `CwdChanged` (cwd-change record).
+
+Codex uses the curated seven-event project subset `SessionStart`, `PreToolUse`, `PostToolUse`, `SubagentStart`, `SubagentStop`, `Stop`, and `SessionEnd`. Claude-only events are not exposed there. The Edit/Write guards run on Codex through the `apply_patch` adapter (`hooks/codex-apply-patch-guard.mjs`, #1913); see `docs/codex-setup.md` § Hook Surface and Trust for what stays unwired. The manifest uses native `${PLUGIN_ROOT}` while exporting `CODEX_PLUGIN_ROOT` plus `SO_PLATFORM=codex` for shared compatibility code.
+
+## Other surfaces
+
+- **Output Styles (3):** `session-report`, `wave-summary`, `finding-report`.
+- **Policy & rules:** `.orchestrator/policy/blocked-commands.json` (destructive-command rules); `.claude/rules/parallel-sessions.md` (PSA-001..PSA-004).
+- **Destructive-command guard.** On Claude Code, the active `hooks/pre-bash-destructive-guard.mjs` applies `.orchestrator/policy/blocked-commands.json` in the main session and in subagent waves. The policy has 14 blocking rules (`git reset --hard`, `rm -rf`, `git push --force`, deletion of `.orchestrator/metrics/**`, and more) and 4 warning rules. Cursor and Pi use event bridges with documented limits; On Codex the same hook runs as a `PreToolUse` Bash hook, and Codex honours its deny (measured 2026-10-20, codex-cli 0.160.1, #1691). Scope `enforcement: warn` or `off` does not change the separate destructive-command policy — see [Platform support](install.md#platform-support). The guard reads the text of a tool call and is an accident guard for a cooperating agent, not a containment boundary (see [SECURITY.md](https://github.com/Kanevry/session-orchestrator/blob/main/SECURITY.md)). `allow-destructive-ops: true` in Session Config is ignored since #2089; the operator relaxes the guard with `SO_HOOK_PROFILE` or host-local `owner.yaml` `hooks.profile` (profile `relaxed` warns and runs two measured cases only: a truncating redirect onto an unmodified tracked file and `git reset --hard` on a clean tree), or turns it off with `SO_DISABLED_HOOKS=pre-bash-destructive-guard`. The rule source of truth is [`.claude/rules/parallel-sessions.md`](https://github.com/Kanevry/session-orchestrator/blob/main/.claude/rules/parallel-sessions.md) (PSA-003), vendored to consumer repos via `/bootstrap`.
+- **Import probe.** `hooks/post-edit-import-probe.mjs` (PostToolUse on `Edit`/`Write`/`MultiEdit`) guards the other direction: a hook-reachable helper saved in a broken intermediate state makes *every* Bash/Edit/Write call fail with an internal hook error, host-wide, for every session sharing the working copy. Right after such a file is saved the probe runs ESLint `no-undef` on it (plus a child-process `import()` for `scripts/lib/**`) and reports the blast radius; it never blocks and always exits 0. It only fires for files listed in the committed allowlist [`hooks/_lib/hook-import-set.json`](../hooks/_lib/hook-import-set.json), regenerated by `node scripts/generate-hook-import-set.mjs`. Kill switch: `SO_DISABLED_HOOKS=post-edit-import-probe`.
+- **Agent cap.** `hooks/pre-agent-cap.mjs` (PreToolUse on `Agent`, logic in `scripts/lib/agent-cap.mjs`) counts the session's running agents (started = `agent-<id>.meta.json` sidecar, finished = the sidecar's `"finished": true`, else a terminal task-notification, #2049) as process-starting or reading, and denies a dispatch above the fleet cap — an accepted Auflagen file's `caps`, else none for the lead session (the active navigator lease names its native session id, #1971), else the Standard-Auflagen (default 6 + 6) after `fallback_due_at`, none without fleet integration unless the user set a number. Below 15 % free memory it admits no new process-starting agent at all (re-armed above 20 %). Caps and brake are configurable via `agent-caps` (env > owner.yaml > Session Config > default). It only refuses new starts; it kills nothing (#1959). Kill switch: `SO_DISABLED_HOOKS=pre-agent-cap`.
+- **Context threshold.** `hooks/post-tool-context-threshold.mjs` (PostToolUse on every tool, logic in `scripts/lib/context-threshold.mjs`) tail-reads the session's own transcript and gives it the limit the Lead already has: one hint at `context-threshold.prepare-k` (default 700k tokens: prepare the handover file, start no new wave) and one at `handover-k` (default 800k: hand over at the next MR cut). Sidechain lines are not counted; an unmeasurable context stays silent and is reported as „nicht messbar“, never „unter der Schwelle“. Warn-only, Claude Code only (#1960). Kill switch: `SO_DISABLED_HOOKS=post-tool-context-threshold`.
+- **Process-group kill + orphan reaper.** Both quality-gate paths spawn their commands `detached: true`, so the whole process GROUP is killed on timeout (SIGTERM → grace → SIGKILL, exit 124) instead of only the shell — the shell's own children used to be reparented to PID 1 and keep running. Every gate process this repo starts is recorded in `.orchestrator/runtime/gate-processes.jsonl`; `hooks/post-tool-batch-wave-signal.mjs` and `hooks/on-stop.mjs` trigger a throttled, detached orphan scan that reaps only what that register claims. Ships inert (`reaper.enabled: false`, `reaper.mode: report`) until its firing rate is measured — rule [`.claude/rules/host-resources.md`](../.claude/rules/host-resources.md) § HR-107, rationale [ADR-0015](adr/0015-process-group-kill-and-orphan-reaper.md), audit trail `.orchestrator/metrics/reaper-audit.jsonl`.
+- **ADR-0016 Cross-session messaging.** Adopt for the live cross-session axis (CSM-001..005), Spike for Remote Control (#1056, closed negative); anchors "entries vs messages" — files hold state, messages are hints — rationale [ADR-0016](adr/0016-cross-session-messaging.md).
+- **ADR-0017 Destructive-guard scope.** Accepted 2026-11-02 (#1854, owner option 1): the guard protects against irreversible loss of uncommitted/untracked work and shared working-copy state (rule ids in [`.orchestrator/policy/blocked-commands.json`](../.orchestrator/policy/blocked-commands.json)); lexical variants the tokenizer can read and forms measured as frequent are in goal, payloads the tokenizer cannot see (variable payloads, other interpreters, `xargs`/`find -exec`, script files, nesting past the caps) are non-goals — a hurdle, not the authority; § Path reset (#1834): same-ref resets (`checkout [HEAD] --`, `restore`) are measured with a read-only `git status` (dirty/unmeasurable → deny, clean → allow with notice), foreign refs warn; rationale [ADR-0017](adr/0017-destructive-guard-scope.md).
+- **ADR-0018 npm publish route after the token sunset.** Accepted 2026-11-02 (#1906, owner decision queue #7906): from January 2027 a Bypass-2FA token can only stage a publish; npm trusts GitHub Actions, GitLab.com and CircleCI as OIDC publishers, not a self-hosted GitLab. In force: `release.mjs --publish` stages with `npm stage publish` and the owner approves on npmjs.com (Option C, `--direct` keeps the old route); Option B (trusted publishing from the curated GitHub mirror's workflow) is built and opt-in as `release.mjs --publish --trusted` (2026-11-02); the owner's Trusted Publisher setup and the first rehearsal are pending, and the default stays route C until then; rationale [ADR-0018](adr/0018-npm-publish-route-after-token-sunset.md).
+- **Plugin validators.** `scripts/validate-plugin.mjs` runs the validator set under `scripts/lib/validate/*.mjs` (49 modules on disk, measured 2026-09-24 with `ls scripts/lib/validate/*.mjs | wc -l`); a failing BLOCKING validator fails the run. Newest blocking member: `check-learnings-shell-writes.mjs` (#1446) — blocks instruction prose that tells an agent to write `learnings.jsonl` with a shell redirect. Before it: `check-hook-entry-guards.mjs` — an AST oracle over every hook registered in the four hook manifests, flagging a missing entry guard or a top-level profile exit, either of which makes an imported hook module execute its whole program.
+- **Codex:** `.codex-plugin/plugin.json` (tracked `+codex.<UTC timestamp>` version), generated command and skill entrypoints under `.codex-plugin/skills/`, compatibility config, agent role definitions, and the public marketplace/add/list lifecycle implemented by `scripts/codex-install.mjs`. `scripts/generate-codex-skills.mjs` produces the name union with commands taking precedence; [Codex usage](codex-setup.md#usage) explains selection. Every installer run refreshes via `plugin add`; hook trust remains an operator decision in a fresh task through `/hooks`.
+- **Cursor:** `.cursor-plugin/plugin.json` registers canonical skills and `mcp/servers.json` using Cursor's native manifest format. Additional native component discovery is explicitly disabled; `scripts/cursor-install.mjs` supplies the existing command and hook adapters. The former standard root manifest was moved to prevent [Codex manifest interception](codex-setup.md#manifest-compatibility).
+- **Pi:** `package.json` `pi` manifest, `pi/extensions/session-orchestrator.ts` bridge, `hooks/hooks-pi.json`, `scripts/pi-install.mjs`.
+- **Portable cross-harness surface (generated, never hand-edited):** root `AGENTS.md` (byte-identical copy of `CLAUDE.md`) and `.agents/skills/<name>/SKILL.md` — mirrors carrying only spec-legal frontmatter plus a pointer body. These two surfaces are written by `scripts/generate-agents-skills.mjs` and drift-checked via its `--check` form inside `scripts/validate-plugin.mjs`. Native plugin manifests are maintained separately, with versions updated by `scripts/release.mjs`.
+- **Scripts:** deterministic CLI tools (parse-config, run-quality-gate, validate-wave-scope, validate-plugin, token-audit, autopilot, session-shape) plus shared lib under `scripts/lib/*.mjs` — e.g. `session-shape.mjs` (the one wave-shape resolver for `/session` mode + `--profile`), `maintenance-due-banner.mjs` (the single session-start probe for the whole maintenance loop), `session-end/tail-runner.mjs` (the mechanical apply-half of Phase 3.6.4's Expired-Learnings Sweep), `issue-budget-reconcile.mjs` (close-time recorded-vs-charged cross-check), `telemetry/pricing.mjs` (per-model USD-per-token rates for cost estimation), `process-group.mjs` (the one `spawnInGroup`/`killProcessGroup` primitive both quality-gate paths use) and `orphan-reaper.mjs` (stable entry + CLI over `orphan-reaper/`: the pure `decideReapCandidates` decision, `runOrphanScan`, the bounded B5 audit) — all covered by the vitest suite. Standalone CLIs added in the same cycle: `scripts/check-sessions-integrity.mjs` (validates the just-written `sessions.jsonl` record against the schema AND vault-mirror's real render path; exit 0/1/2). `scripts/session-ledger-census.mjs` (#1835, read-only) sorts every `abandoned` stub into `empty / conversation / dispatched / unmeasured` from its `work_evidence` field or the events ledger, and prints close and abort rates with and without measured empty restarts. `scripts/apply-session-learnings.mjs` (#1446) is the only sanctioned session-end/retro write path for `learnings.jsonl`: confirm/contradict, strict validation of new records, passive decay, then `pruneLearnings()`; dry-run by default, exit 0/1/2. Config parsers live beside their block: `scripts/lib/config/reaper.mjs`, `scripts/lib/config/gate.mjs`.
+
+## `/harness-audit` — Anthropic large-codebase rubric
+
+`scripts/harness-audit.mjs` runs **9 deterministic categories / 38 checks** over a repo and emits `.orchestrator/metrics/audit.jsonl`. Category 8 ("Large-Codebase Readiness") operationalises Anthropic's [Claude Code large-codebase best-practices](https://claude.com/blog/how-claude-code-works-in-large-codebases-best-practices-and-where-to-start) checklist — layered `CLAUDE.md` (or `AGENTS.md`), codebase-map presence, LSP/code-intelligence wiring, scoped test/lint commands, `permissions.deny`, and root-file leanness — as scored signals you can run on yourself and on consumer repos. Category 9 ("Skill-Health Surfacing") surfaces the #648 per-skill health pipeline — telemetry hygiene, scorer wiring, and an advisory-only verdict tally that never affects points; non-adoption always scores full points. These checks are intentionally orthogonal to repo-audit's baseline-compliance pass/fail; both surfaces ship.
+
+## Design choices
+
+- **The wave order is deliberate.** Discovery runs first so every implementer starts from the same picture of the code. Impl-Core runs before Impl-Polish so the structure exists before anything integrates against it. The Quality wave simplifies generated code *before* tests are written; write the tests first and they assert whatever the model produced, so changing it later means rewriting the tests too.
+- **Checks run after each implementation wave, not only at the end.** A mistake caught after wave 2 costs one wave. The same mistake found at `/close` has already been copied into every wave after it. Findings below the configured confidence threshold are not shown to you.
+- **A crash does not lose the session.** `STATE.md` records which wave finished and what deviated from the plan. The next `/session` offers to continue from the last completed wave.
+- **Two sessions in one working copy is treated as a real risk.** Two people, or two of your own sessions, in the same checkout share one git index, one filesystem and one `STATE.md`, and neither can see the other's uncommitted work. A heartbeat session lock, per-agent file-scope manifests, and the rules in [`.claude/rules/parallel-sessions.md`](../.claude/rules/parallel-sessions.md) exist for exactly that case.
+- **Guards run where the harness supports them, and the [platform table](install.md#platform-support) says where they do not.** The destructive-command policy (14 rules block, 4 warn) runs as a real hook on Claude Code and Codex and as a bridge on Cursor and Pi; file-scope enforcement is a hook on Claude Code, a bridge on Cursor and Pi, and instructions only on Codex (see [Other surfaces](#other-surfaces)).
+- **What it learns is opt-in and readable.** Every session appends a record. After 5 or more sessions, `/evolve analyze` proposes patterns with a confidence score; you read them and delete the ones you disagree with. Nothing is applied without you.
+- **GitLab and GitHub, both fully.** It detects which one your remote points at and drives issues and merge or pull requests for either.
+- **No build step.** Skills, commands and agents are Markdown with YAML frontmatter; the code that dispatches, validates and records runs in `scripts/lib/*.mjs` and `hooks/*.mjs`. When a session does something you did not expect, you can open the file that decided it.
+
+## Comparisons
+
+Moved here from the README so that a claim about another project can carry its measurement next to it. Every row below names when and how it was measured; rows that could not be measured were **removed rather than softened** — an unverifiable comparison row is worse than none.
+
+### vs. `open-gsd/gsd-core`
+
+Surface counts measured 2026-09-06 by this repo's 360° ecosystem probe (GitHub-overlap report of the 2026-09-06 360° audit; audit reports stay in the private GitLab repository and are not part of the public mirror); session-orchestrator's own counts measured the same day with the commands listed in the [user guide](USER-GUIDE.md#what-you-get).
+
+| Axis | session-orchestrator | `open-gsd/gsd-core` |
+|---|---|---|
+| Commands / skills / agents | 26 / 50 / 14 | 70 / 71 / 35 |
+| Hook guards | 29 hook files, 10 event types | 28 hooks, incl. write / read / prompt / workflow / secret-read / agent-isolation / worktree-path guards |
+| Cross-session learning | `/evolve` + confidence-scored `learnings.jsonl`; reconcile turns eligible learnings into PROPOSED rules an operator approves one by one | `gsd-extract-learnings`, `gsd-mempalace-*` |
+| Harness coverage | Claude Code, Codex CLI, Cursor IDE, Pi (4) | 44 `capabilities/` directories (pi, hermes, kimi, windsurf, opencode, ollama, …) |
+| Install | marketplace / clone + installer script per harness | `npx @opengsd/gsd-core@latest` |
+
+**Two README rows were deleted here, not carried over.** The old README comparison table claimed "Scope and command enforcement hooks → Other orchestrators: None" and "Cross-session learning → Other orchestrators: None". Both are **false**: gsd-core ships 28 guard hooks and two learning subsystems (measurement above). Two further rows — "VCS integration → usually GitHub only" and "Circuit breaker → Partial" — were removed because no measurement of any named project backs them.
+
+**What is NOT established.** Whether gsd-core's session lock covers the *operator-session* axis (multiple concurrent human sessions in one working copy) is an **open question** — the probe counted 14 code hits in its hooks without reading them. Until that is read, treat the operator-session axis as the plausible distinguishing surface rather than a proven one. The surfaces this repo can point at concretely are: a heartbeat session lock plus peer-scope manifests and the PSA rule set (`.claude/rules/parallel-sessions.md`); owner privacy by construction (`owner.yaml` outside every repo plus a leakage scanner with name redaction); rules derived from this repo's own measured telemetry; Obsidian vault mirroring; and dual GitLab + GitHub auto-detection.
+
+### vs. `maestro-orchestrate`
+
+Both [`maestro-orchestrate`](https://github.com/josstei/maestro-orchestrate) and session-orchestrator coordinate multi-agent work in long-running AI coding sessions. They differ in scope and execution model:
+
+| Axis | session-orchestrator | maestro-orchestrate |
+|---|---|---|
+| Execution model | typed waves resolved from the session mode by `scripts/session-shape.mjs` (housekeeping 1 · feature 3 · deep 5 · ultradeep 7) with inter-wave quality gates and confidence-scored session-reviewer | 4-phase sequential model with parallel subagents |
+| Runtime coverage | Claude Code + Codex CLI + Cursor IDE + Pi (4) | Gemini CLI + Claude Code + Codex + Qwen Code (4) |
+| VCS integration | GitLab + GitHub (auto-detected); hook events + commands wire to both | Runtime-agnostic; VCS work delegated to user |
+| Cross-session learning | Confidence-scored entries surfaced at session-start; opt-in `/evolve` review | Session archival without explicit learning extraction |
+| Specialist agents | 14 typed agents | 39 specialist agents across design/impl/review/debugging/security/compliance |
+
+The two plugins are complementary rather than competing: session-orchestrator focuses on a single wave-based lifecycle with VCS + learning integration, while maestro-orchestrate optimises for multi-runtime parallel specialist delivery.

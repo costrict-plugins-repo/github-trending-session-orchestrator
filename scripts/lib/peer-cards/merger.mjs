@@ -1,0 +1,696 @@
+/**
+ * merger.mjs — Sentinel-region three-way merge for peer cards (USER.md / AGENT.md)
+ * for issue #503 (Wave 2 I8).
+ *
+ * Consumers:
+ *   - /evolve --dialectic pass (future #506)
+ *
+ * Design notes
+ * ────────────
+ *  • SENTINEL-REGION MERGE (Strategy A per #503 D3). Managed regions are delimited by
+ *    HTML comment sentinels:
+ *        <!-- BEGIN MANAGED: <section-name> -->
+ *        ...AI-replaceable content...
+ *        <!-- END MANAGED: <section-name> -->
+ *    Content outside sentinels is hand-owned and preserved verbatim. Content inside
+ *    sentinels is AI-replaceable.
+ *  • Pure functions — no fs imports, no IO, deterministic. Same input → same output.
+ *  • Conflict-surfacing — duplicate section names and orphan BEGIN sentinels become
+ *    `conflicts[]` entries. Derived-body merges also report `unmapped-preamble`,
+ *    `multi-heading-region`, `omitted-items-retained`, and `unterminated-fence` for caller review.
+ *  • Idempotent — `mergePeerCard(body, {})` returns body byte-equivalent (modulo the
+ *    serialize round-trip; the sentinel comments are re-emitted in the same form).
+ *
+ * Section-name grammar: `[A-Za-z0-9_-]+` (word characters + hyphen).
+ */
+
+const SECTION_NAME = '[\\w-]+';
+const SENTINEL_BEGIN_RE = new RegExp(`<!--\\s*BEGIN\\s+MANAGED:\\s*(${SECTION_NAME})\\s*-->`, 'g');
+
+/**
+ * @typedef {Object} HandSection
+ * @property {'hand'} type
+ * @property {string} content — verbatim text between/around sentinels (may be empty)
+ * @property {number} startIdx — absolute char offset in original body
+ * @property {number} endIdx — absolute char offset (exclusive)
+ */
+
+/**
+ * @typedef {Object} ManagedSection
+ * @property {'managed'} type
+ * @property {string} name — section name from the BEGIN sentinel
+ * @property {string} content — inner content (excludes the sentinel comments themselves)
+ * @property {number} startIdx — offset of the BEGIN sentinel; -1 for sections appended via merge
+ * @property {number} endIdx — offset just past the END sentinel; -1 for appended sections
+ */
+
+/**
+ * @typedef {HandSection | ManagedSection} Section
+ */
+
+/**
+ * @typedef {Object} Conflict
+ * @property {'duplicate-section' | 'orphan-begin' | 'unmapped-preamble' | 'multi-heading-region' | 'omitted-items-retained' | 'unterminated-fence'} type
+ * @property {string} [name] — section name (for duplicate-section and orphan-begin)
+ */
+
+/**
+ * Parse a peer-card body into hand-owned and AI-managed sections.
+ *
+ * Behaviour
+ * ─────────
+ *  • Text before the first BEGIN sentinel becomes a `hand` section.
+ *  • Each well-formed BEGIN..END pair becomes a `managed` section. The `content` field
+ *    excludes the sentinel comments themselves (so re-serialising wraps them back on).
+ *  • An orphan BEGIN (no matching END) collapses the BEGIN sentinel and all remaining
+ *    text into a single `hand` section — defensive: we never silently drop user text.
+ *    Caller should detect this via the absence of the expected managed section in the
+ *    parse result, OR via the `mergePeerCard` `conflicts[]` (which checks structure).
+ *  • Trailing text after the last END becomes a `hand` section.
+ *
+ * @param {string} body
+ * @returns {{ sections: Section[] }}
+ */
+function parseSections(body) {
+  if (typeof body !== 'string') {
+    throw new Error(`parseSections: body must be string (got ${typeof body}).`);
+  }
+
+  const sections = [];
+  const text = body;
+  let cursor = 0;
+
+  // Reset regex state (global regex carries lastIndex across calls)
+  SENTINEL_BEGIN_RE.lastIndex = 0;
+  const beginMatches = [...text.matchAll(SENTINEL_BEGIN_RE)];
+
+  for (const beginMatch of beginMatches) {
+    const sectionName = beginMatch[1];
+    const beginStart = beginMatch.index;
+
+    // If a previous orphan-BEGIN already consumed to EOF, skip remaining matches
+    if (beginStart < cursor) continue;
+
+    const beginEnd = beginStart + beginMatch[0].length;
+
+    // Hand region BEFORE this BEGIN
+    if (cursor < beginStart) {
+      sections.push({
+        type: 'hand',
+        content: text.slice(cursor, beginStart),
+        startIdx: cursor,
+        endIdx: beginStart,
+      });
+    }
+
+    // Find matching END (constructed per-section so names match exactly)
+    const endRegex = new RegExp(`<!--\\s*END\\s+MANAGED:\\s*${escapeRegex(sectionName)}\\s*-->`);
+    const endRest = text.slice(beginEnd);
+    const endMatch = endRest.match(endRegex);
+
+    if (!endMatch) {
+      // Orphan BEGIN — defensive: treat the BEGIN sentinel + rest of file as hand
+      sections.push({
+        type: 'hand',
+        content: text.slice(beginStart),
+        startIdx: beginStart,
+        endIdx: text.length,
+      });
+      cursor = text.length;
+      break;
+    }
+
+    const endStart = beginEnd + endMatch.index;
+    const endEnd = endStart + endMatch[0].length;
+
+    sections.push({
+      type: 'managed',
+      name: sectionName,
+      content: text.slice(beginEnd, endStart),
+      startIdx: beginStart,
+      endIdx: endEnd,
+    });
+    cursor = endEnd;
+  }
+
+  // Trailing hand region
+  if (cursor < text.length) {
+    sections.push({
+      type: 'hand',
+      content: text.slice(cursor),
+      startIdx: cursor,
+      endIdx: text.length,
+    });
+  }
+
+  return { sections };
+}
+
+/**
+ * Serialize sections back to a body string, wrapping managed regions in sentinels.
+ *
+ * @param {Section[]} sections
+ * @returns {string}
+ */
+function serializeSections(sections) {
+  if (!Array.isArray(sections)) {
+    throw new Error(`serializeSections: sections must be array (got ${typeof sections}).`);
+  }
+
+  let out = '';
+  for (const s of sections) {
+    if (s.type === 'hand') {
+      out += s.content;
+    } else if (s.type === 'managed') {
+      out += `<!-- BEGIN MANAGED: ${s.name} -->`;
+      out += s.content;
+      out += `<!-- END MANAGED: ${s.name} -->`;
+    } else {
+      throw new Error(`serializeSections: unknown section type: ${JSON.stringify(s)}`);
+    }
+  }
+  return out;
+}
+
+/**
+ * @typedef {Object} MergeResult
+ * @property {string} body — the merged body
+ * @property {Conflict[]} conflicts — duplicate-section / orphan-begin issues for caller review
+ * @property {{ preserved: number, replaced: number, appended: number }} stats
+ */
+
+/**
+ * Merge a dialectic-derived update into an existing peer-card body.
+ *
+ * Semantics
+ * ─────────
+ *  • Hand-owned sections (outside sentinels): PRESERVED verbatim.
+ *  • Managed sections matching `managedUpdates` keys: REPLACED with new content.
+ *  • Managed sections in `managedUpdates` not in existing: APPENDED at end.
+ *  • Managed sections in existing not in `managedUpdates`: KEPT (no auto-delete).
+ *  • Idempotency: `mergePeerCard(body, {})` returns a body byte-equivalent to `body`
+ *    (round-trip through parse/serialize, which preserves sentinel form).
+ *
+ * Conflicts
+ * ─────────
+ *  • `duplicate-section` — same managed section name appears more than once in the
+ *    existing body. We replace ALL occurrences with the update content (or keep all
+ *    as-is if no update) but surface the conflict so the caller can resolve.
+ *  • `orphan-begin` — BEGIN without matching END. Detected by re-parsing the merged
+ *    body and comparing sentinel structure.
+ *
+ * @param {string} existingBody — the on-disk body (with sentinels)
+ * @param {Record<string, string>} managedUpdates — `{ <section-name>: <new-content> }`
+ * @returns {MergeResult}
+ */
+export function mergePeerCard(existingBody, managedUpdates) {
+  if (typeof existingBody !== 'string') {
+    throw new Error(`mergePeerCard: existingBody must be string (got ${typeof existingBody}).`);
+  }
+  if (!managedUpdates || typeof managedUpdates !== 'object' || Array.isArray(managedUpdates)) {
+    throw new Error('mergePeerCard: managedUpdates must be a plain object.');
+  }
+
+  // Validate update keys against section-name grammar
+  for (const name of Object.keys(managedUpdates)) {
+    if (!/^[\w-]+$/.test(name)) {
+      throw new Error(`mergePeerCard: invalid section name "${name}" (allowed: [A-Za-z0-9_-]+).`);
+    }
+    if (typeof managedUpdates[name] !== 'string') {
+      throw new Error(`mergePeerCard: managedUpdates["${name}"] must be a string.`);
+    }
+  }
+
+  const { sections } = parseSections(existingBody);
+  const conflicts = [];
+  const stats = { preserved: 0, replaced: 0, appended: 0 };
+
+  // Detect orphan-begin: a BEGIN sentinel was found but no matching END (the parser
+  // collapsed it into a hand section). We re-scan the original text for BEGIN names
+  // whose presence in the parsed managed sections is missing — those are orphans.
+  const parsedManagedNames = new Set();
+  const seenForDuplicate = new Set();
+  for (const s of sections) {
+    if (s.type === 'managed') {
+      parsedManagedNames.add(s.name);
+      if (seenForDuplicate.has(s.name)) {
+        conflicts.push({ type: 'duplicate-section', name: s.name });
+      } else {
+        seenForDuplicate.add(s.name);
+      }
+    }
+  }
+
+  SENTINEL_BEGIN_RE.lastIndex = 0;
+  const allBeginNames = [...existingBody.matchAll(SENTINEL_BEGIN_RE)].map(m => m[1]);
+  const reportedOrphans = new Set();
+  for (const name of allBeginNames) {
+    if (!parsedManagedNames.has(name) && !reportedOrphans.has(name)) {
+      conflicts.push({ type: 'orphan-begin', name });
+      reportedOrphans.add(name);
+    }
+  }
+
+  // Apply updates: replace managed sections whose names match, preserve others
+  const updatedSections = sections.map(s => {
+    if (s.type === 'hand') {
+      stats.preserved++;
+      return s;
+    }
+    // s.type === 'managed'
+    if (Object.prototype.hasOwnProperty.call(managedUpdates, s.name)) {
+      stats.replaced++;
+      return { ...s, content: wrapManagedContent(managedUpdates[s.name]) };
+    }
+    // Managed section not in updates — keep as-is
+    return s;
+  });
+
+  // Append new managed sections from updates that didn't exist in original.
+  // Each one starts on its own line: a managed section ends on its END sentinel
+  // and a body may end without a newline, so a separator goes in unless the
+  // text before already ends with one (an empty body needs none).
+  for (const name of Object.keys(managedUpdates)) {
+    if (!parsedManagedNames.has(name)) {
+      stats.appended++;
+      const last = updatedSections[updatedSections.length - 1];
+      if (last && !(last.type === 'hand' && last.content.endsWith('\n'))) {
+        updatedSections.push({ type: 'hand', content: '\n', startIdx: -1, endIdx: -1 });
+      }
+      updatedSections.push({
+        type: 'managed',
+        name,
+        content: wrapManagedContent(managedUpdates[name]),
+        startIdx: -1,
+        endIdx: -1,
+      });
+    }
+  }
+
+  return {
+    body: serializeSections(updatedSections),
+    conflicts,
+    stats,
+  };
+}
+
+// ── helpers ──────────────────────────────────────────────────────────────────
+
+/**
+ * Normalise managed content so the serialised form always reads:
+ *   <!-- BEGIN MANAGED: x -->\n<content>\n<!-- END MANAGED: x -->
+ * Trimming + adding newlines keeps managed regions visually distinct from sentinels.
+ * Only leading BLANK lines are removed: the first line's indentation is meaning
+ * (an indented list item sets its children's content offset, #1816).
+ * @param {string} raw
+ * @returns {string}
+ */
+function wrapManagedContent(raw) {
+  return '\n' + trimBlockEdges(raw) + '\n';
+}
+
+/** Drop leading blank lines and trailing whitespace, keeping the first line's indentation. */
+function trimBlockEdges(raw) {
+  return raw.replace(/^(?:[ \t]*\r?\n)+/, '').trimEnd();
+}
+
+/**
+ * Escape regex metacharacters in a section name. The grammar `[\w-]+` excludes most
+ * metacharacters, but defence-in-depth is cheap here.
+ * @param {string} s
+ * @returns {string}
+ */
+function escapeRegex(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+// ── body-string → section-map adapter (#1310) ────────────────────────────────
+//
+// The seam this closes: `dialectic-deriver` (agents/dialectic-deriver.md § Output
+// format) emits ONE FULL PEER-CARD BODY STRING per target, while `mergePeerCard`
+// above consumes a SECTION MAP keyed by sentinel name. Nothing translated between
+// the two, so `/evolve dialectic --apply` could not complete (#1310, correcting
+// #1303 point 3 — the signatures line up, the seam did not).
+//
+// The mapping is DERIVED, not invented: a managed region wrapping exactly one
+// `## ` heading makes that heading the section unit. A region wrapping SEVERAL
+// headings cannot be addressed per heading without splitting the region (a
+// storage-format change), so it is fail-closed (#1380): `deriveManagedUpdates`
+// never targets it, and every proposed heading that lives inside it is skipped
+// — neither replaced (which would delete its sibling headings' hand text) nor
+// appended (which would duplicate the heading) — and reported as a
+// `multi-heading-region` conflict by `mergeDerivedBody`. Existing
+// names are read back out of the card rather than re-slugified, because the live
+// names are NOT a pure function of their headings — measured 2026-09-11 in
+// `.orchestrator/peers/AGENT.md`: "Guard and protocol-migration discipline" →
+// `guard-and-protocol-migration` (drops "discipline") and "Review discipline — the
+// refutation mandate" → `review-discipline-refutation-mandate` (drops "the").
+// Re-slugifying either would APPEND a duplicate section instead of replacing it.
+
+const H2_RE = /^##[ \t]+(.+?)[ \t]*$/gm;
+
+/** Normalise a heading for matching: case- and whitespace-insensitive. */
+function headingKey(heading) {
+  return heading.trim().toLowerCase().replace(/\s+/g, ' ');
+}
+
+/**
+ * Slugify a heading into a section name matching the `[\w-]+` grammar.
+ * Only used for headings with NO existing managed section (the append path).
+ * @param {string} heading
+ * @returns {string}
+ */
+function slugifyHeading(heading) {
+  const slug = heading
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  return slug.length > 0 ? slug : 'section';
+}
+
+/**
+ * Split a proposed full-body string into `{ <section-name>: <content> }`, reusing
+ * the existing card's section names wherever the heading already has a home.
+ *
+ * Behaviour for every input class (no case is silently dropped):
+ *  • Heading whose text matches an existing managed section's own `## ` heading →
+ *    mapped to that section's EXISTING name (`origin: 'existing'`) → REPLACE.
+ *  • Heading with no existing section → slugified name (`origin: 'new'`) →
+ *    APPEND. Collisions get a `-2`, `-3`, … suffix.
+ *  • Text BEFORE the first `## ` heading → returned as `preamble`. It is NOT
+ *    written into any section (it has no sentinel to own it); `mergeDerivedBody`
+ *    surfaces it as an `unmapped-preamble` conflict so a caller cannot miss it.
+ *  • Heading that lives inside an existing managed region wrapping MORE than one
+ *    `## ` heading → SKIPPED (not in `managedUpdates`, not in `mapping`) and
+ *    listed in `skippedRegions`; that region is never a target (#1380).
+ *  • Content under `###`+ headings stays inside its parent `##` section.
+ *  • A proposed body that already carries BEGIN/END sentinels keeps them inside
+ *    the section content — it is the deriver's job not to emit them (see
+ *    `agents/dialectic-deriver.md` § Anti-patterns).
+ *
+ * Pure function — no IO, deterministic.
+ *
+ * @param {string} proposedBody — the deriver's full replacement body for one target
+ * @param {string} [existingBody] — the on-disk body, for existing-name lookup
+ * @returns {{ managedUpdates: Record<string,string>,
+ *             mapping: Array<{heading: string, section: string, origin: 'existing'|'new'}>,
+ *             preamble: string,
+ *             skippedRegions: Array<{region: string, headings: string[], skipped: string[]}> }}
+ */
+export function deriveManagedUpdates(proposedBody, existingBody = '') {
+  if (typeof proposedBody !== 'string') {
+    throw new Error(`deriveManagedUpdates: proposedBody must be string (got ${typeof proposedBody}).`);
+  }
+  if (typeof existingBody !== 'string') {
+    throw new Error(`deriveManagedUpdates: existingBody must be string (got ${typeof existingBody}).`);
+  }
+
+  // heading-key → existing section name, read out of the live card
+  const existingByHeading = new Map();
+  const existingNames = new Set();
+  // Fail-closed bookkeeping for regions wrapping more than one `## ` heading (#1380).
+  /** @type {Map<string, {region: string, headings: string[], skipped: string[]}>} */
+  const multiHeading = new Map();
+  const multiHeadingByKey = new Map();
+  if (existingBody.length > 0) {
+    for (const s of parseSections(existingBody).sections) {
+      if (s.type !== 'managed') continue;
+      existingNames.add(s.name);
+      H2_RE.lastIndex = 0;
+      const regionHeads = [...s.content.matchAll(H2_RE)].map(h => h[1]);
+      if (regionHeads.length > 1) {
+        const entry = multiHeading.get(s.name) ?? { region: s.name, headings: [], skipped: [] };
+        entry.headings.push(...regionHeads);
+        multiHeading.set(s.name, entry);
+        for (const h of regionHeads) multiHeadingByKey.set(headingKey(h), entry);
+        continue;
+      }
+      if (regionHeads.length === 1 && !existingByHeading.has(headingKey(regionHeads[0]))) {
+        existingByHeading.set(headingKey(regionHeads[0]), s.name);
+      }
+    }
+  }
+
+  H2_RE.lastIndex = 0;
+  const heads = [...proposedBody.matchAll(H2_RE)];
+  const preamble = (heads.length > 0 ? proposedBody.slice(0, heads[0].index) : proposedBody).trim();
+
+  /** @type {Record<string,string>} */
+  const managedUpdates = {};
+  const mapping = [];
+  const used = new Set();
+
+  for (let i = 0; i < heads.length; i++) {
+    const heading = heads[i][1];
+    const start = heads[i].index;
+    const end = i + 1 < heads.length ? heads[i + 1].index : proposedBody.length;
+    const content = proposedBody.slice(start, end).trim();
+
+    const blocked = multiHeadingByKey.get(headingKey(heading));
+    if (blocked !== undefined) {
+      blocked.skipped.push(heading);
+      continue;
+    }
+
+    const existing = existingByHeading.get(headingKey(heading));
+    let section;
+    let origin;
+    if (existing !== undefined && !used.has(existing)) {
+      section = existing;
+      origin = 'existing';
+    } else {
+      const base = slugifyHeading(heading);
+      let candidate = base;
+      let n = 2;
+      // A multi-heading region is never a target — not even via a slug that
+      // happens to equal its name.
+      while (used.has(candidate) || multiHeading.has(candidate)) {
+        candidate = `${base}-${n++}`;
+      }
+      section = candidate;
+      origin = existingNames.has(candidate) ? 'existing' : 'new';
+    }
+
+    used.add(section);
+    managedUpdates[section] = content;
+    mapping.push({ heading, section, origin });
+  }
+
+  const skippedRegions = [...multiHeading.values()].filter(e => e.skipped.length > 0);
+  return { managedUpdates, mapping, preamble, skippedRegions };
+}
+
+// These units implement the retention contract, not a full Markdown parser.
+// Revisit if peer cards require Markdown constructs beyond lists, paragraphs,
+// ATX headings and backtick/tilde fences (e.g. setext headings or HTML blocks).
+const LIST_ITEM_RE = /^( {0,3})(?:[-*+]|\d+[.)])[ \t]+/;
+const HEADING_RE = /^ {0,3}#{1,6}[ \t]+/;
+const FENCE_RE = /^[ \t]*(`{3,}|~{3,})/;
+// Written to end a retained list before an indented unit (#1813 F2); structure, never a point.
+const LIST_BREAK = '<!-- -->';
+
+/** Split section content into comparison units, excluding its leading H2. */
+function sectionUnits(content) {
+  const lines = content.replace(/\r\n?/g, '\n').split('\n');
+  const units = [];
+  // Return the first line after a fence and whether a closing line was found.
+  const consumeFence = (start, fence) => {
+    const close = new RegExp(`^[ \\t]*${fence[1][0]}{${fence[1].length},}[ \\t]*$`);
+    let end = start + 1;
+    while (end < lines.length && !close.test(lines[end])) end++;
+    return { end: end < lines.length ? end + 1 : end, closed: end < lines.length };
+  };
+  const indentation = line => [...line.match(/^[ \t]*/)[0]]
+    .reduce((column, char) => column + (char === '\t' ? 4 - column % 4 : 1), 0);
+  const dedent = (line, columns) => {
+    let end = 0;
+    let column = 0;
+    while (column < columns && (line[end] === ' ' || line[end] === '\t')) {
+      column += line[end++] === '\t' ? 4 - column % 4 : 1;
+    }
+    return ' '.repeat(Math.max(0, column - columns)) + line.slice(end);
+  };
+  let i = 0;
+  while (i < lines.length && !lines[i].trim()) i++;
+  if (/^##[ \t]+/.test(lines[i] ?? '')) i++;
+  while (i < lines.length) {
+    if (!lines[i].trim()) { i++; continue; }
+    const start = i;
+    const fence = lines[i].match(FENCE_RE);
+    const marker = lines[i].match(LIST_ITEM_RE);
+    const list = marker !== null;
+    let unterminatedFence = false;
+    i++;
+    if (fence) {
+      const consumed = consumeFence(start, fence);
+      i = consumed.end;
+      unterminatedFence = !consumed.closed;
+    } else if (!HEADING_RE.test(lines[start])) {
+      while (i < lines.length) {
+        const line = lines[i];
+        if (!line.trim()) {
+          let next = i + 1;
+          while (next < lines.length && !lines[next].trim()) next++;
+          if (!list || next === lines.length || indentation(lines[next]) <= marker[1].length) break;
+          i = next;
+          continue;
+        }
+        const child = list && indentation(line) > marker[1].length;
+        const nestedFence = line.match(FENCE_RE);
+        if (child && nestedFence) {
+          const consumed = consumeFence(i, nestedFence);
+          i = consumed.end;
+          unterminatedFence ||= !consumed.closed;
+          continue;
+        }
+        if (!child && (LIST_ITEM_RE.test(line) || HEADING_RE.test(line) || nestedFence)) break;
+        i++;
+      }
+    }
+    // Keep source indentation; only trailing blank lines are outside a unit.
+    let end = i;
+    while (end > start && !lines[end - 1].trim()) end--;
+    const text = lines.slice(start, end).join('\n');
+    let appendText = text;
+    if (list && marker[1].length > 0) {
+      let fenceIndent = null;
+      let closeFence;
+      appendText = text.split('\n').map(line => {
+        if (fenceIndent !== null) {
+          // Move the fence's container prefix, preserving tabs in its code payload.
+          const shifted = ' '.repeat(Math.max(0, fenceIndent - marker[1].length)) + dedent(line, fenceIndent);
+          if (closeFence.test(line)) fenceIndent = null;
+          return shifted;
+        }
+        const fence = line.match(FENCE_RE);
+        if (fence) {
+          fenceIndent = indentation(line);
+          closeFence = new RegExp(`^[ \\t]*${fence[1][0]}{${fence[1].length},}[ \\t]*$`);
+          return ' '.repeat(Math.max(0, fenceIndent - marker[1].length)) + line.trimStart();
+        }
+        // Outside a fence, re-expand all leading whitespace: a partial dedent would
+        // leave a second tab that jumps to another tab stop and turns code into prose.
+        return ' '.repeat(Math.max(0, indentation(line) - marker[1].length)) + line.replace(/^[ \t]*/, '');
+      }).join('\n');
+    }
+    const key = unitKey(appendText);
+    units.push({ text, appendText, key, list, unterminatedFence });
+  }
+  return units;
+}
+
+/** Collapse prose whitespace while preserving every fenced span, including list children. */
+function unitKey(text) {
+  const parts = [];
+  let prose = [];
+  let code = null;
+  let close;
+  for (const line of text.split('\n')) {
+    if (code !== null) {
+      code.push(line.trimEnd());
+      if (close.test(line)) {
+        parts.push(['fence', code.join('\n')]);
+        code = null;
+      }
+      continue;
+    }
+    const fence = line.match(FENCE_RE);
+    if (fence) {
+      parts.push(['prose', prose.join('\n').replace(/\s+/g, ' ').trim()]);
+      prose = [];
+      code = [line.trimEnd()];
+      close = new RegExp(`^[ \t]*${fence[1][0]}{${fence[1].length},}[ \t]*$`);
+    } else {
+      prose.push(line);
+    }
+  }
+  if (code !== null) parts.push(['fence', code.join('\n')]);
+  parts.push(['prose', prose.join('\n').replace(/\s+/g, ' ').trim()]);
+  // BV-004: lightweight units do not implement full CommonMark container rules
+  // (e.g. blockquotes, marker-width continuation or inline list-opening fences).
+  // Revisit with a Markdown parser when peer cards require those constructs.
+  return JSON.stringify(parts);
+}
+
+/**
+ * Merge a deriver-shaped FULL BODY STRING into an existing peer-card body.
+ * This is the function `/evolve dialectic --apply` calls; `mergePeerCard` stays
+ * the section-map primitive its existing callers already use.
+ *
+ * A managed region wrapping several `## ` headings is left byte-unchanged; each
+ * skipped proposed heading surfaces as a
+ * `{ type: 'multi-heading-region', region, headings, skipped }` conflict (#1380).
+ * Omitted units in an existing region are retained, with new units appended and
+ * an `omitted-items-retained` conflict listing the omissions. Explicitly naming
+ * the region in `confirmDrops` permits replacement with fewer units (#1810).
+ *
+ * @param {string} existingBody
+ * @param {string} proposedBody
+ * @param {{ confirmDrops?: string[] }} [options] — section names permitting omitted units
+ * @returns {MergeResult & { mapping: Array<{heading: string, section: string, origin: 'existing'|'new'}>, preamble: string }}
+ */
+export function mergeDerivedBody(existingBody, proposedBody, { confirmDrops = [] } = {}) {
+  if (!Array.isArray(confirmDrops)) {
+    throw new Error('mergeDerivedBody: confirmDrops must be an array of section names.');
+  }
+  for (const name of confirmDrops) {
+    if (typeof name !== 'string' || !/^[A-Za-z0-9_-]+$/.test(name)) {
+      throw new Error('mergeDerivedBody: invalid section name in confirmDrops (allowed: [A-Za-z0-9_-]+).');
+    }
+  }
+  const { managedUpdates, mapping, preamble, skippedRegions } = deriveManagedUpdates(proposedBody, existingBody);
+  const existingSections = parseSections(existingBody).sections.filter(s => s.type === 'managed');
+  const retainedConflicts = [];
+  for (const { section, heading, origin } of mapping) {
+    if (origin === 'new' || confirmDrops.includes(section)) continue;
+    const occurrences = existingSections.filter(s => s.name === section);
+    if (occurrences.length === 0) continue;
+    const existingUnits = occurrences.flatMap(s => sectionUnits(s.content));
+    const proposedUnits = sectionUnits(managedUpdates[section]);
+    const proposedKeys = new Set(proposedUnits.map(u => u.key));
+    const dropped = [];
+    const droppedKeys = new Set();
+    for (const unit of existingUnits) {
+      if (proposedKeys.has(unit.key) || droppedKeys.has(unit.key)) continue;
+      if (unit.text.trim() === LIST_BREAK) continue;
+      dropped.push(unit);
+      droppedKeys.add(unit.key);
+    }
+    if (dropped.length === 0) continue;
+    if (existingUnits.some(unit => unit.unterminatedFence)) {
+      delete managedUpdates[section];
+      retainedConflicts.push({ type: 'unterminated-fence', region: section, heading });
+      continue;
+    }
+
+    let content = trimBlockEdges(occurrences[0].content);
+    const firstUnits = sectionUnits(occurrences[0].content);
+    const writtenKeys = new Set(firstUnits.map(u => u.key));
+    let previous = firstUnits.at(-1);
+    // Retain invariant: every existing unit key appears in the written section.
+    const laterUnits = occurrences.slice(1).flatMap(s => sectionUnits(s.content));
+    for (const unit of [...laterUnits, ...proposedUnits]) {
+      if (writtenKeys.has(unit.key)) continue;
+      let separator = '\n\n';
+      if (previous?.list && unit.list) separator = '\n';
+      // An indented standalone unit after a list would re-parse as the item's
+      // child on the next run; a blank HTML comment ends the list first (the
+      // separator CommonMark itself names for a list before an indented block).
+      else if (previous?.list && /^[ \t]/.test(unit.appendText)) separator = `\n\n${LIST_BREAK}\n\n`;
+      content += separator + unit.appendText;
+      writtenKeys.add(unit.key);
+      previous = unit;
+    }
+    managedUpdates[section] = content;
+    retainedConflicts.push({ type: 'omitted-items-retained', region: section, heading, items: dropped.map(u => u.text) });
+  }
+  const result = mergePeerCard(existingBody, managedUpdates);
+  result.conflicts.push(...retainedConflicts);
+  for (const { region, headings, skipped } of skippedRegions) {
+    result.conflicts.push({ type: 'multi-heading-region', region, headings, skipped });
+  }
+  if (preamble.length > 0) {
+    result.conflicts.push({ type: 'unmapped-preamble', content: preamble });
+  }
+  return { ...result, mapping, preamble };
+}

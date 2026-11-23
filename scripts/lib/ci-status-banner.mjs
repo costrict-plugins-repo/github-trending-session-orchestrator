@@ -1,0 +1,1736 @@
+/**
+ * ci-status-banner.mjs — #369
+ * Checks CI status for the current HEAD commit and returns a structured
+ * result for session-start Phase 4 banner rendering.
+ *
+ * Plain-JS — no Zod dependency. Never throws.
+ *
+ * THREE return states (#1031), not two:
+ *   - `null`                     — read, and there is nothing to report (a
+ *                                  benign ABSENCE: no VCS remote, no pipeline
+ *                                  worth a banner, green with no soft failures)
+ *   - `{status, ok, details, …}` — a real CI reading (`green` | `red` |
+ *                                  `unknown`)
+ *   - `{severity, message, degraded, ok:false}` — the state could NOT be read.
+ *     `degraded` is a member of the frozen {@link DEGRADED_REASONS} enum
+ *     exported below. This must NEVER be read as "CI is green".
+ *
+ * Until #1031 every unreadable state collapsed onto `null`, which in the banner
+ * contract reads as all-clear — the exact confusion #1022 (`gh repo view -R` →
+ * `unknown shorthand flag`) hid behind on every GitHub repo. The shape is the
+ * one `scripts/lib/mirror-issues-banner.mjs` established.
+ *
+ * Supports GitLab (via glab) and GitHub (via gh).
+ * VCS is auto-detected from the repo's git remotes via
+ * `vcs-repo-spec.mjs`'s `detectVcsFamily` — NOT from a hard-coded `origin`
+ * lookup, which left the banner structurally dark in every repo whose remotes
+ * are named `gitlab`/`github` (#1039).
+ */
+
+import { promisify } from 'node:util';
+import {
+  resolveRepoSpec,
+  resolveRepoHost,
+  resolveGitlabProjectTarget,
+  redactUrlCredentials,
+  detectVcsFamily,
+  isQueryFailure,
+  readConfiguredVcs,
+} from './vcs-repo-spec.mjs';
+import { hookProgram } from './program-lookup.mjs';
+import { execFile as _execFile } from './native-command.mjs';
+
+const runFile = promisify(_execFile);
+const execFileAsync = (cmd, args, options) => runFile(hookProgram(cmd, options.cwd), args, options);
+
+/** Default timeout in milliseconds for CLI invocations. */
+export const DEFAULT_TIMEOUT_MS = 8000;
+
+/**
+ * Closed set of `degraded` reasons (#1031). A degraded result means "the CI
+ * state was NOT successfully read" — never "CI is green".
+ *
+ * Deliberately THIS module's own enum rather than a merged one shared with
+ * `mirror-issues-banner.mjs` / `git-config-drift.mjs`: those two already carry
+ * DIFFERENT member sets for their own failure surfaces, and a merged superset
+ * would hand every consumer members its probe can never emit — an enum whose
+ * members are not exhaustively reachable cannot be switched on exhaustively,
+ * which is the only reason to freeze one. The members here are exactly what
+ * this probe can fail at:
+ *
+ *   - `cli-missing`  a required binary (`git`, `glab`, `gh`) is not on PATH.
+ *   - `timeout`      a subprocess outlived its budget. Not silent since #1031:
+ *                    a hang is not actionable, but "state unknown" IS the
+ *                    finding, and silence renders identically to green.
+ *   - `parse-error`  a CLI answered with output this module could not read
+ *                    (unparseable JSON, or valid JSON of the wrong shape).
+ *   - `query-failed` residual bucket — a present CLI ran and rejected the
+ *                    invocation, or a resolvable remote whose API target could
+ *                    not be derived. Folding these into `parse-error` would
+ *                    mislabel a rejected flag as malformed output.
+ *   - `git-error`    the VCS probe itself failed (`git remote -v` non-zero for
+ *                    a reason other than "not a work tree"). Distinct from
+ *                    `query-failed` because it means the module never got as
+ *                    far as choosing a CI platform.
+ *
+ * @type {readonly ['cli-missing','timeout','parse-error','query-failed','git-error']}
+ */
+export const DEGRADED_REASONS = Object.freeze([
+  'cli-missing',
+  'timeout',
+  'parse-error',
+  'query-failed',
+  'git-error',
+]);
+
+/**
+ * Build the third return state. Distinct from `null` on purpose: `null` in the
+ * banner contract reads as "all clear", which a failed read has NOT
+ * established.
+ *
+ * The `detail` is appended bounded (BV-004: 200 chars — long enough for a
+ * `Command failed: <argv>` first line, short enough not to bury the
+ * session-start banner it prints beside; revisit if a CLI starts emitting a
+ * diagnostic that needs more). Callers pass ALREADY-redacted text — every
+ * source here is either a fixed string or a `redactUrlCredentials` result.
+ *
+ * @param {'cli-missing'|'timeout'|'parse-error'|'query-failed'|'git-error'} reason
+ * @param {string} [detail]  Optional, already-redacted diagnostic tail
+ * @returns {{ severity: 'warn', ok: false, message: string, degraded: string }}
+ */
+function degradedResult(reason, detail) {
+  // Redaction (the callers' job) and control-byte escaping are DIFFERENT
+  // protections: `redactUrlCredentials` removes secrets, it does not neutralise
+  // ANSI/CR. `parseCliJson` already escapes the text it embeds (see the call at
+  // the JSON.parse catch), but the degraded tail reaches the operator's terminal
+  // by a second route — a CLI stderr quoted into `err.message` — and skipped it.
+  // Escape here so BOTH routes are covered at their common exit. Slice first,
+  // escape after: the budget is 200 chars of DETAIL, and escaping cannot then
+  // leave a cut mid-`\uXXXX`.
+  const escaped = detail ? escapeControlBytes(String(detail).trim().slice(0, 200)) : '';
+  const tail = escaped ? ` — ${escaped}` : '';
+  return {
+    severity: 'warn',
+    ok: false,
+    message:
+      `⚠ ci-status: CI status for HEAD could not be determined (${reason}) — ` +
+      `state UNKNOWN, not "green".${tail}`,
+    degraded: reason,
+    // The SAME already-clamped, already-escaped tail, carried as a field rather
+    // than only inside the banner sentence. Consumers that render their own row
+    // (the release preflight's `ci-green-on-head`) otherwise had to discard the
+    // only distinguishing part: a short sha, an unknown commit and a missing
+    // pipeline all printed the identical `CI status unknown (query-failed)`.
+    // Absent when there is no detail, so `ci.detail` stays falsy exactly where
+    // there is nothing to add.
+    ...(escaped ? { detail: escaped } : {}),
+  };
+}
+
+/**
+ * Wraps execFile with a per-call timeout race.
+ *
+ * @param {string} cmd
+ * @param {string[]} args
+ * @param {{ cwd?: string, timeoutMs?: number, execFile?: Function }} opts
+ * @returns {Promise<{ stdout: string, stderr: string }>}
+ */
+async function execWithTimeout(cmd, args, opts = {}) {
+  const { cwd, timeoutMs = DEFAULT_TIMEOUT_MS, execFile = execFileAsync } = opts;
+  return Promise.race([
+    execFile(cmd, args, { cwd, env: process.env }),
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error('timeout')), timeoutMs),
+    ),
+  ]);
+}
+
+/** C0 controls plus DEL — matching them is the POINT, hence the disable. */
+// eslint-disable-next-line no-control-regex
+const CONTROL_BYTE_RE = /[\u0000-\u001f\u007f]/g;
+
+/**
+ * Replace every C0/DEL control byte with its printable `\uXXXX` escape.
+ *
+ * `JSON.stringify` covers the payload preview, but NOT `SyntaxError.message` —
+ * V8 quotes the offending input INTO that message verbatim, so an ANSI/CR
+ * payload reached the operator's terminal through the error text even after
+ * the preview was escaped. Both halves go through here.
+ *
+ * @param {unknown} text
+ * @returns {string}
+ */
+function escapeControlBytes(text) {
+  return String(text).replace(
+    CONTROL_BYTE_RE,
+    (ch) => `\\u${ch.charCodeAt(0).toString(16).padStart(4, '0')}`,
+  );
+}
+
+/**
+ * Ceiling (BV-004) for one API-supplied fragment embedded in a reading's
+ * operator-facing fields. 60 characters fits every real GitLab pipeline status
+ * and every CI job name this repo has ever produced (`test (macos-latest)` is
+ * 20), and keeps the release-preflight row on one line. Revisit if a platform
+ * starts emitting job names that need more.
+ */
+const API_TEXT_MAX = 60;
+
+/**
+ * Clamp AND control-byte-escape a string that came from a CI platform's API
+ * before it is interpolated into a reading (`details.reason`,
+ * `failingJobName`, `allowFailureJobs`).
+ *
+ * The degraded branch has done this since #1031 ({@link degradedResult}); the
+ * READ branch had not, so a pipeline `status` or job `name` reached the
+ * operator's terminal verbatim — including
+ * `scripts/release.mjs`'s `ci-green-on-head` row, the one line that decides
+ * whether a release proceeds. A status shaped `x\r\u001b[32m✓ ... PASS`
+ * repainted that row green while the row's own verdict stayed `ok:false`.
+ *
+ * Escaped at GENERATION, not at each render: there are four renderers
+ * (session-start banner, release preflight × 2, session-start probes) and only
+ * one producer, so the invariant "a reading carries no raw control bytes"
+ * belongs here. Slice first, escape after — the budget is 60 chars of API
+ * TEXT, and escaping afterwards cannot leave a cut mid-`\uXXXX`.
+ *
+ * @param {unknown} value
+ * @returns {string}
+ */
+function sanitizeApiText(value) {
+  return escapeControlBytes(String(value ?? '').trim().slice(0, API_TEXT_MAX));
+}
+
+/**
+ * Name a parsed JSON value's type WITHOUT quoting any of its content.
+ *
+ * @param {unknown} value
+ * @returns {'null'|'array'|'object'|'string'|'number'|'boolean'|'undefined'}
+ */
+function jsonTypeOf(value) {
+  if (value === null) return 'null';
+  if (Array.isArray(value)) return 'array';
+  return /** @type {any} */ (typeof value);
+}
+
+/**
+ * Parse CLI stdout as JSON, degrading an unparseable payload onto this module's
+ * documented failure channel instead of a bare `SyntaxError` (CWE-502).
+ *
+ * The throw IS that channel, not an escape from it: every call site runs under
+ * `checkCiStatus`'s outer catch, whose comment already names "unparseable
+ * output" as a case it converts to `console.warn` + `null`. Measured
+ * 2026-08-28 at 30940cb, BEFORE this helper existed: an HTML login page from
+ * `gh repo view`, a literal `null`, and an empty `glab` stdout ALL already
+ * returned `null` with a warn — nothing crashed, and
+ * `tests/lib/ci-status-banner.test.mjs` § "error containment" pinned it. So
+ * this does not fix a crash — the outer catch already turned non-JSON output
+ * into a warn + `null`. The rule this helper closes is lexical
+ * (`json-parse-untrusted-input`, see below), not a crash it prevents.
+ *
+ * What it does fix is the message. The raw parse error (`Unexpected token
+ * '<'`) named neither the CLI nor the request, and this banner spawns four
+ * different subprocesses — an operator reading that line at session-start
+ * could not tell which one returned garbage, which is the same
+ * "could not read looks like nothing to report" class #1022/#1039 attacked.
+ * Guarding at the parse also satisfies the `json-parse-untrusted-input` rule,
+ * which keys on a LEXICALLY enclosing try/catch and cannot see the outer one.
+ *
+ * Ceiling (BV-004): the payload preview is clamped to 120 characters. An
+ * unbounded one would bury the session-start banner it is printed beside — a
+ * paginated HTML error page is the realistic worst case. Revisit if a CLI
+ * starts emitting a diagnostic that needs more than one line to identify.
+ *
+ * The preview is emitted through `JSON.stringify`, not raw. It comes from a
+ * subprocess whose stdout this module does not control and lands in a
+ * `console.warn` beside the session-start banner: a payload carrying ANSI
+ * escapes, a `\r`, or a bare newline could otherwise repaint or overwrite the
+ * lines around it. `JSON.stringify` escapes every control byte and quotes the
+ * result, so the preview stays exactly one line of printable text.
+ *
+ * `expect` closes the second half of the same gap: valid JSON of the WRONG
+ * SHAPE parsed fine and escaped this named channel entirely. Measured
+ * 2026-08-28 at 7daa3d2 — a `gh repo view` that printed `null` reached
+ * `const { nameWithOwner } = …` and threw a bare
+ * `TypeError: Cannot destructure property 'nameWithOwner' of 'null'`, which
+ * names neither the CLI nor the request; a `glab api …/pipelines` that printed
+ * `null` was swallowed by `!Array.isArray(pipelines) → return null`, silent.
+ * Both now fail as the SAME named error the parse failure produces.
+ *
+ * @param {string} stdout  Raw child-process stdout (untrusted)
+ * @param {string} label   The command that produced it, for the failure message
+ * @param {'object'|'array'} [expect]  Required shape; omit to accept any JSON
+ * @returns {unknown} The parsed value
+ * @throws {Error} Named parse/shape failure carrying a bounded payload preview
+ */
+function parseCliJson(stdout, label, expect) {
+  const raw = String(stdout ?? '');
+  // Bounded (BV-004: 120 chars — a paginated HTML error page is the realistic
+  // worst case) AND escaped, so it can never break the line it is printed on.
+  const preview = raw.trim().slice(0, 120);
+  const shown = preview
+    ? `got: ${escapeControlBytes(JSON.stringify(preview))}`
+    : 'got: (empty stdout)';
+
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    const reason = escapeControlBytes(err instanceof Error ? err.message : String(err));
+    // `cause` preserves the original for a debugger; the reason is ALSO
+    // inlined into the message because the outer catch reads `err.message`
+    // only — a cause-only wrapper would lose it on the operator-facing line.
+    throw tagParseError(new Error(
+      `${label} returned unparseable JSON (${reason}) — ${shown}`,
+      { cause: err },
+    ));
+  }
+
+  // A shape mismatch reports the JSON TYPE, never the payload. The parse
+  // succeeded, so the bytes add nothing an operator can act on — and
+  // `tests/lib/ci-status-banner.test.mjs` § "unexpected benign pipeline
+  // metadata" pins that a well-formed-but-wrong-shaped API body must not have
+  // its contents echoed anywhere. A type name carries no body content.
+  const actual = jsonTypeOf(parsed);
+  if (expect === 'array' && actual !== 'array') {
+    throw tagParseError(new Error(`${label} returned JSON of an unexpected shape — expected an array, got ${actual}`));
+  }
+  if (expect === 'object' && actual !== 'object') {
+    throw tagParseError(new Error(`${label} returned JSON of an unexpected shape — expected an object, got ${actual}`));
+  }
+  return parsed;
+}
+
+/**
+ * Stamp the `parse-error` degraded reason onto an error raised by
+ * {@link parseCliJson}.
+ *
+ * Carried on the error object rather than re-derived from its message text in
+ * the outer catch: a message-substring test would silently reclassify the
+ * moment a wording changes, and the two failures (`unparseable JSON`, wrong
+ * shape) are one class only because THIS function says so.
+ *
+ * @param {Error} err
+ * @returns {Error}
+ */
+function tagParseError(err) {
+  return Object.assign(err, { degradedReason: 'parse-error' });
+}
+
+/**
+ * The one failure this probe can produce that the frozen
+ * `REMOTE_RESOLUTION_REASONS` set has no member for: the async timeout race
+ * every subprocess here runs under has no counterpart in the SYNCHRONOUS
+ * `vcs-repo-spec.mjs` core (it uses `execFileSync`, which cannot time out).
+ *
+ * Deliberately NOT a query-failure for WARNING purposes — a timeout emits no
+ * `console.warn`, matching how `checkCiStatus`'s outer catch has always
+ * treated one, and warning on a hung `git` but not on a hung `glab` would be
+ * an inconsistency inside a single banner.
+ *
+ * It is no longer SILENT, though (#1031). The old argument — "a hang is not a
+ * fact an operator can act on the way 'git is not installed' is" — is
+ * superseded: what the operator acts on is not the hang, it is that CI state
+ * is UNKNOWN, and returning `null` rendered that identically to green. A
+ * timeout therefore yields `degradedResult('timeout')` on both this path and
+ * the outer catch.
+ */
+const PROBE_TIMEOUT = 'probe-timeout';
+
+/**
+ * The ONE `isQueryFailure` member this banner deliberately keeps silent.
+ *
+ * `vcs-repo-spec.mjs` classifies `not-a-git-repo` as a query failure, and that
+ * is correct IN ITS DOMAIN: a remote-resolution helper genuinely could not
+ * enumerate remotes. For THIS consumer the same fact is a benign absence —
+ * session-start Phase 4 asking a non-repo directory about its CI has a complete
+ * and unsurprising answer ("there is no CI here"), and an operator cannot act on
+ * being told their directory is not a git repo. Warning would print on every
+ * such session-start and train exactly the reflex that makes the
+ * `git-unavailable` / `git-error` lines worthless.
+ *
+ * Expressed as a SUBTRACTION from `isQueryFailure` rather than as a hard-coded
+ * warn-list, so a reason added to the frozen set upstream is warned by default
+ * (fail-toward-visible) instead of silently inheriting the benign path.
+ *
+ * @type {ReadonlySet<string>}
+ */
+const SILENT_QUERY_FAILURES = new Set(['not-a-git-repo']);
+
+/**
+ * Project a `REMOTE_RESOLUTION_REASONS` query failure onto this module's own
+ * {@link DEGRADED_REASONS} member.
+ *
+ * Written as explicit branches rather than a lookup table so that EVERY reason
+ * literal this module can emit sits inside a literal call to the builder
+ * call — which is what makes the enum-membership census in
+ * `tests/lib/ci-status-banner.test.mjs` a regex over the source instead of a
+ * hand-typed list that drifts.
+ *
+ * The fallthrough is `query-failed`, not a throw: a reason added to the frozen
+ * upstream set must degrade visibly (fail-toward-visible), never crash the
+ * probe or slip back onto the silent path.
+ *
+ * @param {string} reason
+ * @param {string} [detail]  Already-redacted git stderr
+ * @returns {{ severity: 'warn', ok: false, message: string, degraded: string }}
+ */
+function degradedForVcsReason(reason, detail) {
+  // git itself is a CLI, and "not on PATH" is the same fact for it as for
+  // glab/gh — one member, not two spellings of it.
+  if (reason === 'git-unavailable') return degradedResult('cli-missing', detail);
+  if (reason === 'git-error') return degradedResult('git-error', detail);
+  return degradedResult('query-failed', detail);
+}
+
+/**
+ * Classify a rejected ASYNC `execFile` into a `REMOTE_RESOLUTION_REASONS`
+ * member.
+ *
+ * This cannot reuse `vcs-repo-spec.mjs`'s own (unexported) `classifyGitFailure`
+ * because that one reads an `execFileSync` result, where the spawn errno lands
+ * in `err.code` and the child's exit status in `err.status`. Async `execFile`
+ * folds BOTH into `err.code`, discriminated only by TYPE: the string `'ENOENT'`
+ * when the binary is not on PATH, the number `128` when git ran and rejected
+ * the path as a work tree. Same taxonomy, different carrier.
+ *
+ * @param {unknown} err
+ * @returns {'git-unavailable'|'not-a-git-repo'|'git-error'}
+ */
+function classifyGitProbeFailure(err) {
+  const code = err && typeof err === 'object' ? /** @type {any} */ (err).code : undefined;
+  if (code === 'ENOENT') return 'git-unavailable';
+  // `git remote -v` exits 128 for "not a git repository" — and, unlike the
+  // `remote get-url origin` call this replaced, NOT for "no such remote":
+  // a repo with zero remotes exits 0 with empty stdout. That is exactly the
+  // split that makes `no-remotes` (benign absence) reportable at all.
+  if (code === 128) return 'not-a-git-repo';
+  return 'git-error';
+}
+
+/**
+ * Detect the repo's VCS family from its git remotes.
+ *
+ * **Never throws.** Returns a discriminated result carrying a reason from
+ * `vcs-repo-spec.mjs`'s frozen `REMOTE_RESOLUTION_REASONS` (plus
+ * {@link PROBE_TIMEOUT}), so the caller can separate "I could not ask"
+ * (`isQueryFailure` → WARN) from "I asked; this repo has no VCS remote"
+ * (benign, silent). This is the `mirror-issues-banner.mjs` shape — a third
+ * state beyond `value | null` — applied to the last unmigrated path in this
+ * module (#1039).
+ *
+ * What it replaces, and why both halves were defects:
+ *   1. `git remote get-url origin` — a hard-coded remote NAME. In a repo whose
+ *      remotes are `gitlab` + `github` (no `origin`) the call failed, the
+ *      caller swallowed it to `null`, and the banner was structurally dark:
+ *      it could never report, not even on a red pipeline.
+ *   2. `remoteUrl.includes('github.com') ? 'github' : 'gitlab'` — a substring
+ *      test that classifies GitHub Enterprise (`git@github.example.com:o/r`)
+ *      as gitlab and then drives `glab` at a GitHub instance.
+ * `detectVcsFamily` fixes both: preference-ordered remote selection, and
+ * host-prefix classification (`github.*` / `gitlab.*`) ahead of remote-name.
+ *
+ * The `git remote -v` spawn stays HERE rather than inside `detectVcsFamily`
+ * because this module owes every subprocess a timeout race — the shared core
+ * is synchronous by design. So the output is captured once and handed to the
+ * shared classifier through its `gitRun` seam: one spawn, one taxonomy, no
+ * second copy of the parsing or the credential strip.
+ *
+ * @param {string} repoRoot
+ * @param {{ execFile?: Function, timeoutMs?: number }} deps
+ * @returns {Promise<{ ok: true, vcs: 'github'|'gitlab' }
+ *   | { ok: false, reason: string, stderr?: string }>}
+ */
+async function detectVcs(repoRoot, deps = {}) {
+  // Use the smaller of 2000ms or the caller-supplied timeout so that a short
+  // test-level timeout is still respected here.
+  const gitTimeout = Math.min(2000, deps.timeoutMs ?? 2000);
+
+  let stdout;
+  try {
+    const result = await execWithTimeout(
+      'git',
+      ['remote', '-v'],
+      { cwd: repoRoot, timeoutMs: gitTimeout, execFile: deps.execFile },
+    );
+    stdout = String(result?.stdout ?? '');
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err ?? '');
+    if (msg === 'timeout') return { ok: false, reason: PROBE_TIMEOUT };
+    const stderr = err && typeof err === 'object' ? String(/** @type {any} */ (err).stderr ?? '') : '';
+    return { ok: false, reason: classifyGitProbeFailure(err), stderr };
+  }
+
+  // Replay the captured output through the shared core's `gitRun` seam. The
+  // arg guard is insurance, not decoration: `detectVcsFamily` asks only for
+  // `remote -v` today, and if it ever grows a second query the guard turns a
+  // silently-wrong answer (built from the WRONG command's output) into a
+  // reported `git-error`.
+  const replayGitRun = (args) =>
+    Array.isArray(args) && args.at(-2) === 'remote' && args.at(-1) === '-v'
+      ? { ok: true, stdout, stderr: '', status: 0 }
+      : { ok: false, stdout: '', stderr: `unsupported git query in ci-status probe: ${String(args)}`, status: 1 };
+
+  // The repo's Session Config `vcs:` breaks an AMBIGUOUS remote tie (#1846);
+  // a forced `vcs` never reaches this function.
+  const preferVcs = await readConfiguredVcs(repoRoot);
+  const family = detectVcsFamily({ repoRoot, gitRun: replayGitRun, preferVcs });
+  if (!family.ok) return { ok: false, reason: family.reason, stderr: family.stderr };
+  return { ok: true, vcs: family.vcs };
+}
+
+/**
+ * Get current HEAD commit SHA.
+ *
+ * @param {string} repoRoot
+ * @param {{ execFile?: Function, timeoutMs?: number }} deps
+ * @returns {Promise<string>}
+ */
+async function getHeadSha(repoRoot, deps = {}) {
+  const gitTimeout = Math.min(2000, deps.timeoutMs ?? 2000);
+  const result = await execWithTimeout(
+    'git',
+    ['rev-parse', 'HEAD'],
+    { cwd: repoRoot, timeoutMs: gitTimeout, execFile: deps.execFile },
+  );
+  return result.stdout.trim();
+}
+
+/**
+ * Run a host-pinned `glab api <path>` request and return parsed JSON.
+ *
+ * GitLab's API accepts neither a remote URL nor `-R`; callers provide the host
+ * proven by `resolveGitlabProjectTarget` so this helper cannot fall back to
+ * ambient `GITLAB_HOST` configuration.
+ *
+ * @param {string} apiPath
+ * @param {string} repoRoot
+ * @param {{ execFile?: Function, timeoutMs?: number, repoHost: string }} deps
+ * @param {'object'|'array'} [expect]  Required payload shape (see `parseCliJson`)
+ * @returns {Promise<unknown>}
+ */
+async function glabApi(apiPath, repoRoot, deps = {}, expect = undefined) {
+  const args = ['api', apiPath, '--hostname', deps.repoHost];
+  const result = await execWithTimeout(
+    'glab',
+    args,
+    { cwd: repoRoot, timeoutMs: deps.timeoutMs ?? DEFAULT_TIMEOUT_MS, execFile: deps.execFile },
+  );
+  return parseCliJson(result.stdout, `glab api ${apiPath}`, expect);
+}
+
+/**
+ * Jobs endpoint of one GitLab pipeline, shared by the green (allow-failure)
+ * and red (failing-job) branches of `checkCiStatus()`.
+ *
+ * `per_page=100` (#1716): the API default page is 20, so a failed job at
+ * position 21+ was never named. Ceiling: one page of 100; a pipeline with
+ * more jobs still truncates. Revisit trigger: a pipeline with > 100 jobs
+ * (then paginate via `glab api --paginate`).
+ *
+ * @param {string} projectPath - `projects/<url-encoded path>`
+ * @param {number|string} pipelineId
+ * @returns {string}
+ */
+function pipelineJobsPath(projectPath, pipelineId) {
+  return `${projectPath}/pipelines/${pipelineId}/jobs?per_page=100`;
+}
+
+/** Upper bound on `failingJobNames` — a row listing 40 jobs is unreadable. */
+const MAX_FAILING_JOB_NAMES = 10;
+
+/**
+ * Every failing job/check-run name, sanitised, deduplicated (a re-run job
+ * appears twice) and capped (#1712). Additive companion to `failingJobName`,
+ * which keeps naming only the first: release 5.13.0 had a red informational
+ * Windows run beside the real cause, and naming one of two hid the other.
+ *
+ * @param {Array<{name?: unknown}>} failed
+ * @returns {string[]}
+ */
+function collectFailingJobNames(failed) {
+  const names = [];
+  for (const item of failed) {
+    const name = sanitizeApiText(item?.name);
+    if (name && !names.includes(name)) names.push(name);
+    if (names.length >= MAX_FAILING_JOB_NAMES) break;
+  }
+  return names;
+}
+
+/**
+ * Run `gh api <path>` and return parsed JSON.
+ *
+ * #872: `gh api` has no repo/`-R` concept either — pinned via `--hostname`
+ * from `deps.repoHost` when resolved.
+ *
+ * @param {string} apiPath
+ * @param {string} repoRoot
+ * @param {{ execFile?: Function, timeoutMs?: number, repoHost?: string }} deps
+ * @param {'object'|'array'} [expect]  Required payload shape (see `parseCliJson`)
+ * @returns {Promise<unknown>}
+ */
+async function ghApi(apiPath, repoRoot, deps = {}, expect = undefined) {
+  const args = ['api', apiPath];
+  if (deps.repoHost) args.push('--hostname', deps.repoHost);
+  const result = await execWithTimeout(
+    'gh',
+    args,
+    { cwd: repoRoot, timeoutMs: deps.timeoutMs ?? DEFAULT_TIMEOUT_MS, execFile: deps.execFile },
+  );
+  return parseCliJson(result.stdout, `gh api ${apiPath}`, expect);
+}
+
+/**
+ * Run `gh api graphql` with string variables and return the parsed object.
+ *
+ * Variables go through `-f` (raw string), NEVER `-F`: `-F` type-converts
+ * values ("true", numbers) and reads `@file` operands, so a value starting
+ * with `@` would make gh read a local file into the request. The argv order
+ * is fixed (query, then the variables in the caller's insertion order, then
+ * `--hostname`) so the exact-argv test mock can pin it. Host-pinning mirrors
+ * {@link ghApi} (#872).
+ *
+ * @param {string} query
+ * @param {Record<string, string>} vars
+ * @param {string} repoRoot
+ * @param {{ execFile?: Function, timeoutMs?: number, repoHost?: string }} deps
+ * @returns {Promise<unknown>}
+ */
+async function ghGraphql(query, vars, repoRoot, deps = {}) {
+  const args = ['api', 'graphql', '-f', `query=${query}`];
+  for (const [key, value] of Object.entries(vars)) args.push('-f', `${key}=${value}`);
+  if (deps.repoHost) args.push('--hostname', deps.repoHost);
+  const result = await execWithTimeout(
+    'gh',
+    args,
+    { cwd: repoRoot, timeoutMs: deps.timeoutMs ?? DEFAULT_TIMEOUT_MS, execFile: deps.execFile },
+  );
+  return parseCliJson(result.stdout, 'gh api graphql', 'object');
+}
+
+/**
+ * Commits the GitHub red branch reads back from HEAD to find the last green
+ * (#856): HEAD itself plus 15 ancestors. Ceiling: a red run longer than the
+ * window reports `redCount` without `lastGreen` although a green commit
+ * exists further back. Revisit trigger: a GitHub red reading with
+ * `lastGreen` absent while an older green commit is known (then page via
+ * `history(after:)`).
+ */
+const GITHUB_HISTORY_WINDOW = 16;
+
+/**
+ * One GraphQL round trip: the commit history from `expr` with each commit's
+ * CI rollup. A commit with no CI at all has `statusCheckRollup: null`.
+ */
+const GITHUB_HISTORY_QUERY =
+  'query($owner: String!, $name: String!, $expr: String!) { repository(owner: $owner, name: $name) { ' +
+  'object(expression: $expr) { ... on Commit { ' +
+  `history(first: ${GITHUB_HISTORY_WINDOW}) { nodes { oid committedDate statusCheckRollup { state } } } ` +
+  '} } } }';
+
+/**
+ * Walk the GitHub history from HEAD and derive `redCount` / `lastGreen` (#856).
+ *
+ * Returns `null` on ANY failure (spawn error, timeout, parse error,
+ * unexpected shape, unusable `nameWithOwner`) — the caller then reports the
+ * red reading without both fields. Never throws: like the GitLab job-list
+ * query, one failed side query must not degrade a red reading.
+ *
+ * Rules: every node whose `oid` equals `headSha` is skipped (HEAD already is
+ * the first member of the red run; its index is not relied on). A node
+ * without `statusCheckRollup` carried no CI — neither green nor red, like a
+ * GitLab commit without a pipeline row — and is skipped. `SUCCESS` is the
+ * last green; every other state (FAILURE, ERROR, PENDING, EXPECTED, …)
+ * extends the red run.
+ *
+ * Ceiling: `statusCheckRollup` also counts legacy commit statuses, while the
+ * HEAD verdict counts check runs only — a commit can read green in the rollup
+ * and still have a red check run elsewhere, and vice versa. `history`
+ * follows all parents in date order, so commits of merged branches
+ * interleave with the mainline. Revisit trigger: a reported `lastGreen` whose
+ * check runs are red, or a `redCount` someone reads as mainline-only.
+ *
+ * @param {string} nameWithOwner
+ * @param {string} headSha
+ * @param {number} now  Unix epoch ms
+ * @param {string} repoRoot
+ * @param {{ execFile?: Function, timeoutMs?: number, repoHost?: string }} deps
+ * @returns {Promise<{ redCount: number, lastGreen?: { sha: string, ageCommits: number, ageDays: number|null } }|null>}
+ */
+async function readGithubLastGreen(nameWithOwner, headSha, now, repoRoot, deps) {
+  const slash = typeof nameWithOwner === 'string' ? nameWithOwner.indexOf('/') : -1;
+  const owner = slash > 0 ? nameWithOwner.slice(0, slash) : '';
+  const name = slash > 0 ? nameWithOwner.slice(slash + 1) : '';
+  if (!owner || !name) return null;
+  try {
+    const data = await ghGraphql(
+      GITHUB_HISTORY_QUERY,
+      { owner, name, expr: headSha },
+      repoRoot,
+      deps,
+    );
+    const nodes = data?.data?.repository?.object?.history?.nodes;
+    if (!Array.isArray(nodes)) return null;
+    let redCount = 1; // HEAD itself — its check runs just read red.
+    for (const node of nodes) {
+      if (!node || typeof node !== 'object' || typeof node.oid !== 'string') return null;
+      if (node.oid === headSha) continue;
+      const rollup = node.statusCheckRollup;
+      if (rollup === null || rollup === undefined) continue;
+      if (rollup.state === 'SUCCESS') {
+        return {
+          redCount,
+          lastGreen: {
+            sha: node.oid,
+            ageCommits: redCount,
+            ageDays: ageDaysFrom(node.committedDate, now),
+          },
+        };
+      }
+      redCount++;
+    }
+    return { redCount };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Fold a {@link readGithubLastGreen} answer into a GitHub red reading — the
+ * one shape the inline (#856) and the deferred (#1728) history paths share.
+ * `history: null` (the query failed) keeps the red verdict and adds
+ * `details.reason: 'last-green-query-failed'`; any earlier `reason` and the
+ * `deferredHistory` marker are dropped.
+ *
+ * @param {{ status: 'red', ok: false, failingJobName: string, failingJobNames: string[], details: { cliUsed: 'gh', checkRunCounts: object } }} red
+ * @param {{ redCount: number, lastGreen?: object }|null} history
+ * @returns {object}
+ */
+function withGithubHistory(red, history) {
+  return {
+    status: red.status,
+    ok: red.ok,
+    failingJobName: red.failingJobName,
+    failingJobNames: red.failingJobNames,
+    ...(history ? { redCount: history.redCount } : {}),
+    ...(history?.lastGreen ? { lastGreen: history.lastGreen } : {}),
+    details: {
+      cliUsed: red.details.cliUsed,
+      ...(history ? {} : { reason: 'last-green-query-failed' }),
+      checkRunCounts: red.details.checkRunCounts,
+    },
+  };
+}
+
+/**
+ * Run ONLY the #856 history query for a red reading that
+ * `checkCiStatus({ deferHistory: true })` returned with
+ * `details.reason: 'last-green-deferred'` (#1728), and return the enriched
+ * reading — the same `redCount` / `lastGreen` / `last-green-query-failed`
+ * fields the inline path produces. It repeats neither `gh repo view` nor the
+ * check-runs query: the reading carries `deferredHistory` (`nameWithOwner`,
+ * `headSha`, `repoHost`), which is everything the query needs.
+ *
+ * Never throws (the history query is non-fatal, as inline). A reading without
+ * `deferredHistory` — green, GitLab, explicit-sha, or not deferred — comes
+ * back unchanged.
+ *
+ * @param {*} result  A `checkCiStatus` result
+ * @param {{ repoRoot?: string, timeoutMs?: number, now?: number }} [opts]
+ * @param {{ execFile?: Function }} [deps]  Same callback-style seam as `checkCiStatus`
+ * @returns {Promise<*>}
+ */
+export async function readDeferredGithubHistory(result, opts = {}, deps = {}) {
+  const pending = result?.deferredHistory;
+  if (!pending || typeof pending !== 'object') return result;
+  const { repoRoot = process.cwd(), timeoutMs = DEFAULT_TIMEOUT_MS, now = Date.now() } = opts;
+  const execFile = deps.execFile ? promisify(deps.execFile) : execFileAsync;
+  const history = await readGithubLastGreen(
+    pending.nameWithOwner,
+    pending.headSha,
+    now,
+    repoRoot,
+    { execFile, timeoutMs, repoHost: pending.repoHost },
+  );
+  return withGithubHistory(result, history);
+}
+
+/**
+ * Look up the branch HEAD currently sits on, for pipeline-REF preference.
+ *
+ * **Never throws and never degrades the reading.** A missing branch is not a
+ * failure to report — it only costs the ref preference below, which then falls
+ * back to "every same-sha pipeline is an acceptable candidate", i.e. exactly the
+ * pre-#857 behaviour. Degrading here instead would turn a detached HEAD, a
+ * worktree oddity or a `git` hiccup into a dark banner on a repo whose CI state
+ * is perfectly readable.
+ *
+ * `HEAD` (detached) is reported as "unknown", not as a branch named HEAD.
+ *
+ * @param {string} repoRoot
+ * @param {{ execFile?: Function, timeoutMs?: number }} deps
+ * @returns {Promise<string|undefined>}
+ */
+async function getCurrentBranch(repoRoot, deps = {}) {
+  const gitTimeout = Math.min(2000, deps.timeoutMs ?? 2000);
+  try {
+    const result = await execWithTimeout(
+      'git',
+      ['rev-parse', '--abbrev-ref', 'HEAD'],
+      { cwd: repoRoot, timeoutMs: gitTimeout, execFile: deps.execFile },
+    );
+    const branch = String(result?.stdout ?? '').trim();
+    if (branch === '' || branch === 'HEAD') return undefined;
+    return branch;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Does a pipeline's `ref` name the branch HEAD is on?
+ *
+ * GitLab reports a branch pipeline's ref as the bare branch name (`main`);
+ * `refs/heads/main` is accepted too because nothing in the API contract forbids
+ * the long form. An MR pipeline's ref is `refs/merge-requests/<iid>/head`,
+ * which matches no branch and is therefore never a confident match.
+ *
+ * @param {unknown} ref
+ * @param {string|undefined} branch
+ * @returns {boolean}
+ */
+function refMatchesBranch(ref, branch) {
+  if (!branch || typeof ref !== 'string' || ref === '') return false;
+  return ref === branch || ref === `refs/heads/${branch}`;
+}
+
+/**
+ * Does a pipeline's `ref` name a merge-request HEAD (`detached`) pipeline?
+ *
+ * GitLab spells it `refs/merge-requests/<iid>/head` — the DETACHED pipeline,
+ * which runs the MR source commit itself. The merged-results counterpart
+ * (`refs/merge-requests/<iid>/merge`) runs a synthetic merge commit whose sha is
+ * NOT the local HEAD, so it can never reach a same-sha candidate tier and is
+ * deliberately not matched here.
+ *
+ * @param {unknown} ref
+ * @returns {boolean}
+ */
+function isMergeRequestHeadRef(ref) {
+  return typeof ref === 'string' && /^refs\/merge-requests\/[^/]+\/head$/.test(ref);
+}
+
+/**
+ * Rank a GitLab pipeline status by how ALARMING it is (#857).
+ *
+ * Used only to pick ONE reading out of several pipelines for the SAME commit on
+ * the SAME ref, whose statuses contradict each other — measured on this project
+ * 2026-09-18: 14 of ~86 distinct shas in the last 100 pipelines carry 2-4
+ * pipelines, 7 of them with contradicting statuses (`canceled`+`success`,
+ * `failed`+`success`, …), produced by different `source`s (`push`, `api`,
+ * `merge_request_event`).
+ *
+ * Worst-status-wins is this module's stated fail-toward-visible posture (see
+ * {@link SILENT_QUERY_FAILURES}) applied to disagreement: a `success` beside a
+ * `failed` or a `canceled` cannot establish that the commit is green — the two
+ * runs may have executed different job sets, and which one is "the real one" is
+ * not derivable from the pipeline list. The disagreement itself is published as
+ * evidence (`details.ambiguous` + `details.candidateStatuses`), so the operator
+ * is never left guessing WHY the verdict reads the way it does.
+ *
+ * `failed` outranks `canceled` so a real failure can never be masked by a
+ * cancellation; everything UNSETTLED outranks `success`, because an in-flight
+ * sibling run means the commit's verdict is not settled.
+ *
+ * "Unsettled" is a category, not a leftover bucket. `skipped` and `manual` are
+ * TERMINAL non-failing states — the ordinary shape of a `rules:`-gated or
+ * manual-trigger pipeline — and lumping them in with `running`/`pending` turned
+ * the everyday `success` + `skipped` pair into `unknown /
+ * unrecognised-status-skipped`, where the pre-#857 reading was `green`. They
+ * therefore rank BELOW `success`: they never beat a real reading in either
+ * direction (`success` beside them → green, `failed` beside them → red), while
+ * a LONE `skipped`/`manual` still falls through `checkGitlab`'s tail to
+ * `unknown`, unchanged. Category separation, not a threshold tweak.
+ *
+ * @param {unknown} status
+ * @returns {number} Higher = more alarming
+ */
+function statusSeverity(status) {
+  if (status === 'failed') return 4;
+  if (status === 'canceled') return 3;
+  if (status === 'success') return 1;
+  // Terminal, non-failing, carries no verdict of its own.
+  if (status === 'skipped' || status === 'manual') return 0;
+  // running / pending / created / preparing / waiting_for_resource / scheduled
+  // — and anything unrecognised, which cannot be assumed settled.
+  return 2;
+}
+
+/**
+ * Split every pipeline carrying the queried sha into the candidate set this
+ * reading may speak for, and the foreign-ref remainder it must not (#857).
+ *
+ * Before this, `pipelines.find(p => p.sha === currentSha)` took the most
+ * recently updated row in a 15-row window that MIXES refs (`main`,
+ * `refs/merge-requests/39/head`, a `codex/…` branch — measured 2026-09-18), so
+ * a foreign branch's or an MR's pipeline could silently become the local HEAD's
+ * verdict.
+ *
+ * Preference, first non-empty tier wins:
+ *   1. pipelines whose `ref` names the current branch (the confident match);
+ *   2. pipelines whose ref cannot be judged — no `ref` field, or no branch
+ *      resolved (detached HEAD, `git` unavailable). Judging is impossible, so
+ *      this is the pre-#857 CANDIDATE SET, now resolved worst-status-wins like
+ *      every other tier (a ref-less `success` + `canceled` pair read green
+ *      before #857 and reads red now — the change is deliberate, see
+ *      {@link statusSeverity});
+ *   3. pipelines on an MR HEAD ref ({@link isMergeRequestHeadRef}) carrying the
+ *      queried sha. A repo whose `workflow: rules:` only admit
+ *      `merge_request_event` produces NO branch pipeline at all, so tiers 1-2
+ *      are empty and the pre-tier-3 code reported `pipeline-unmatched-ref` for a
+ *      commit whose verdict was sitting right there. SHA EQUALITY is the
+ *      correctness argument — the ref is only a tie-breaker, and a
+ *      merged-results pipeline runs a DIFFERENT sha, so it cannot reach this
+ *      tier at all. `matchedRef` is reported, so the operator sees which ref
+ *      spoke;
+ *   4. otherwise NOTHING is selected: every same-sha pipeline belongs to a
+ *      genuinely foreign ref (another branch), which the caller reports as
+ *      `unknown` with its own reason rather than adopting.
+ *
+ * `foreign` is EVERY same-sha row outside the selected tier — on every branch,
+ * not only on tier 4 (#1390). It used to be `[]` whenever a tier matched, so a
+ * same-sha `failed` on another ref vanished with no trace behind a `green`
+ * reading. The ref preference still decides the verdict; the rows it set aside
+ * are handed back so the caller can publish them as evidence
+ * ({@link candidateEvidence} `droppedStatuses`). Linear `includes` scan over
+ * at most the 15-row API window — revisit if `per_page` grows past ~200.
+ *
+ * @param {Array<any>} pipelines
+ * @param {string} sha
+ * @param {string|undefined} branch
+ * @returns {{ selected: Array<any>, foreign: Array<any> }}
+ */
+function selectShaPipelines(pipelines, sha, branch) {
+  const sameSha = pipelines.filter((p) => p && p.sha === sha);
+  const split = (selected) => ({
+    selected,
+    foreign: sameSha.filter((p) => !selected.includes(p)),
+  });
+
+  const onBranch = sameSha.filter((p) => refMatchesBranch(p.ref, branch));
+  if (onBranch.length > 0) return split(onBranch);
+
+  const unjudgeable = sameSha.filter(
+    (p) => !branch || typeof p.ref !== 'string' || p.ref === '',
+  );
+  if (unjudgeable.length > 0) return split(unjudgeable);
+
+  const mrHead = sameSha.filter((p) => isMergeRequestHeadRef(p.ref));
+  if (mrHead.length > 0) return split(mrHead);
+
+  return split([]);
+}
+
+/**
+ * Pick the pipeline a reading speaks for: the most alarming of the candidates,
+ * ties resolved by the API's own `updated_at desc` ordering (first wins).
+ *
+ * @param {Array<any>} candidates  Non-empty
+ * @returns {any}
+ */
+function worstPipeline(candidates) {
+  let worst = candidates[0];
+  for (const p of candidates) {
+    if (statusSeverity(p.status) > statusSeverity(worst.status)) worst = p;
+  }
+  return worst;
+}
+
+/**
+ * ADDITIVE evidence fields (#857) describing how a reading was chosen.
+ *
+ * Additive by hard constraint: the `status` vocabulary stays
+ * `green | red | unknown`, because `dispatcher/rank.mjs` and
+ * `autonomy/suitability.mjs` treat only the literal `'red'` as bad and the
+ * session-start renderer prints nothing for a status string it does not know.
+ * So ambiguity is published BESIDE the verdict, never as a new verdict.
+ *
+ *   - `matchedRef`       the chosen pipeline's ref (present whenever the API
+ *                        supplied one), so the operator can see WHICH ref the
+ *                        verdict speaks for.
+ *   - `candidateCount`   number of same-sha candidates — only when > 1, so an
+ *                        ordinary one-pipeline reading is byte-identical to
+ *                        before.
+ *   - `candidateStatuses` their statuses, in API order, same gate.
+ *   - `ambiguous`        `true` only when those statuses DISAGREE.
+ *   - `droppedCount`     number of same-sha pipelines the ref preference SET
+ *                        ASIDE (another branch, an MR HEAD beside a branch
+ *                        match, a ref-less row beside a judged one) — only when
+ *                        > 0 (#1390). Without it a `failed` run of the very
+ *                        commit on another ref disappeared behind a `green`.
+ *   - `droppedStatuses`  their statuses, in API order, same gate. Evidence
+ *                        only: they do not enter the severity ranking or
+ *                        `ambiguous`.
+ *
+ * @param {Array<any>} selected
+ * @param {any} chosen
+ * @param {Array<any>} dropped  Same-sha rows outside the selected tier
+ * @returns {{ matchedRef?: string, candidateCount?: number, candidateStatuses?: string[], ambiguous?: true, droppedCount?: number, droppedStatuses?: string[] }}
+ */
+function candidateEvidence(selected, chosen, dropped) {
+  /** @type {any} */
+  const out = {};
+  if (typeof chosen?.ref === 'string' && chosen.ref !== '') {
+    out.matchedRef = sanitizeApiText(chosen.ref);
+  }
+  if (selected.length > 1) {
+    out.candidateCount = selected.length;
+    out.candidateStatuses = selected.map((p) => sanitizeApiText(p.status));
+    if (new Set(out.candidateStatuses).size > 1) out.ambiguous = true;
+  }
+  if (dropped.length > 0) {
+    out.droppedCount = dropped.length;
+    out.droppedStatuses = dropped.map((p) => sanitizeApiText(p.status));
+  }
+  return out;
+}
+
+function gitlabRunningResult(pipeline, evidence) {
+  return {
+    status: 'unknown',
+    ok: false,
+    phase: 'running',
+    details: {
+      currentPipelineId: pipeline.id,
+      cliUsed: 'glab',
+      reason: `pipeline-${sanitizeApiText(pipeline.status)}`,
+      ...evidence,
+    },
+  };
+}
+
+/**
+ * Compute age in whole days between an ISO date string and `now`.
+ *
+ * @param {string} isoDate
+ * @param {number} now  Unix epoch ms
+ * @returns {number|null}
+ */
+function ageDaysFrom(isoDate, now) {
+  const ts = Date.parse(isoDate);
+  if (Number.isNaN(ts)) return null;
+  return Math.floor((now - ts) / (24 * 60 * 60 * 1000));
+}
+
+/**
+ * GitLab CI status check.
+ * Returns a status result object or null on unrecoverable error.
+ *
+ * @param {string} repoRoot
+ * @param {number} now
+ * @param {{
+ *   execFile?: Function,
+ *   timeoutMs?: number,
+ *   gitlabProject?: { host: string, encodedProjectPath: string },
+ * }} deps
+ * @returns {Promise<object|null>}
+ */
+async function checkGitlab(repoRoot, now, deps = {}) {
+  const project = deps.gitlabProject;
+  if (
+    !project ||
+    typeof project.host !== 'string' ||
+    typeof project.encodedProjectPath !== 'string' ||
+    project.host === '' ||
+    project.encodedProjectPath === ''
+  ) {
+    return null;
+  }
+
+  // #1332: an explicit `deps.sha` (validated full hex SHA, see checkCiStatus)
+  // replaces the local HEAD lookup — the caller asks about a NAMED commit.
+  const currentSha = deps.sha ?? (await getHeadSha(repoRoot, deps));
+  // #857 ref preference — resolved alongside the sha, and best-effort: an
+  // unresolvable branch costs the preference, never the reading. See
+  // {@link getCurrentBranch}.
+  const branch = await getCurrentBranch(repoRoot, deps);
+  const apiDeps = { ...deps, repoHost: project.host };
+  const projectPath = `projects/${project.encodedProjectPath}`;
+  // `'array'` is load-bearing, not decoration: before it, a `glab api` that
+  // returned valid JSON of the wrong shape (`null`, `"ok"`, an object) fell
+  // into `!Array.isArray(pipelines) → return null` — a SILENT no-op an operator
+  // reads as "nothing to report". It now raises the same named error an
+  // unparseable payload does, so the outer catch warns.
+  const pipelines = await glabApi(
+    `${projectPath}/pipelines?order_by=updated_at&sort=desc&per_page=15`,
+    repoRoot,
+    apiDeps,
+    'array',
+  );
+
+  // #857: the window mixes refs and carries duplicate pipelines per commit, so
+  // the reading is CHOSEN (ref preference, then worst-status-wins), never
+  // `.find()`-ed off the most recently updated row.
+  const { selected, foreign } = selectShaPipelines(pipelines, currentSha, branch);
+
+  if (selected.length === 0 && foreign.length > 0) {
+    // Pipelines EXIST for this commit, but every one of them belongs to a
+    // foreign ref (another branch, or `refs/merge-requests/<iid>/head`).
+    // Adopting one would let an MR's or a foreign branch's verdict stand in for
+    // the local HEAD's; claiming "no pipeline" would hide that runs exist. So:
+    // `unknown`, with a reason that names the actual situation. The status
+    // vocabulary is unchanged — the finding is delivered as a REASON.
+    return {
+      status: 'unknown',
+      ok: false,
+      details: {
+        currentPipelineId: null,
+        cliUsed: 'glab',
+        reason: 'pipeline-unmatched-ref',
+        candidateCount: foreign.length,
+        candidateStatuses: foreign.map((p) => sanitizeApiText(p.status)),
+      },
+    };
+  }
+
+  if (selected.length === 0) {
+    return {
+      status: 'unknown',
+      ok: false,
+      details: {
+        currentPipelineId: null,
+        cliUsed: 'glab',
+        reason: 'no-pipeline-for-head-sha',
+      },
+    };
+  }
+
+  const currentPipeline = worstPipeline(selected);
+  const evidence = candidateEvidence(selected, currentPipeline, foreign);
+  const pipelineStatus = currentPipeline.status;
+
+  if (pipelineStatus === 'success') {
+    // A pipeline reports `success` even when jobs marked `allow_failure: true`
+    // failed. Those jobs are invisible at the pipeline level, so a permanently
+    // red allow-failure job (observed: 4/4 consecutive pipelines) would never
+    // surface. Inspect the job list to name them. Non-fatal: a failed job query
+    // still yields a plain green result.
+    let allowFailureJobs;
+    try {
+      const jobs = await glabApi(
+        pipelineJobsPath(projectPath, currentPipeline.id),
+        repoRoot,
+        apiDeps,
+        'array',
+      );
+      if (Array.isArray(jobs)) {
+        const softFailed = jobs
+          .filter((j) => j.status === 'failed' && j.allow_failure === true)
+          .map((j) => sanitizeApiText(j.name));
+        if (softFailed.length > 0) allowFailureJobs = softFailed;
+      }
+    } catch {
+      // Non-fatal — report green without the allow-failure detail.
+    }
+
+    return {
+      status: 'green',
+      ok: true,
+      ...(allowFailureJobs ? { allowFailureJobs } : {}),
+      details: {
+        currentPipelineId: currentPipeline.id,
+        cliUsed: 'glab',
+        ...evidence,
+      },
+    };
+  }
+
+  if (pipelineStatus === 'running' || pipelineStatus === 'pending') {
+    return gitlabRunningResult(currentPipeline, evidence);
+  }
+
+  if (pipelineStatus === 'failed' || pipelineStatus === 'canceled') {
+    // Find the last green pipeline in the history.
+    //
+    // #857: the look-back slice EXCLUDES every row carrying the queried sha, not
+    // just the chosen one. Pipelines are NOT one-per-commit on this project —
+    // measured 2026-09-18, 14 of ~86 distinct shas in the last 100 pipelines
+    // carry 2-4 — so a `success` duplicate of the very commit being reported red
+    // used to be found here and named as its own `lastGreen`. Reproduced on
+    // `52ae12f1` (a `canceled` push pipeline + a `success` api pipeline for the
+    // same commit): status `red`, `lastGreen.sha` === HEAD.
+    const currentIdx = pipelines.indexOf(currentPipeline);
+    const rest = pipelines.slice(currentIdx + 1).filter((p) => p && p.sha !== currentSha);
+    const lastGreenPipeline = rest.find((p) => p.status === 'success');
+
+    // The unbroken non-success run from the current pipeline back to the last
+    // green, as ROWS. Same meaning `redCount` always had.
+    const redRun = [currentPipeline];
+    for (const p of rest) {
+      if (p.status === 'success') break;
+      redRun.push(p);
+    }
+    const redCount = redRun.length;
+
+    let lastGreen;
+    if (lastGreenPipeline) {
+      const ageDays = ageDaysFrom(lastGreenPipeline.created_at, now);
+      lastGreen = {
+        sha: lastGreenPipeline.sha,
+        pipelineId: lastGreenPipeline.id,
+        // Commit distance, counted over DISTINCT shas in the red run. The old
+        // value was the ROW count under a comment asserting "pipelines are
+        // one-per-commit on this project" — measured false at 16%, so the
+        // distance was overstated whenever a commit had been re-run.
+        ageCommits: new Set(redRun.map((p) => p.sha)).size,
+        // The row count is kept under its own name rather than dropped: it is
+        // what `redCount` reports, and "3 red pipelines over 2 commits" is a
+        // different (and also useful) statement from either number alone.
+        agePipelines: redCount,
+        ageDays,
+      };
+    }
+
+    // Get the name of the first failing job on the current pipeline.
+    let failingJobName;
+    let failingJobNames;
+    try {
+      const jobs = await glabApi(
+        pipelineJobsPath(projectPath, currentPipeline.id),
+        repoRoot,
+        apiDeps,
+        'array',
+      );
+      if (Array.isArray(jobs)) {
+        const failedJobs = jobs.filter((j) => j?.status === 'failed');
+        failingJobName = failedJobs[0] ? sanitizeApiText(failedJobs[0].name) : undefined;
+        failingJobNames = failedJobs.length ? collectFailingJobNames(failedJobs) : undefined;
+      }
+    } catch {
+      // Non-fatal — we still report red status without job name.
+    }
+
+    // #856: additive "no verdict" marker, only when nothing in the reading is a
+    // real failure: no `failed` row in the red run back to the last green, and
+    // no same-sha `failed` set aside by the ref preference (#1390
+    // `droppedStatuses`, which `worstPipeline` never ranks).
+    const canceledWithoutFailure =
+      pipelineStatus === 'canceled' &&
+      !redRun.some((p) => p.status === 'failed') &&
+      !(evidence.droppedStatuses ?? []).includes('failed');
+
+    // #1852: a canceled run without a failure has no verdict. Report an
+    // in-flight same-SHA sibling with its own ID and ref for the banner.
+    if (canceledWithoutFailure && failingJobName === undefined) {
+      const inFlight = foreign.find((p) => p.status === 'running' || p.status === 'pending');
+      if (inFlight) {
+        const dropped = pipelines.filter((p) => p?.sha === currentSha && p !== inFlight);
+        return gitlabRunningResult(inFlight, candidateEvidence([inFlight], inFlight, dropped));
+      }
+    }
+
+    return {
+      status: 'red',
+      ok: false,
+      ...(canceledWithoutFailure ? { phase: 'canceled' } : {}),
+      ...(lastGreen ? { lastGreen } : {}),
+      redCount,
+      ...(failingJobName !== undefined ? { failingJobName } : {}),
+      ...(failingJobNames !== undefined ? { failingJobNames } : {}),
+      details: {
+        currentPipelineId: currentPipeline.id,
+        cliUsed: 'glab',
+        // A user-cancelled pipeline printed `🚨 CI RED on HEAD` indistinguishably
+        // from a real failure. The STATUS stays `red` on purpose (no consumer
+        // churn — `dispatcher/rank.mjs` and `autonomy/suitability.mjs` key on the
+        // literal `'red'`), and the distinction is delivered through the reason
+        // both the banner and the release-preflight row already interpolate.
+        // Named like the `pipeline-running` / `pipeline-pending` reasons above;
+        // `failed` keeps carrying no reason — its detail is `failingJobName`.
+        ...(pipelineStatus === 'canceled' ? { reason: 'pipeline-canceled' } : {}),
+        ...evidence,
+      },
+    };
+  }
+
+  // Any other status (skipped, manual, etc.) → unknown.
+  return {
+    status: 'unknown',
+    ok: false,
+    details: {
+      currentPipelineId: currentPipeline.id,
+      cliUsed: 'glab',
+      reason: `unrecognised-status-${sanitizeApiText(pipelineStatus)}`,
+      ...evidence,
+    },
+  };
+}
+
+/**
+ * GitHub CI status check.
+ *
+ * #872/#1022: pins the `gh repo view` lookup to `deps.repoSpec` when resolved
+ * (host-pinning — `gh repo view` otherwise falls back to the ambient
+ * `GH_HOST`). The spec is passed POSITIONALLY, not via `-R`: `gh repo view`
+ * takes `[<repository>]` as a positional argument and has no `-R`/`--repo`
+ * flag at all, so `-R` made gh exit 1 with `unknown shorthand flag: 'R'` —
+ * an error `checkCiStatus`'s outer catch swallowed to `null`, leaving the
+ * Phase 4 banner silently dead on EVERY GitHub repo (#1022). The
+ * `[HOST/]OWNER/REPO` shape `resolveRepoSpec({ vcs: 'github' })` returns is
+ * exactly the positional's documented input format.
+ *
+ * GitLab CI differs deliberately: it derives a host-pinned API target from
+ * the selected remote, while GitHub still needs this lookup because its API
+ * path requires `nameWithOwner`. Do not unify these call sites.
+ *
+ * `nameWithOwner` is NOT derivable from `deps.repoSpec`, so this lookup
+ * cannot be dropped: the spec carries a HOST prefix the `repos/<owner>/<repo>`
+ * API path must not contain, it is `undefined` whenever no remote resolves
+ * (cross-family guard, unsafe-argv guard), and `normalizeGithubSpec` falls
+ * back to the raw URL on an unrecognised remote shape.
+ *
+ * LOCAL HEAD (#1727): the check-runs query names the commit `git rev-parse
+ * HEAD` returns, never the literal `HEAD` ref — on the GitHub API `HEAD`
+ * resolves to the tip of the REMOTE DEFAULT BRANCH, so a feature branch or an
+ * unpushed commit used to read main's verdict, green included. `deps.sha`
+ * (#1332), when set, names THAT commit instead. A commit the remote does not
+ * know (HTTP 422 "No commit found for SHA") is `unknown` with reason
+ * `head-sha-not-on-remote` — a measured answer, not a query failure.
+ *
+ * Red (#856): for the LOCAL-HEAD reading only (no `deps.sha`), one GraphQL
+ * history query adds `redCount` and, when a green commit lies inside the
+ * window, `lastGreen` (`sha`, `ageCommits`, `ageDays`; no
+ * `pipelineId`/`agePipelines` — GitHub has no pipelines). The query is
+ * non-fatal: on failure the red reading stays and carries
+ * `details.reason: 'last-green-query-failed'`. An explicit-sha red reading
+ * skips the query and carries none of the three. See {@link readGithubLastGreen}.
+ * `deps.deferHistory` (#1728) also skips it, but marks the red reading
+ * `details.reason: 'last-green-deferred'` with a `deferredHistory` field for
+ * {@link readDeferredGithubHistory}.
+ *
+ * @param {string} repoRoot
+ * @param {number} now  Unix epoch ms, for `lastGreen.ageDays`
+ * @param {{ execFile?: Function, timeoutMs?: number, repoSpec?: string, repoHost?: string, sha?: string, deferHistory?: boolean }} deps
+ * @returns {Promise<object|null>}
+ */
+async function checkGithub(repoRoot, now, deps = {}) {
+  // Resolve owner/repo from gh to keep the API path generic.
+  const repoViewArgs = ['repo', 'view'];
+  if (deps.repoSpec) repoViewArgs.push(deps.repoSpec);
+  repoViewArgs.push('--json', 'nameWithOwner');
+  const repoViewResult = await execWithTimeout(
+    'gh',
+    repoViewArgs,
+    { cwd: repoRoot, timeoutMs: deps.timeoutMs ?? DEFAULT_TIMEOUT_MS, execFile: deps.execFile },
+  );
+  // `'object'` before the destructuring: a `gh repo view` that printed `null`
+  // (or a bare string, or an array) used to throw a bare
+  // `TypeError: Cannot destructure property 'nameWithOwner' of 'null'`, whose
+  // message names neither the CLI nor the request — the exact identification
+  // failure this helper exists to fix.
+  const { nameWithOwner } = parseCliJson(
+    repoViewResult.stdout,
+    `gh ${repoViewArgs.join(' ')}`,
+    'object',
+  );
+
+  // `per_page=100` (#1712): the API default page is 30, so a larger matrix
+  // silently dropped runs — a red one included. Ceiling: one page of 100; a
+  // commit with more check runs still truncates. Revisit trigger: a workflow
+  // set whose `total_count` exceeds 100 (then paginate via `--paginate`).
+  // A failing `git rev-parse` throws into checkCiStatus's outer catch — the
+  // same degraded semantics the GitLab path has.
+  const headSha = deps.sha ?? (await getHeadSha(repoRoot, deps));
+  let data;
+  try {
+    data = await ghApi(
+      `repos/${nameWithOwner}/commits/${headSha}/check-runs?per_page=100`,
+      repoRoot,
+      deps,
+      'object',
+    );
+  } catch (err) {
+    // Only the remote's "this commit does not exist here" answer is caught:
+    // the commit is unpushed (or was never on this remote), so there is no CI
+    // verdict for it — unknown, not degraded. Every other error, timeout and
+    // ENOENT included, keeps the outer catch's handling.
+    const text = `${String(err?.stderr ?? '')} ${String(err?.message ?? '')}`;
+    if (/No commit found for SHA/i.test(text)) {
+      return {
+        status: 'unknown',
+        ok: false,
+        details: { cliUsed: 'gh', reason: 'head-sha-not-on-remote' },
+      };
+    }
+    throw err;
+  }
+
+  const checkRuns = data.check_runs;
+  if (!Array.isArray(checkRuns) || checkRuns.length === 0) {
+    return {
+      status: 'unknown',
+      ok: false,
+      details: {
+        cliUsed: 'gh',
+        reason: 'no-check-runs-for-head',
+      },
+    };
+  }
+
+  // #856: lifecycle and conclusion are separate facts. Failure retains
+  // priority even in an inconsistent row; only completed success grants green.
+  // Counts are additive diagnostics, never a new status or gate authority.
+  const checkRunCounts = { success: 0, failure: 0, inProgress: 0, queued: 0, cancelled: 0, skipped: 0, neutral: 0, waiting: 0, other: 0 };
+  const failedRuns = [];
+  for (const run of checkRuns) {
+    if (['failure', 'action_required', 'timed_out', 'startup_failure'].includes(run?.conclusion)) {
+      failedRuns.push(run);
+      checkRunCounts.failure++;
+    } else if (run?.status === 'completed' && run?.conclusion === 'success') checkRunCounts.success++;
+    else if (run?.status === 'completed' && run?.conclusion === 'cancelled') checkRunCounts.cancelled++;
+    else if (run?.status === 'completed' && run?.conclusion === 'skipped') checkRunCounts.skipped++;
+    else if (run?.status === 'completed' && run?.conclusion === 'neutral') checkRunCounts.neutral++;
+    else if (['waiting', 'pending', 'requested'].includes(run?.status) && run?.conclusion === null) checkRunCounts.waiting++;
+    else if (run?.status === 'in_progress' && run?.conclusion === null) checkRunCounts.inProgress++;
+    else if (run?.status === 'queued' && run?.conclusion === null) checkRunCounts.queued++;
+    else checkRunCounts.other++;
+  }
+  const failedRun = failedRuns[0];
+
+  if (failedRun) {
+    const red = {
+      status: 'red',
+      ok: false,
+      failingJobName: sanitizeApiText(failedRun.name),
+      failingJobNames: collectFailingJobNames(failedRuns),
+      details: { cliUsed: 'gh', checkRunCounts },
+    };
+    // #856: the history query runs only for the LOCAL-HEAD reading. Explicit-sha
+    // readings (session-start pushed-commit follow-up, release preflight) read
+    // none of `redCount`/`lastGreen`, and the extra ~0.5–0.7 s pushed the
+    // follow-up past its shared PROBE_BUDGET_MS, degrading a red pushed commit
+    // to "pipeline not checked". Not attempted means no
+    // `last-green-query-failed` reason either. Ceiling: a `{ sha }` caller gets
+    // no `lastGreen`; revisit trigger: a consumer that reads `lastGreen` from a
+    // `{ sha }` reading (then add an explicit opt-in).
+    if (deps.sha) return red;
+    // #1728: `deferHistory` returns the red verdict NOW and leaves the history
+    // to {@link readDeferredGithubHistory}, so a caller with a hard budget (the
+    // session-start probe) holds the red reading before the ~0.5 s query runs.
+    if (deps.deferHistory) {
+      return {
+        ...red,
+        details: { cliUsed: 'gh', reason: 'last-green-deferred', checkRunCounts },
+        deferredHistory: {
+          nameWithOwner,
+          headSha,
+          ...(deps.repoHost ? { repoHost: deps.repoHost } : {}),
+        },
+      };
+    }
+    // Ceiling (#1728): every other local-HEAD caller still pays the query on
+    // red, even one that discards the fields — today `dispatcher/rank.mjs`
+    // (`normalizeCiSignal` keeps status only). Revisit trigger: rank latency on
+    // red GitHub repos (then pass `deferHistory: true` there too).
+    const history = await readGithubLastGreen(nameWithOwner, headSha, now, repoRoot, deps);
+    return withGithubHistory(red, history);
+  }
+
+  const allSuccess = checkRunCounts.success === checkRuns.length;
+  if (allSuccess) {
+    return {
+      status: 'green',
+      ok: true,
+      details: {
+        cliUsed: 'gh',
+      },
+    };
+  }
+
+  const states = [
+    ['inProgress', 'check-runs-in-progress'],
+    ['queued', 'check-runs-queued'],
+    ['cancelled', 'check-runs-cancelled'],
+    ['skipped', 'check-runs-skipped'],
+    ['neutral', 'check-runs-neutral'],
+    ['waiting', 'check-runs-waiting'],
+    ['other', 'check-runs-unrecognised'],
+  ].filter(([key]) => checkRunCounts[key] > 0);
+  // Successes may accompany one unknown state; counts expose the whole mix.
+  const reason = states.length === 1 ? states[0][1] : 'check-runs-mixed';
+  // #856: `phase: 'running'` only when every non-success run is in progress or
+  // queued — the two states this function already recognises as in flight.
+  const inFlight = states.every(([key]) => key === 'inProgress' || key === 'queued');
+  return {
+    status: 'unknown',
+    ok: false,
+    ...(inFlight ? { phase: 'running' } : {}),
+    details: {
+      cliUsed: 'gh',
+      reason,
+      checkRunCounts,
+    },
+  };
+}
+
+/**
+ * Checks CI status for the current HEAD commit.
+ *
+ * Returns `null` (silent no-op) ONLY for a measured ABSENCE: the repo has no
+ * usable VCS remote (not a git repo, no remotes at all, or >= 2 remotes with no
+ * preference match). That is a complete answer — there is no CI here.
+ *
+ * Returns a DEGRADED result (`{severity:'warn', ok:false, message, degraded}`,
+ * see {@link DEGRADED_REASONS}) when the state could not be read: the
+ * VCS-detection query itself failed (`git` not on PATH, `git remote -v`
+ * erroring), a required CLI is missing, an invocation timed out, a present CLI
+ * rejected its invocation, a GitLab API target could not be derived, or a CLI
+ * returned output this module could not parse (see {@link parseCliJson}).
+ * Callers MUST treat that as "state unknown", never as clean — the generic
+ * degraded path in `scripts/lib/session-start-probes.mjs` does exactly that.
+ *
+ * Missing-CLI and timeout additionally stay SILENT on the `console.warn`
+ * channel (they are normal states on a CLI-less machine); every other degraded
+ * reason also emits a warn.
+ *
+ * @param {{
+ *   repoRoot?: string,
+ *   vcs?: 'gitlab'|'github',
+ *   timeoutMs?: number,
+ *   now?: number,
+ *   sha?: string,
+ *   deferHistory?: boolean,
+ * }} opts  `sha` (#1332): query the verdict for THIS commit instead of the
+ *   local HEAD. Must be a full hex object id (40 or 64 chars) — it is matched
+ *   against GitLab's full pipeline SHAs and interpolated into a `gh api` path,
+ *   so anything else is refused as `query-failed` before any spawn. Absent →
+ *   behaviour identical to before the option existed.
+ *   `deferHistory` (#1728, opt-in, only `true` counts): a GitHub LOCAL-HEAD red
+ *   reading returns WITHOUT the #856 history query, marked
+ *   `details.reason: 'last-green-deferred'` and carrying `deferredHistory`;
+ *   {@link readDeferredGithubHistory} runs the query later. Only the
+ *   session-start probe opts in — its budget would otherwise drop the red
+ *   verdict with the query. No effect on GitLab, on `sha` readings, or on
+ *   non-red readings.
+ * @param {{
+ *   execFile?: Function,
+ *   resolveRepoSpec?: (opts: { repoRoot: string, vcs: 'gitlab'|'github' }) => string|undefined,
+ *   resolveRepoHost?: (opts: { repoRoot: string, vcs: 'gitlab'|'github' }) => string|undefined,
+ *   resolveGitlabProjectTarget?: (opts: { repoRoot: string }) =>
+ *     { host: string, encodedProjectPath: string }|undefined,
+ * }} deps  Dependency-injection seam for testing. GitLab defaults to
+ *   `resolveGitlabProjectTarget`, which proves host and project path from one
+ *   sanitized remote; GitHub retains the #872 spec/host resolvers.
+ * @returns {Promise<null | {
+ *   severity: 'warn',
+ *   ok: false,
+ *   message: string,
+ *   degraded: 'cli-missing'|'timeout'|'parse-error'|'query-failed'|'git-error',
+ * } | {
+ *   status: 'green'|'red'|'unknown',
+ *   ok: boolean,
+ *   phase?: 'running'|'canceled',
+ *   lastGreen?: {
+ *     sha: string,
+ *     pipelineId?: number,
+ *     ageCommits: number,
+ *     agePipelines?: number,
+ *     ageDays: number|null,
+ *   },
+ *   redCount?: number,
+ *   failingJobName?: string,
+ *   details: {
+ *     currentPipelineId?: number,
+ *     cliUsed: 'glab'|'gh',
+ *     reason?: string,
+ *     error?: string,
+ *     checkRunCounts?: { success: number, failure: number, inProgress: number, queued: number, cancelled: number, skipped: number, neutral: number, waiting: number, other: number },
+ *     matchedRef?: string,
+ *     candidateCount?: number,
+ *     candidateStatuses?: string[],
+ *     ambiguous?: true,
+ *     droppedCount?: number,
+ *     droppedStatuses?: string[],
+ *   },
+ * }>}
+ *
+ * The `status` vocabulary is FROZEN at `green | red | unknown` (#857/#856): the
+ * #857 "several contradicting pipelines" and "only foreign-ref pipelines"
+ * findings — and the #1390 "same-sha rows the ref preference set aside"
+ * (`droppedCount`/`droppedStatuses`) — are delivered through ADDITIVE `details`
+ * fields and `details.reason`. GitHub's `checkRunCounts` counts each row once:
+ * `failure` includes action_required, timed_out and startup_failure;
+ * `other` includes malformed/inconsistent
+ * rows and unsupported statuses/conclusions. Non-success reasons are
+ * check-runs-in-progress, check-runs-queued, check-runs-cancelled,
+ * check-runs-skipped, check-runs-neutral, check-runs-waiting (#1526),
+ * check-runs-unrecognised, or check-runs-mixed (multiple non-success kinds),
+ * never as a new status value — consumers fail open on an unknown status string
+ * and the session-start renderer prints nothing for one.
+ *
+ * `phase` (#856, additive) marks a reading that carries NO verdict yet:
+ * `'running'` beside `status: 'unknown'` (GitLab HEAD pipeline running/pending,
+ * including a same-SHA sibling of a canceled pipeline with no observed failure;
+ * GitHub check runs only in progress/queued), `'canceled'` beside
+ * `status: 'red'` (GitLab HEAD pipeline canceled, with no `failed` row in the
+ * red run back to the last green and no same-sha `failed` set aside by the ref
+ * preference). The key is ABSENT in every other case — never null/empty.
+ *
+ * GitHub-specific (#1727/#856): `lastGreen.pipelineId` and
+ * `lastGreen.agePipelines` are GitLab-only — GitHub has no pipelines, so its
+ * `lastGreen` carries `sha`, `ageCommits` and `ageDays` only, and
+ * `details.currentPipelineId` stays absent. Reasons: `head-sha-not-on-remote`
+ * (unknown — the local HEAD is not on the remote, e.g. unpushed) and
+ * `last-green-query-failed` (red — the history query failed, so `redCount`
+ * and `lastGreen` are absent) and `last-green-deferred` (red under
+ * `deferHistory` — the history was not queried yet; `deferredHistory`
+ * carries what {@link readDeferredGithubHistory} needs).
+ */
+export async function checkCiStatus(opts = {}, deps = {}) {
+  const {
+    repoRoot = process.cwd(),
+    vcs: forcedVcs,
+    timeoutMs = DEFAULT_TIMEOUT_MS,
+    now = Date.now(),
+    sha: rawSha,
+    deferHistory: rawDeferHistory,
+  } = opts;
+  const deferHistory = rawDeferHistory === true;
+
+  // Validate at the boundary (#1332): the value reaches an API path and an
+  // equality match against full SHAs. A short or non-hex SHA would silently
+  // match nothing (GitLab) or re-route the request path (GitHub).
+  let sha;
+  if (rawSha !== undefined) {
+    const candidate = typeof rawSha === 'string' ? rawSha.trim().toLowerCase() : '';
+    if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(candidate)) {
+      return degradedResult('query-failed', 'sha must be a full hex commit id');
+    }
+    sha = candidate;
+  }
+
+  const execFileDep = deps.execFile
+    ? promisify(deps.execFile)
+    : execFileAsync;
+
+  const resolveRepoSpecDep = deps.resolveRepoSpec ?? resolveRepoSpec;
+  const resolveRepoHostDep = deps.resolveRepoHost ?? resolveRepoHost;
+  const resolveGitlabProjectTargetDep = deps.resolveGitlabProjectTarget ?? resolveGitlabProjectTarget;
+
+  const depsWithExec = { execFile: execFileDep, timeoutMs };
+
+  try {
+    // Step 1: detect VCS (or use forced value).
+    let vcs = forcedVcs;
+    if (!vcs) {
+      const detected = await detectVcs(repoRoot, depsWithExec);
+      if (!detected.ok) {
+        // An ABSENCE (`no-remotes`, `no-matching-remote`, `unsafe-value`) is a
+        // real, benign answer and stays `null` AND silent — degrading there
+        // would print a banner on every session-start in a remote-less repo and
+        // train operators to ignore this line, which is the more expensive
+        // error. A QUERY FAILURE (`git-unavailable`, `git-error`) means the
+        // question could not be asked at all: since #1031 that is the third
+        // state, no longer a warn-only side channel on top of an all-clear
+        // `null`. `not-a-git-repo` is the one query failure this banner reads
+        // as an absence — see {@link SILENT_QUERY_FAILURES}.
+        if (detected.reason === PROBE_TIMEOUT) {
+          return degradedResult('timeout');
+        }
+        if (isQueryFailure(detected.reason) && !SILENT_QUERY_FAILURES.has(detected.reason)) {
+          const stderr = detected.stderr
+            ? redactUrlCredentials(detected.stderr).trim()
+            : '';
+          const detail = stderr ? ` — ${stderr}` : '';
+          console.warn(
+            `WARN ci-status-banner: VCS detection failed (${detected.reason}), banner suppressed — ` +
+              `CI state is UNKNOWN, not "green".${detail}`,
+          );
+          return degradedForVcsReason(
+            detected.reason,
+            stderr ? `${detected.reason}: ${stderr}` : detected.reason,
+          );
+        }
+        return null;
+      }
+      vcs = detected.vcs;
+    }
+
+    // Step 1b: GitLab's API target must be proven before its first glab spawn.
+    // A missing target is never permission to fall back to ambient
+    // GITLAB_HOST/repository configuration. GitHub retains its distinct
+    // repository lookup because its API path requires `nameWithOwner`.
+    //
+    // It is also not an ABSENCE: detectVcs just proved a GitLab remote exists,
+    // so `!gitlabProject` means "remote present, its form was rejected" — a
+    // QUERY FAILURE by the same rule the block above states. Returning null
+    // silently put this repo back in the pre-#1039 state where "CI green" and
+    // "could not ask" look identical. Reachable inputs measured 2026-08-21:
+    // `git://` scheme, a doubled slash in the path, a query string.
+    if (vcs === 'gitlab') {
+      const gitlabProject = resolveGitlabProjectTargetDep({ repoRoot });
+      if (!gitlabProject) {
+        console.warn(
+          'WARN ci-status-banner: a GitLab remote was detected but its host/project path ' +
+            'could not be derived, banner suppressed — CI state is UNKNOWN, not "green".',
+        );
+        return degradedResult(
+          'query-failed',
+          'a GitLab remote was detected but its host/project path could not be derived',
+        );
+      }
+      return await checkGitlab(repoRoot, now, { ...depsWithExec, gitlabProject, sha });
+    }
+
+    if (vcs === 'github') {
+      const repoSpec = resolveRepoSpecDep({ repoRoot, vcs });
+      const repoHost = resolveRepoHostDep({ repoRoot, vcs });
+      return await checkGithub(repoRoot, now, { ...depsWithExec, repoSpec, repoHost, sha, deferHistory });
+    }
+
+    // Unknown VCS value — silent no-op.
+    return null;
+  } catch (err) {
+    // Never throws: every failure below leaves as the third return state.
+    const msg = err instanceof Error ? err.message : String(err);
+
+    // Timeout and ENOENT (missing CLI) stay SILENT on the warn channel — a
+    // machine without `glab` is a normal state, and a warn on every
+    // session-start there drowns the #1022 signal this channel carries. Since
+    // #1031 they are no longer silent on the RETURN channel: neither state
+    // established that CI is green, so both degrade.
+    if (msg === 'timeout') return degradedResult('timeout');
+    if (err && err.code === 'ENOENT') {
+      return degradedResult('cli-missing', redactUrlCredentials(msg));
+    }
+
+    // Everything else means the CLI was PRESENT but the invocation failed —
+    // non-zero exit, rejected flag, unparseable output. A bare `null` here made
+    // that state indistinguishable from "CLI not installed" AND from "CI is
+    // green", which is exactly how #1022 (`gh repo view -R` → `unknown
+    // shorthand flag: 'R'`) stayed invisible on every GitHub repo.
+    //
+    // #1031 finished the migration this comment used to describe as pending:
+    // the third state `{ severity, message, degraded }` — the shape
+    // `scripts/lib/mirror-issues-banner.mjs` established — now leaves here too,
+    // alongside (not instead of) the stderr trace. `parse-error` is carried on
+    // the error by `tagParseError`; everything else is the residual
+    // `query-failed`.
+    //
+    // Credentials redacted defense-in-depth (#907) — the message can quote the
+    // failed argv, which carries the repo spec — and the redacted text is what
+    // reaches BOTH the warn and the operator-facing `message`.
+    const redacted = redactUrlCredentials(msg);
+    console.warn(
+      `WARN ci-status-banner: CI status check failed, banner suppressed — ${redacted}`,
+    );
+    // Literal reasons on BOTH branches, never `degradedResult(reason)` with a
+    // computed variable: the enum census in the test file is a regex over this
+    // source, and a variable hides the member from it.
+    if (err && typeof err === 'object' && err.degradedReason === 'parse-error') {
+      return degradedResult('parse-error', redacted);
+    }
+    return degradedResult('query-failed', redacted);
+  }
+}

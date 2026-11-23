@@ -1,0 +1,354 @@
+/**
+ * autopilot/loop.mjs — runLoop: the main autopilot session controller.
+ *
+ * All I/O is injected via opts — no child-process spawning, no direct file I/O.
+ * DAG: kill-switches (leaf) + flags (leaf) + telemetry (leaf) → loop → barrel
+ */
+
+import { KILL_SWITCHES, preIterationKillSwitch, postSessionKillSwitch } from './kill-switches.mjs';
+import {
+  FLAG_BOUNDS,
+  DEFAULT_PEER_ABORT_THRESHOLD,
+  DEFAULT_JSONL_PATH,
+  DEFAULT_CARRYOVER_THRESHOLD,
+} from './flags.mjs';
+import {
+  SCHEMA_VERSION,
+  writeAutopilotJsonl,
+  defaultRunId,
+  readHostClass,
+  finalizeState,
+} from './telemetry.mjs';
+import { durableCommit } from './durable-telemetry.mjs';
+import { getStateDir } from '../platform.mjs';
+import { resolveLedgerPath } from '../ledger-path.mjs';
+
+// Internal clamp — mirrors flags.mjs internal; not re-exported there.
+function clampNumber(value, { min, max, fallback }) {
+  if (typeof value !== 'number' || Number.isNaN(value)) return fallback;
+  if (value < min) return min;
+  if (value > max) return max;
+  return value;
+}
+
+/**
+ * @typedef {Object} AutopilotState
+ * @property {number} schema_version @property {string} autopilot_run_id @property {string} started_at
+ * @property {string} completed_at @property {number} duration_seconds @property {number} max_sessions
+ * @property {number} max_hours @property {number} confidence_threshold @property {number} iterations_completed
+ * @property {string|null} kill_switch @property {string|null} kill_switch_detail @property {string[]} sessions
+ * @property {string|null} host_class @property {string|null} resource_verdict_at_start
+ * @property {boolean} fallback_to_manual @property {boolean} dry_run @property {number} total_tokens_used
+ * @property {number} tokens_unknown_sessions — #1487 Pkt 4: iterations whose own record carried no token figure; > 0 makes total_tokens_used a lower bound
+ * @property {string|null} worktree_path @property {string|null} parent_run_id @property {number} stall_recovery_count
+ * @property {number|null} blocked_by_issue — Phase D (#341): issue number this loop was waiting on (OPEN-4 commit-deps); null when not blocked
+ * @property {boolean} aborted_by_cohort — Phase D (#341): set by cohort-abort policy (OPEN-5); mutated by W3 P5 orchestration-glue, not by runLoop itself
+ * @property {number} spiral_recovery_count — Phase D (#341): increments on first SPIRAL retry; mirrors stall_recovery_count pattern
+ */
+
+/**
+ * Run the autopilot loop. All I/O is injected via opts — pass real implementations
+ * in production, mocks in tests.
+ *
+ * @param {object} opts
+ * @param {number} [opts.maxSessions] @param {number} [opts.maxHours]
+ * @param {number} [opts.confidenceThreshold] @param {boolean} [opts.dryRun]
+ * @param {() => Promise<{mode: string, confidence: number}>} [opts.modeSelector]
+ * @param {(args: {mode: string, autopilotRunId: string}) => Promise<{session_id: string}>} [opts.sessionRunner]
+ * @param {() => {verdict: string}} [opts.resourceEvaluator]
+ * @param {() => Promise<number>} [opts.peerCounter]
+ * @param {() => number} [opts.nowMs] @param {AbortSignal} [opts.abortSignal]
+ * @param {string} [opts.jsonlPath] @param {string} [opts.runId] @param {string} [opts.branch]
+ * @param {string} [opts.hostJsonPath] @param {number} [opts.peerAbortThreshold]
+ * @param {number} [opts.carryoverThreshold] @param {number} [opts.maxTokens]
+ * @param {string} [opts.autopilotJsonlPath] — STALL_TIMEOUT sampler fallback marker (defaults to jsonlPath)
+ * @param {string} [opts.sessionLockPath] — STALL_TIMEOUT sampler PRIMARY marker (`session.lock`
+ *   `last_heartbeat`). Deliberately undefaulted: the default would be cwd-relative, which in a
+ *   test run resolves to the LIVE repo lock and would silently decide the sampler's branch. The
+ *   CLI driver (`scripts/autopilot.mjs`) supplies it; omitting it keeps the legacy mtime marker.
+ * @param {number} [opts.stallTimeoutSeconds] — STALL_TIMEOUT threshold seconds (default 600)
+ * @param {string} [opts.worktreePath] @param {string} [opts.parentRunId]
+ * @param {number} [opts.blockedByIssue] — Phase D (#341) forward-compat: issue number this loop is waiting on (OPEN-4 commit-deps); callers may omit, defaults to null
+ * @returns {Promise<AutopilotState>}
+ */
+export async function runLoop(opts = {}) {
+  const maxSessions = Math.floor(clampNumber(opts.maxSessions, {
+    min: FLAG_BOUNDS.maxSessions.min,
+    max: FLAG_BOUNDS.maxSessions.max,
+    fallback: FLAG_BOUNDS.maxSessions.default,
+  }));
+  const maxHours = clampNumber(opts.maxHours, {
+    min: FLAG_BOUNDS.maxHours.min,
+    max: FLAG_BOUNDS.maxHours.max,
+    fallback: FLAG_BOUNDS.maxHours.default,
+  });
+  const confidenceThreshold = clampNumber(opts.confidenceThreshold, {
+    min: FLAG_BOUNDS.confidenceThreshold.min,
+    max: FLAG_BOUNDS.confidenceThreshold.max,
+    fallback: FLAG_BOUNDS.confidenceThreshold.default,
+  });
+  const dryRun = Boolean(opts.dryRun);
+
+  const nowMs = typeof opts.nowMs === 'function' ? opts.nowMs : () => Date.now();
+  const jsonlPath = typeof opts.jsonlPath === 'string' && opts.jsonlPath.length > 0
+    ? opts.jsonlPath
+    : resolveLedgerPath(DEFAULT_JSONL_PATH, process.cwd()); // #1722: linked worktree → main checkout when ignored
+  const peerAbortThreshold = typeof opts.peerAbortThreshold === 'number'
+    ? opts.peerAbortThreshold
+    : DEFAULT_PEER_ABORT_THRESHOLD;
+  const carryoverThreshold = typeof opts.carryoverThreshold === 'number'
+    ? opts.carryoverThreshold
+    : DEFAULT_CARRYOVER_THRESHOLD;
+
+  const startedAtMs = nowMs();
+  const runId = typeof opts.runId === 'string' && opts.runId.length > 0
+    ? opts.runId
+    : defaultRunId(opts.branch, startedAtMs);
+  const hostClass = readHostClass(opts.hostJsonPath ?? '.orchestrator/host.json');
+
+  const maxHoursMs = maxHours * 3_600_000;
+  const abort = opts.abortSignal ?? null;
+  const isAborted = () => Boolean(abort && abort.aborted === true);
+
+  // Capture initial verdict for telemetry (before any iteration runs).
+  let initialVerdict = null;
+  if (typeof opts.resourceEvaluator === 'function') {
+    try {
+      const v = opts.resourceEvaluator();
+      initialVerdict = typeof v?.verdict === 'string' ? v.verdict : null;
+    } catch {
+      initialVerdict = null;
+    }
+  }
+
+  /** @type {AutopilotState} */
+  const state = {
+    schema_version: SCHEMA_VERSION,
+    autopilot_run_id: runId,
+    started_at: new Date(startedAtMs).toISOString(),
+    completed_at: '',
+    duration_seconds: 0,
+    max_sessions: maxSessions,
+    max_hours: maxHours,
+    confidence_threshold: confidenceThreshold,
+    // Persisted for the same reason as the three above (HR-105): a switch whose
+    // input is never recorded cannot be falsified afterwards. `0` = disabled.
+    // Live path (#1436): scripts/emit-session.mjs merges the subagents.jsonl
+    // rollup (`total_token_output`, `total_tokens`) into each session record,
+    // scripts/autopilot.mjs selects the unique canonical record whose
+    // raw_session_id equals the child's --session-id UUID and projects its
+    // totals as `usage`; the accumulator sums them into `total_tokens_used`.
+    // Zero or multiple matches throw → FAILED_WAVE, never foreign token usage.
+    // CEILING: an own record without token totals adds 0 — the budget
+    // undercounts, it never over-fires. Such sessions are counted in
+    // `tokens_unknown_sessions` (#1487 Pkt 4), and the switch still fires on the
+    // known lower bound: every fire stays correct, none is lost. Failing closed on
+    // an unknown session instead would stop an armed run on every
+    // coordinator-direct session (no subagents → no rollup totals); revisit if
+    // the session record ever carries the coordinator's own usage.
+    max_tokens: opts.maxTokens ?? 0,
+    iterations_completed: 0,
+    kill_switch: null,
+    kill_switch_detail: null,
+    sessions: [],
+    host_class: hostClass,
+    resource_verdict_at_start: initialVerdict,
+    fallback_to_manual: false,
+    dry_run: dryRun,
+    total_tokens_used: 0,
+    // #1487 Pkt 4 — completed iterations whose own record carried no token
+    // figure; non-zero means `total_tokens_used` is a lower bound.
+    tokens_unknown_sessions: 0,
+    // ADR-364 additive fields — forward-compat; callers may omit, defaults are null/0.
+    worktree_path: opts.worktreePath ?? null,
+    parent_run_id: opts.parentRunId ?? null,
+    stall_recovery_count: 0,
+    // Phase D (#341) cross-loop telemetry — additive, forward-compat.
+    blocked_by_issue: opts.blockedByIssue ?? null,   // {number|null} — which issue this loop was waiting on (OPEN-4 commit-deps)
+    aborted_by_cohort: false,                         // {boolean} — set by cohort-abort policy (OPEN-5)
+    spiral_recovery_count: 0,                         // {number} — increments on first SPIRAL retry, mirrors stall_recovery_count pattern
+  };
+
+  // Dry-run short-circuits: emit a state record without invoking the lifecycle.
+  if (dryRun) {
+    state.kill_switch_detail = 'dry-run preview — no sessions executed';
+    finalizeState(state, nowMs);
+    writeAutopilotJsonl(state, jsonlPath);
+    // Durable-telemetry seam (ADR 0003 #485) — currently inert for local execution.
+    // Cloud-execution (Routines spike, #485 W3 P3) flips enabled:true.
+    // Dry-run stays SINGLE-FILE (autopilot.jsonl only): no session executed, so
+    // sessions.jsonl + STATE.md have NOT been written. Adding them here would trip
+    // durableCommit's per-file existsSync guard → {ok:false, error:'file not found'}.
+    // The 3-file triple (#490) only applies at normal loop exit where a session ran.
+    await durableCommit({
+      sessionId: state.autopilot_run_id,
+      files: [jsonlPath.replace(process.cwd() + '/', '')],
+      enabled: false,
+    });
+    // _durable.ok === true with skipped:true in local path — no-op.
+    return state;
+  }
+
+  // Main loop — pre-checks ordered cheapest-first: abort → sessions/hours → resource.
+  let cumulativeTokens = 0;
+  for (;;) {
+    // Check inexpensive pre-conditions first.
+    const elapsedMs = nowMs() - startedAtMs;
+    let peerCount = null;
+    if (typeof opts.peerCounter === 'function') {
+      try {
+        peerCount = await opts.peerCounter();
+      } catch {
+        peerCount = null;
+      }
+    }
+    let verdict = initialVerdict;
+    if (typeof opts.resourceEvaluator === 'function') {
+      try {
+        const v = opts.resourceEvaluator();
+        verdict = typeof v?.verdict === 'string' ? v.verdict : verdict;
+      } catch {
+        // keep prior verdict on error
+      }
+    }
+
+    const preCheck = preIterationKillSwitch({
+      iterationsCompleted: state.iterations_completed,
+      maxSessions,
+      elapsedMs,
+      maxHoursMs,
+      resourceVerdict: verdict,
+      peerCount,
+      peerAbortThreshold,
+      aborted: isAborted(),
+      cumulativeTokensUsed: cumulativeTokens,
+      // 0 = off sentinel: kill-switch activates only on explicit opt-in (#355).
+      maxTokens: opts.maxTokens ?? 0,
+    });
+    if (preCheck !== null) {
+      state.kill_switch = preCheck.kill;
+      state.kill_switch_detail = preCheck.detail;
+      break;
+    }
+
+    // Mode selection -------------------------------------------------------
+    let recommendation = null;
+    if (typeof opts.modeSelector === 'function') {
+      try {
+        recommendation = await opts.modeSelector();
+      } catch (err) {
+        state.kill_switch = KILL_SWITCHES.LOW_CONFIDENCE_FALLBACK;
+        state.kill_switch_detail = `modeSelector threw: ${err?.message ?? String(err)}`;
+        break;
+      }
+    }
+    const confidence = typeof recommendation?.confidence === 'number'
+      ? recommendation.confidence
+      : 0;
+    const recommendedMode = typeof recommendation?.mode === 'string'
+      ? recommendation.mode
+      : null;
+
+    if (recommendedMode === null || confidence < confidenceThreshold) {
+      // Iteration 1 sub-threshold → seamless fallback to manual.
+      // Iteration 2+ sub-threshold → exit kill-switch (user must re-decide).
+      if (state.iterations_completed === 0) {
+        state.fallback_to_manual = true;
+        state.kill_switch_detail = recommendedMode === null
+          ? `iteration 1: no mode recommendation — fallback to manual`
+          : `iteration 1: confidence=${confidence} < threshold=${confidenceThreshold} — fallback to manual`;
+      } else {
+        state.kill_switch = KILL_SWITCHES.LOW_CONFIDENCE_FALLBACK;
+        state.kill_switch_detail = `iteration ${state.iterations_completed + 1}: confidence=${confidence} < threshold=${confidenceThreshold}`;
+      }
+      break;
+    }
+
+    // Run one session ------------------------------------------------------
+    let sessionResult = null;
+    if (typeof opts.sessionRunner === 'function') {
+      try {
+        sessionResult = await opts.sessionRunner({
+          mode: recommendedMode,
+          autopilotRunId: runId,
+        });
+      } catch (err) {
+        state.kill_switch = KILL_SWITCHES.FAILED_WAVE;
+        state.kill_switch_detail = `sessionRunner threw: ${err?.message ?? String(err)}`;
+        break;
+      }
+    }
+
+    if (sessionResult && typeof sessionResult.session_id === 'string') {
+      state.sessions.push(sessionResult.session_id);
+    }
+    state.iterations_completed += 1;
+
+    // Accumulate own-record output tokens (total_tokens fallback). An unassignable
+    // child record already threw → FAILED_WAVE above. An own record carrying
+    // neither figure has UNKNOWN usage, not 0 (#1487 Pkt 4): it adds nothing, so
+    // `total_tokens_used` is a lower bound, and it is counted in
+    // `tokens_unknown_sessions` so the record says how much the sum cannot see.
+    const usage = sessionResult?.usage;
+    const rawTokens = usage !== null && typeof usage === 'object'
+      ? (usage.output_tokens ?? usage.total_tokens)
+      : undefined;
+    // `Number(null)` is 0 — a null figure is a missing one, never a measured 0.
+    const outTokens = rawTokens === null || rawTokens === undefined ? NaN : Number(rawTokens);
+    if (Number.isFinite(outTokens) && outTokens >= 0) {
+      cumulativeTokens += outTokens;
+    } else {
+      state.tokens_unknown_sessions += 1;
+    }
+    state.total_tokens_used = cumulativeTokens;
+
+    // Post-session kill-switches (Phase C-1.b — spiral / failed-wave / carryover-too-high;
+    // Phase C-2 / ADR-364 — stall-timeout via sampler).
+    const postCheck = postSessionKillSwitch(sessionResult, {
+      carryoverThreshold,
+      autopilotJsonlPath: opts.autopilotJsonlPath ?? jsonlPath,
+      sessionLockPath: opts.sessionLockPath,
+      stallTimeoutSeconds: opts.stallTimeoutSeconds ?? 600,
+      nowMs: opts.nowMs,
+    });
+    if (postCheck !== null) {
+      if (postCheck.kill === KILL_SWITCHES.STALL_TIMEOUT) {
+        state.stall_recovery_count += 1;
+      }
+      state.kill_switch = postCheck.kill;
+      state.kill_switch_detail = postCheck.detail;
+      break;
+    }
+
+    // User aborted between iterations?
+    if (isAborted()) {
+      state.kill_switch = KILL_SWITCHES.USER_ABORT;
+      state.kill_switch_detail = 'AbortSignal triggered between iterations';
+      break;
+    }
+  }
+
+  finalizeState(state, nowMs);
+  writeAutopilotJsonl(state, jsonlPath);
+  // Durable-telemetry seam (ADR 0003 #485) — currently inert for local execution.
+  // Cloud-execution (Routines spike, #485 W3 P3) flips enabled:true.
+  // Normal loop exit: a nested session ran, so sessions.jsonl + STATE.md now exist
+  // alongside autopilot.jsonl. Commit all three per ADR 0003:32 mandate (#490) so the
+  // full telemetry triple survives ephemeral-clone reclamation in cloud execution.
+  // NOTE: `${SO_STATE_DIR}/STATE.md` is the clone-relative path (platform-resolved) —
+  // autopilot commits the worktree's own copy. session-end Phase 3.7b resolves the host
+  // <state-dir> instead; the two durableCommit owners' path forms intentionally differ
+  // (#490 / ADR-0009).
+  await durableCommit({
+    sessionId: state.autopilot_run_id,
+    files: [
+      jsonlPath.replace(process.cwd() + '/', ''),
+      // ledger-root: durableCommit file list (disabled), not a sink
+      '.orchestrator/metrics/sessions.jsonl',
+      `${getStateDir()}/STATE.md`,
+    ],
+    enabled: false,
+  });
+  // _durable.ok === true with skipped:true in local path — no-op.
+  return state;
+}

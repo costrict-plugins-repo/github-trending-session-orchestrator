@@ -1,0 +1,53 @@
+---
+name: eli5
+description: Explain a topic like I'm a 5 year old — restate my last output, or a named topic, in plain words without dropping a single fact. Use when the user types /eli5 [topic], or says an answer was too technical, too long, or unclear about what he now has to do.
+user-invocable: true
+argument-hint: "[topic]"
+model: inherit
+---
+
+# eli5
+
+Say it again in plain words. Same facts, in the order he needs them.
+
+## Invocation
+
+Invoked as `/eli5 [topic]` with arguments: **$ARGUMENTS**.
+
+The argument is optional and is a topic, in prose. If `$ARGUMENTS` is empty, the target is my own last substantial output in this conversation; if there is none yet, say so rather than picking a topic for him.
+
+- `/eli5` — restate what I just said.
+- `/eli5 warum ist der Regel-Korpus voll?` — explain that, grounded in what this session measured.
+
+## The frame
+
+**Write for someone who knows this project but has not seen what you just saw.**
+
+He owns this repo. He is not missing knowledge, he is missing observation — he did not watch the command run or read the file it points at. Write across, not down. The two limits below are the core of this register and suffice on their own. When the project defines its own register rule (session-orchestrator: `.claude/rules/ask-via-tool.md` § AUQ-006 and `skills/session-start/soul.md` § Register), that rule is the canonical statement; apply it, do not restate it.
+
+## What to restate
+
+- `/eli5` — my last substantial output in this conversation. If there is none yet, say so instead of inventing a topic.
+- `/eli5 <topic>` — that topic (`$ARGUMENTS`), grounded in what THIS session already measured: name the file, command, or record it came from. If it was never measured here, say that rather than filling the gap from memory.
+
+Answer in the operator's language: `owner.language` from the owner config when the harness defines one (session-orchestrator: `~/.config/session-orchestrator/owner.yaml`), falling back to `en` when there is no such file, it is unreadable, or the key is absent — and follow the operator's own language the moment he writes in another one.
+
+## Two limits, and they are the whole skill
+
+**1. Say more simply what actually happens — introduce nothing that does not exist.**
+Test: delete every noun the system does not contain. Sentence still true and complete → it was no analogy. Sentence collapses → describe what actually happens instead.
+✓ "Waiting means the other session finishes first." ✗ "Think of the session as a level crossing."
+
+**2. Simplifying removes words, never facts.** If a path, a number, an error code, an identifier, or an instruction to act disappears, that is data loss, not simplification. The mechanical decider: **could the token you are about to cut ever appear in a `grep`? Then it stays.** Never traded for brevity, and outranking every brevity instruction in this file: input validation and the reporting of invalid input; error messages and failure disclosure; security findings, warnings and destructive-action confirmations; accessibility of the output (no meaning carried by colour or emoji alone, no bare unlabelled numbers, no table without its header); anything he explicitly asked to see. When the project defines its own list (session-orchestrator: `skills/session-start/soul.md` § "Never traded for brevity"), that list wins on any difference.
+
+## Shape
+
+Line 1 answers the question he actually has: **do I have to do something now, and what happens if I don't?** Then the facts, in the order he needs them — not the order you found them.
+
+The output is text, so there is no picture to draw. When options differ in something literal — a diff, a title, a config block, a file list — show that text itself, so he reads the thing instead of a description of it: in the option's preview field where the harness has a question tool with one (Claude Code: `preview` on an `AskUserQuestion` option), otherwise in a fenced block directly under the option it belongs to.
+
+## What this is not
+
+- **Not shorter by default.** Eight lines before may be eight lines after. Reorder first; cut only filler.
+- **Not a children's explanation.** The label is a poster, the reader is an expert who was not in the room.
+- **Not a second attempt at the answer.** If the first answer was wrong, fix the answer — `/eli5` restates, it never re-derives.
